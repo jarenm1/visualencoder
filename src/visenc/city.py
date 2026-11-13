@@ -198,6 +198,9 @@ class Pose:
         return forward, up_rolled
 
 
+REGIMES = ("seen", "novel")
+
+
 @dataclass(frozen=True)
 class Appearance:
     sun_dir: tuple[float, float, float]
@@ -209,6 +212,7 @@ class Appearance:
     exposure: float
     tint: tuple[float, float, float]
     materials: tuple[int, ...]  # raw choice per (class, slot) in CLASS_SLOTS order; resolved modulo pool size
+    texture_split: str = "train"  # "train" pools or eval-only "heldout" pools (see materials.json)
 
     @staticmethod
     def canonical() -> "Appearance":
@@ -219,18 +223,37 @@ class Appearance:
         )  # fmt: skip
 
     @staticmethod
-    def random(rng: np.random.Generator) -> "Appearance":
-        """Task-valid variation: lighting, atmosphere, camera response and surface materials; geometry untouched."""
-        elevation, azimuth = rng.uniform(0.15, 1.45), rng.uniform(0, 2 * math.pi)
+    def random(rng: np.random.Generator, regime: str = "seen") -> "Appearance":
+        """Task-valid variation: lighting, atmosphere, camera response and surface materials; geometry untouched.
+
+        seen:  the training distribution (train texture pools, moderate sun/fog/exposure ranges).
+        novel: eval-only: held-out textures, low sun (long shadows), dim light, heavy fog, and
+               exposure/tint outside the seen ranges. Never used for training data.
+        """
+        if regime == "seen":
+            elevation, intensity = rng.uniform(0.35, 1.45), rng.uniform(0.45, 1.1)
+            fog = float(rng.uniform() ** 2 * 0.006)
+            exposure = float(rng.uniform(0.75, 1.3))
+            tint = rng.uniform(0.88, 1.12, 3)
+            split = "train"
+        elif regime == "novel":
+            elevation, intensity = rng.uniform(0.1, 0.35), rng.uniform(0.25, 0.45)
+            fog = float(rng.uniform(0.005, 0.008))  # above most seen fog (mean ~0.002), distant content still visible
+            exposure = float(rng.uniform(0.55, 0.75) if rng.uniform() < 0.5 else rng.uniform(1.3, 1.55))
+            tint = 1.0 + rng.choice([-1.0, 1.0], 3) * rng.uniform(0.12, 0.2, 3)
+            split = "heldout"
+        else:
+            raise ValueError(f"unknown appearance regime {regime!r}; use {REGIMES}")
+        azimuth = rng.uniform(0, 2 * math.pi)
         sun = (math.cos(elevation) * math.cos(azimuth), math.sin(elevation), math.cos(elevation) * math.sin(azimuth))
         warmth = rng.uniform(-1, 1)
-        sun_color = np.array([1.0 + 0.25 * warmth, 0.95, 1.0 - 0.3 * warmth]) * rng.uniform(0.3, 1.1)
+        sun_color = np.array([1.0 + 0.25 * warmth, 0.95, 1.0 - 0.3 * warmth]) * intensity
         sky = np.clip(rng.uniform([0.25, 0.3, 0.35], [0.95, 0.95, 1.0]) * rng.uniform(0.4, 1.1), 0, 1)
         ambient = rng.uniform(0.15, 0.6)
         return Appearance(
             sun, tuple(sun_color), tuple(sky * ambient / max(sky.max(), 1e-3) + 0.05), tuple(rng.uniform(0.1, 0.35, 3)),
-            tuple(sky), float(rng.uniform(0.0, 0.012) ** 1.5 * 10), float(rng.uniform(0.7, 1.4)), tuple(rng.uniform(0.85, 1.15, 3)),
-            tuple(int(v) for v in rng.integers(0, 1 << 16, N_MATERIAL_CHOICES)),
+            tuple(sky), fog, exposure, tuple(float(t) for t in tint),
+            tuple(int(v) for v in rng.integers(0, 1 << 16, N_MATERIAL_CHOICES)), split,
         )  # fmt: skip
 
 
@@ -332,12 +355,16 @@ class CityRenderer:
         depth = rl.Texture(depth_id, SHADOW_SIZE, SHADOW_SIZE, 1, 19)
         return rl.RenderTexture(fbo, rl.Texture(0, SHADOW_SIZE, SHADOW_SIZE, 1, 7), depth)
 
-    def _load_textures(self, root: Path) -> dict[str, list[SurfaceTexture]]:
+    def _load_textures(self, root: Path) -> dict[str, dict[str, list[SurfaceTexture]]]:
+        """pools[split][role]: 'train' excludes the eval-only textures listed in materials.json 'heldout'."""
         spec = json.loads((root / "materials.json").read_text())
+        if "heldout" not in spec:
+            raise ValueError(f"{root}/materials.json has no 'heldout' split; re-run scene/fetch_polyhaven.py")
         loaded: dict[str, SurfaceTexture] = {}
-        pools = {}
+        pools: dict[str, dict[str, list[SurfaceTexture]]] = {"train": {}, "heldout": {}}
         for role, ids in spec["roles"].items():
-            pools[role] = []
+            held = set(spec["heldout"][role])
+            pools["train"][role], pools["heldout"][role] = [], []
             for tid in ids:
                 if tid not in loaded:
                     textures = []
@@ -350,7 +377,7 @@ class CityRenderer:
                         textures.append(tex)
                     mean = np.asarray(Image.open(root / tid / "diff.jpg").convert("RGB").reduce(16), dtype=np.float64).mean((0, 1)) / 255
                     loaded[tid] = SurfaceTexture(textures[0], textures[1], float(spec["textures"][tid]["size_m"][0]), tuple(mean))
-                pools[role].append(loaded[tid])
+                pools["heldout" if tid in held else "train"][role].append(loaded[tid])
         self._all_textures = list(loaded.values())
         return pools
 
@@ -383,18 +410,21 @@ class CityRenderer:
         rl.set_shader_value(shader, rl.get_shader_location(shader, name), _vec(values), kinds[len(values)])
 
     def _resolve_materials(self, look: Appearance) -> dict[str, list[SurfaceTexture]]:
-        """Pick each class's three textures; slots sharing a role always get distinct textures."""
+        """Pick each class's three textures from the look's split; slots sharing a role get distinct
+        textures while the pool allows (held-out pools may hold a single texture)."""
+        pools = self.pools[look.texture_split]
         choices = iter(look.materials)
         out = {}
         for cls, roles in CLASS_SLOTS.items():
             used: dict[str, set[int]] = {}
             picked = []
             for role in roles:
-                pool = self.pools[role]
+                pool = pools[role]
                 idx = next(choices) % len(pool)
-                while idx in used.setdefault(role, set()):
+                taken = used.setdefault(role, set())
+                while idx in taken and len(taken) < len(pool):
                     idx = (idx + 1) % len(pool)
-                used[role].add(idx)
+                taken.add(idx)
                 picked.append(pool[idx])
             out[cls] = picked
         return out

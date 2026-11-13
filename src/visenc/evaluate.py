@@ -215,19 +215,32 @@ def evaluate_encoder(spec: str, split: Split, args, device: torch.device) -> dic
     return result
 
 
+def view_group(view: str) -> str:
+    """Appearance shift group of a non-fit view: 'seen' (training distribution) or 'novel' (held out)."""
+    return "novel" if view.startswith("novel") else "seen"
+
+
 def summary_table(results: list[dict], fit_view: str) -> str:
     others = sorted({v for r in results for v in r["views"] if v != fit_view})
-    cols = ["encoder", f"state R² {fit_view}", "state R² shifted", "depth AbsRel", "depth AbsRel shifted",
-            "seg mIoU", "seg mIoU shifted", "retrieval@1", "patch cos"]  # fmt: skip
+    groups = [g for g in ("seen", "novel") if any(view_group(v) == g for v in others)]
+    cols = ["encoder"]
+    for metric in ("state R²", "depth AbsRel", "seg mIoU"):
+        cols += [f"{metric} {fit_view}", *(f"{metric} {g}" for g in groups)]
+    cols += [f"{m} {g}" for m in ("retrieval@1", "patch cos") for g in groups]
     if any("real_domain_accuracy" in r for r in results):
         cols.append("real domain acc")
     lines = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
     for r in results:
         base = r["views"][fit_view]
-        mean_other = lambda key: float(np.mean([r["views"][v][key] for v in others])) if others else math.nan  # noqa: E731
-        pair = lambda key: float(np.mean([r["pairs"][v][key] for v in others])) if others else math.nan  # noqa: E731
-        row = [r["spec"], base["state_r2"], mean_other("state_r2"), base["depth_absrel"], mean_other("depth_absrel"),
-               base["semantic_miou"], mean_other("semantic_miou"), pair("retrieval_at_1"), pair("patch_cosine")]  # fmt: skip
+
+        def mean(table: dict, key: str, group: str) -> float:
+            vals = [table[v][key] for v in others if view_group(v) == group and v in table]
+            return float(np.mean(vals)) if vals else math.nan
+
+        row: list = [r["spec"]]
+        for key in ("state_r2", "depth_absrel", "semantic_miou"):
+            row += [base[key], *(mean(r["views"], key, g) for g in groups)]
+        row += [mean(r["pairs"], key, g) for key in ("retrieval_at_1", "patch_cosine") for g in groups]
         if "real domain acc" in cols:
             row.append(r.get("real_domain_accuracy", math.nan))
         lines.append("| " + " | ".join(c if isinstance(c, str) else f"{c:.3f}" for c in row) + " |")

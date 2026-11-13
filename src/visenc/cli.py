@@ -16,6 +16,8 @@ def main() -> None:
     data.add_argument("--width", type=int, default=320)
     data.add_argument("--height", type=int, default=240)
     data.add_argument("--random-views", type=int, default=2, help="random appearances per pose (plus canonical)")
+    data.add_argument("--novel-views", type=int, default=0,
+                      help="eval-only appearances: held-out textures and out-of-range lighting; never for training data")  # fmt: skip
     data.add_argument("--workers", type=int, default=8, help="parallel renderer processes")
     data.add_argument("--exclude-region", type=float, nargs=4, metavar=("X0", "Z0", "X1", "Z1"),
                       help="world rectangle no pose may fall in (spatial holdout)")  # fmt: skip
@@ -30,7 +32,7 @@ def main() -> None:
 
         generate(
             args.scene, args.out, args.seed, args.count, args.width, args.height,
-            args.random_views, args.workers, tuple(args.exclude_region) if args.exclude_region else None,
+            args.random_views, args.novel_views, args.workers, tuple(args.exclude_region) if args.exclude_region else None,
         )  # fmt: skip
     elif args.command == "distill":
         distill.train(args)

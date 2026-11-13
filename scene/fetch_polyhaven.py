@@ -3,8 +3,9 @@
     python scene/fetch_polyhaven.py assets/polyhaven
 
 Writes <out>/<id>/{diff,nor}.jpg and <out>/materials.json:
-    {"roles": {role: [id, ...]}, "textures": {id: {"size_m": [w, h]}}}
-Roles are the texture pools the renderer draws appearance variants from.
+    {"roles": {role: [id, ...]}, "heldout": {role: [id, ...]}, "textures": {id: {"size_m": [w, h]}}}
+Roles are the texture pools the renderer draws appearance variants from. "heldout" textures are
+eval-only: training data never uses them (Appearance regime "novel" draws only these).
 """
 
 import json
@@ -24,6 +25,8 @@ ROLES = {
     "metal": ["metal_plate", "painted_metal_shutter", "blue_metal_plate"],
     "concrete": ["brushed_concrete", "chipped_concrete", "dirty_concrete"],
 }
+# Eval-only texture(s) per role: the last entry (two for walls, the largest pool).
+HELDOUT = {role: ids[-2:] if role == "wall" else ids[-1:] for role, ids in ROLES.items()}
 API = "https://api.polyhaven.com"
 HEADERS = {"User-Agent": "visenc-asset-fetch"}
 
@@ -53,7 +56,7 @@ def main() -> None:
             w, h = info.get("dimensions") or [2000, 2000]
             textures[tid] = {"size_m": [w / 1000.0, h / 1000.0]}
             print(f"fetched {tid}", flush=True)
-    (out / "materials.json").write_text(json.dumps({"roles": ROLES, "textures": textures}, indent=1))
+    (out / "materials.json").write_text(json.dumps({"roles": ROLES, "heldout": HELDOUT, "textures": textures}, indent=1))
 
 
 if __name__ == "__main__":

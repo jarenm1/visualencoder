@@ -5,7 +5,8 @@ is rendered once per appearance view. Seeds derive from (seed, sample index[, vi
 so output is independent of worker count.
 
 Split layout (N samples, H x W):
-    rgb_<view>.npy  uint8   [N,H,W,3]  views: "canonical", "random1".."randomK"
+    rgb_<view>.npy  uint8   [N,H,W,3]  views: "canonical", "random1".."randomK" (seen regime),
+                                       "novel1".."novelM" (eval-only: held-out textures and lighting)
     semantic.npy    uint8   [N,H,W]    class ids, see meta["classes"]
     depth.npy       float16 [N,H,W]    optical-Z metres (sky = far plane)
     state.npy       float32 [N,S]      see visenc.city.STATE_NAMES
@@ -30,8 +31,15 @@ NEAR_WALL_M = 2.0  # reject poses where too much of the view is closer than this
 NEAR_WALL_FRACTION = 0.4
 
 
-def view_names(random_views: int) -> list[str]:
-    return ["canonical"] + [f"random{k}" for k in range(1, random_views + 1)]
+def view_names(random_views: int, novel_views: int = 0) -> list[str]:
+    return ["canonical"] + [f"random{k}" for k in range(1, random_views + 1)] + [f"novel{k}" for k in range(1, novel_views + 1)]
+
+
+def view_appearance(view: str, seed: int, index: int, k: int) -> Appearance:
+    if view == "canonical":
+        return Appearance.canonical()
+    regime = "novel" if view.startswith("novel") else "seen"
+    return Appearance.random(np.random.default_rng([seed, index, k]), regime)
 
 
 def _in_region(p: np.ndarray, region: tuple[float, float, float, float] | None) -> bool:
@@ -65,7 +73,7 @@ def _worker(job: dict) -> int:
             mm["depth"][i] = depth
             mm["state"][i] = pose_state(pose, renderer.layout.clearance(pose.position), depth)
             for k, v in enumerate(views):
-                look = Appearance.canonical() if v == "canonical" else Appearance.random(np.random.default_rng([job["seed"], i, k]))
+                look = view_appearance(v, job["seed"], i, k)
                 mm[v][i] = renderer.render_rgb(pose, look)
             job["progress"].put(1)
     for a in mm.values():
@@ -81,13 +89,14 @@ def generate(
     width: int,
     height: int,
     random_views: int,
+    novel_views: int,
     workers: int,
     exclude_region: tuple[float, float, float, float] | None,
 ) -> None:
     if width % 16 or height % 16:
         raise ValueError("width and height must be multiples of the ViT patch size (16)")
     out.mkdir(parents=True, exist_ok=False)
-    views = view_names(random_views)
+    views = view_names(random_views, novel_views)
     shapes = {
         "semantic": ((count, height, width), np.uint8),
         "depth": ((count, height, width), np.float16),
