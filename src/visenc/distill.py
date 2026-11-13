@@ -24,7 +24,7 @@ import torchvision.transforms.v2.functional as TF
 from torch.utils.data import DataLoader
 
 from .data import ImageFolder, PairedViews, Split
-from .models import HFViT, Student, load_hf
+from .models import Student, load_encoder, load_student, save_backbone
 
 
 def shared_crop(views: torch.Tensor, scale: tuple[float, float]) -> torch.Tensor:
@@ -80,8 +80,8 @@ def train(args) -> None:
             DataLoader(extra_ds, args.extra_batch_size, shuffle=True, num_workers=args.workers, drop_last=True, persistent_workers=True)
         )
 
-    teacher = load_hf(args.teacher, pretrained=True).to(device).eval().requires_grad_(False)
-    backbone: HFViT = load_hf(args.student, pretrained=args.student_init == "pretrained")
+    teacher = load_encoder(args.teacher).to(device).eval().requires_grad_(False)
+    backbone = load_student(args.student, args.student_init)
     student = Student(backbone, teacher.dim).to(device).train()
     params = [p for p in student.parameters() if p.requires_grad]
     decay = [p for p in params if p.ndim >= 2]
@@ -150,7 +150,7 @@ def train(args) -> None:
 
 
 def save(student: Student, out: Path) -> None:
-    student.backbone.model.save_pretrained(out / "student")
+    save_backbone(student.backbone, out / "student")
     torch.save({"cls_head": student.cls_head.state_dict(), "patch_head": student.patch_head.state_dict()}, out / "heads.pt")
 
 
@@ -160,8 +160,8 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--pair-target", choices=["own", "mean"], default="own")
     p.add_argument("--extra-images", help="folder of unlabelled images (e.g. real frames), distilled with own targets")
     p.add_argument("--extra-batch-size", type=int, default=16)
-    p.add_argument("--teacher", default="facebook/dinov3-vitb16-pretrain-lvd1689m")
-    p.add_argument("--student", default="facebook/dinov3-vits16-pretrain-lvd1689m", help="HF id/path; architecture (and weights if pretrained)")
+    p.add_argument("--teacher", default="lingbot:large", help="encoder spec (see visenc.models.load_encoder)")
+    p.add_argument("--student", default="lingbot:small", help="hf:<id> or lingbot:<variant>; architecture (and weights if pretrained)")
     p.add_argument("--student-init", choices=["pretrained", "random"], default="pretrained")
     p.add_argument("--student-aug", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--crop-min-scale", type=float, default=0.4)

@@ -15,6 +15,7 @@ dependencies = [
     "jupyterlab",
     "ipykernel",
     "matplotlib",
+    "lingbot-vision",
 ]
 
 [project.scripts]
@@ -27,6 +28,7 @@ build-backend = "hatchling.build"
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
+lingbot-vision = { git = "https://github.com/robbyant/lingbot-vision", rev = "151e46321bae4399f8568829f190c7bdec216b49" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"

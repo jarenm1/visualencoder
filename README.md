@@ -1,12 +1,12 @@
 # visualencoder
 
-Sim-to-real at the visual-encoder level: distil DINOv3 into a small ViT. The student is trained and evaluated on one large, static simulated city, where every image comes with exact ground truth.
+Sim-to-real at the visual-encoder level: distil a large vision foundation model (LingBot-Vision by default, DINOv3 once access is granted) into a small ViT. The student is trained and evaluated on one large, static simulated city, where every image comes with exact ground truth.
 
 ## Setup
 
 ```sh
 nix develop          # uv-managed venv (torch 2.14.1+cu130, sm_120), raylib, jupyterlab
-huggingface-cli login  # DINOv3 weights are gated: request access at huggingface.co/facebook first
+hf auth login         # only for DINOv3 (gated: request access at huggingface.co/facebook); LingBot-Vision is ungated
 ```
 
 ## Pipeline
@@ -18,10 +18,12 @@ visenc data --out data/train --seed 1 --count 20000 --exclude-region 0 0 245 245
 visenc data --out data/eval  --seed 2 --count 3000
 visenc distill --data data/train --views random1 random2 --pair-target mean --out runs/mean
 visenc eval --data data/eval --heldout-region 0 0 245 245 --out reports/x \
-  --encoders pixels hf:facebook/dinov3-vits16-pretrain-lvd1689m run:runs/mean
+  --encoders pixels lingbot:small run:runs/mean
 ```
 
-`scripts/baselines.sh` runs the full sweep.
+`scripts/baselines.sh` runs the full sweep. It adds the DINOv3 runs automatically once your account has access.
+
+Encoder specs (teacher, baselines, eval): `pixels`, `lingbot:<small|base|large|giant>`, `lingbot-random:<variant>`, `hf:<id>`, `random:<hf id>`, `run:<dir>`. Students: `lingbot:<variant>` or `hf:<id>`.
 
 ### Scene
 
@@ -40,7 +42,7 @@ Each pose stores RGB per appearance view (2× supersampled), plus semantic class
 
 ## Distillation
 
-The teacher is a frozen DINOv3 (default ViT-B/16). The student is a DINOv3 ViT-S/16, initialised either pretrained or random. The loss is cosine distillation on the CLS token and on every patch token. All views of a pose share one crop and flip, so the patch grids stay aligned. The student input can also get photometric corruption.
+The teacher is a frozen encoder: [LingBot-Vision](https://huggingface.co/collections/robbyant/lingbot-vision) ViT-L/16 by default (Apache-2.0, a DINOv3-style ViT with registers and RoPE, pretrained with masked boundary modeling for dense spatial features), or DINOv3 via `--teacher hf:facebook/dinov3-…`. The student defaults to LingBot-Vision ViT-S/16, initialised either pretrained or random. The loss is cosine distillation on the CLS token and on every patch token. All views of a pose share one crop and flip, so the patch grids stay aligned. The student input can also get photometric corruption.
 
 - `--pair-target own`: each view distils the teacher's features of itself.
 - `--pair-target mean`: every view distils the teacher features averaged over views, so the student learns one representation per physical state.
@@ -62,12 +64,12 @@ All probes are linear ridge regressions on frozen features. Each probe is fit on
 Baselines, from the floor upward:
 
 1. `pixels`
-2. `random:` ViT-S
-3. Off-the-shelf DINOv3 ViT-S
-4. The DINOv3 B/L teachers
+2. Randomly initialised ViT-S (`lingbot-random:small`)
+3. Off-the-shelf LingBot-Vision S, plus DINOv3 S when accessible
+4. The LingBot-Vision B/L teachers, plus DINOv3 B/L when accessible
 
 Ablations in `scripts/baselines.sh` each change one factor: pair target, student init, student augmentation, and training on canonical only.
 
 ## Licences
 
-The Kenney kits are CC0, fetched from OpenGameArt mirrors. Poly Haven textures are CC0. DINOv3 weights are under the DINOv3 licence.
+The Kenney kits are CC0, fetched from OpenGameArt mirrors. Poly Haven textures are CC0. LingBot-Vision code and weights are Apache-2.0. DINOv3 weights are under the DINOv3 licence.
