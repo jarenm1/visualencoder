@@ -105,13 +105,17 @@ class Features:
         return torch.cat(globals_), patches
 
 
-def dense_targets(split: Split, indices: np.ndarray, n_classes: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-patch class fractions [n,P,C] and mean log-depth [n,P], patch order row-major."""
-    sem = torch.from_numpy(np.stack([split.semantic[i] for i in indices])).long()
-    depth = torch.from_numpy(np.stack([split.depth[i] for i in indices]).astype(np.float32))
-    frac = F.avg_pool2d(F.one_hot(sem, n_classes).permute(0, 3, 1, 2).float(), PATCH).flatten(2).transpose(1, 2)
-    logd = F.avg_pool2d(depth.clamp_min(0.1).log()[:, None], PATCH).flatten(1)
-    return frac, logd
+def dense_targets(split: Split, indices: np.ndarray, n_classes: int, chunk: int = 64) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-patch class fractions [n,P,C] and mean log-depth [n,P], patch order row-major.
+    Chunked: a full-resolution one-hot of every image at once does not fit in RAM at 640x480."""
+    fracs, logds = [], []
+    for s in range(0, len(indices), chunk):
+        idx = indices[s : s + chunk]
+        sem = torch.from_numpy(np.stack([split.semantic[i] for i in idx])).long()
+        depth = torch.from_numpy(np.stack([split.depth[i] for i in idx]).astype(np.float32))
+        fracs.append(F.avg_pool2d(F.one_hot(sem, n_classes).permute(0, 3, 1, 2).float(), PATCH).flatten(2).transpose(1, 2))
+        logds.append(F.avg_pool2d(depth.clamp_min(0.1).log()[:, None], PATCH).flatten(1))
+    return torch.cat(fracs), torch.cat(logds)
 
 
 def in_region(state: np.ndarray, region: list[float] | None) -> np.ndarray:

@@ -92,13 +92,17 @@ class DenseProbes:
     """Linear per-patch depth (log metres) and segmentation probes, fit on one view of `fit_index`
     exactly as in `visenc eval` (ridge, lambda chosen on a validation slice, sky patches skipped for depth)."""
 
-    def __init__(self, enc: Encoder, split: Split, fit_index: np.ndarray, view: str = "canonical", per_image: int = 64):
+    def __init__(self, enc: Encoder, split: Split, fit_index: np.ndarray, view: str = "canonical", per_image: int = 64, chunk: int = 64):
         self.n_classes = len(split.meta["classes"])
-        feats = enc(np.stack([split.rgb[view][i] for i in fit_index])).patches.flatten(1, 2)  # [n,P,D]
         frac, logd = dense_targets(split, fit_index, self.n_classes)
         rng = np.random.default_rng(0)
-        keep = torch.from_numpy(np.stack([rng.choice(feats.shape[1], per_image, replace=False) for _ in fit_index]))
-        x = torch.gather(feats, 1, keep[..., None].expand(-1, -1, feats.shape[-1])).reshape(-1, feats.shape[-1])
+        keep = torch.from_numpy(np.stack([rng.choice(frac.shape[1], per_image, replace=False) for _ in fit_index]))
+        xs = []
+        for s in range(0, len(fit_index), chunk):  # keep only the sampled patches: full features do not fit in RAM at 640x480
+            p = enc(np.stack([split.rgb[view][i] for i in fit_index[s : s + chunk]])).patches.flatten(1, 2)
+            k = keep[s : s + chunk]
+            xs.append(torch.gather(p, 1, k[..., None].expand(-1, -1, p.shape[-1])).reshape(-1, p.shape[-1]))
+        x = torch.cat(xs)
         f = torch.gather(frac, 1, keep[..., None].expand(-1, -1, self.n_classes)).reshape(-1, self.n_classes)
         d = torch.gather(logd, 1, keep).reshape(-1, 1)
         solid = f[:, SKY] < 0.5
