@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Fetch the CC0 Kenney kits used by scene/build_city.py into assets/kenney/<kit>/.
+# Fetch CC0 assets: Kenney kits (geometry, used by scene/build_city.py) into assets/kenney/<kit>/
+# and Poly Haven surface textures (used by the renderer) into assets/polyhaven/.
 # Mirrors on OpenGameArt; kenney.nl itself gates downloads behind a JS dialog.
 set -euo pipefail
 dest="${1:-assets/kenney}"
@@ -21,3 +22,4 @@ for kit in "${!kits[@]}"; do
   grep -q "CC0" "$dest/$kit/License.txt" || { echo "$kit: licence is not CC0" >&2; exit 1; }
   echo "fetched $kit"
 done
+python3 "$(dirname "$0")/fetch_polyhaven.py" assets/polyhaven

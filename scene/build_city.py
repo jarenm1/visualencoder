@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 import bpy
+import numpy as np
 from mathutils import Matrix, Vector
 
 TILE = 10.0  # metres per Kenney city tile
@@ -94,9 +95,44 @@ class Library:
         return proto
 
 
+# Surface kinds written to vertex colour G (kind / 4); the renderer picks textures from them.
+KIND_DEFAULT, KIND_FOLIAGE, KIND_BARK, KIND_PAVEMENT = 0, 1, 2, 3
+
+
+def _material_kind(material) -> int:
+    name = (material.name if material else "").lower()
+    if "leaf" in name:
+        return KIND_FOLIAGE
+    if "wood" in name or "bark" in name or "trunk" in name:
+        return KIND_BARK
+    return KIND_DEFAULT
+
+
+def tag_mesh(mesh, variant: float, kind: int | None = None) -> None:
+    """Vertex colour R = per-object variant in [0, 1), G = surface kind / 4 (per material if kind is None)."""
+    n_polys, n_loops = len(mesh.polygons), len(mesh.loops)
+    if kind is None:
+        kinds = np.array([_material_kind(m) for m in mesh.materials] or [KIND_DEFAULT], dtype=np.float32)
+        mat_index = np.zeros(n_polys, dtype=np.int32)
+        mesh.polygons.foreach_get("material_index", mat_index)
+        totals = np.zeros(n_polys, dtype=np.int32)
+        mesh.polygons.foreach_get("loop_total", totals)
+        loop_kind = np.repeat(kinds[np.minimum(mat_index, len(kinds) - 1)], totals)
+    else:
+        loop_kind = np.full(n_loops, kind, dtype=np.float32)
+    colors = np.zeros((n_loops, 4), dtype=np.float32)
+    colors[:, 0] = variant
+    colors[:, 1] = loop_kind / 4.0
+    colors[:, 3] = 1.0
+    attr = mesh.color_attributes.new("tag", "FLOAT_COLOR", "CORNER")
+    attr.data.foreach_set("color", colors.ravel())
+    mesh.color_attributes.active_color = attr
+
+
 class City:
     def __init__(self, lib: Library, rng: random.Random):
         self.lib, self.rng = lib, rng
+        self.tag_rng = random.Random(rng.random())  # separate stream: tags never perturb the layout
         self.collections = {}
         for cls in CLASSES[1:]:
             col = bpy.data.collections.new(cls)
@@ -109,6 +145,7 @@ class City:
         proto = self.lib.get(kit, name)
         inst = proto.copy()
         inst.data = proto.data.copy()
+        tag_mesh(inst.data, self.tag_rng.random(), KIND_PAVEMENT if name.startswith("tile-") else None)
         inst.matrix_world = Matrix.Translation((x, y, 0.0)) @ Matrix.Rotation(math.radians(yaw_deg), 4, "Z") @ Matrix.Scale(scale, 4)
         self.collections[cls].objects.link(inst)
         corners = [inst.matrix_world @ Vector(c) for c in proto.bound_box]
@@ -126,6 +163,7 @@ class City:
         mat.use_nodes = True
         mat.node_tree.nodes["Principled BSDF"].inputs["Base Color"].default_value = (0.28, 0.45, 0.2, 1.0)
         plane.data.materials.append(mat)
+        tag_mesh(plane.data, 0.5, KIND_DEFAULT)
         for c in list(plane.users_collection):
             c.objects.unlink(plane)
         self.collections["ground"].objects.link(plane)
@@ -240,7 +278,8 @@ def export(city: City, out: Path) -> None:
             m.name = f"{cls}.{i:03d}"
             m.select_set(True)
         bpy.ops.export_scene.gltf(
-            filepath=str(out / f"{cls}.glb"), export_format="GLB", use_selection=True, export_yup=True, export_apply=True
+            filepath=str(out / f"{cls}.glb"), export_format="GLB", use_selection=True, export_yup=True, export_apply=True,
+            export_vertex_color="ACTIVE",
         )
         faces = sum(len(m.data.polygons) for m in merged)
         print(f"exported {cls}: {faces} faces in {len(merged)} meshes", flush=True)
