@@ -6,6 +6,7 @@ set -euo pipefail
 
 TEACHER=${TEACHER:-lingbot:large}
 STUDENT=${STUDENT:-lingbot:small}
+BATCH=${BATCH:-32}  # poses per step: ~1.6 GiB + 0.14 GiB/pose peak (32 -> ~6 GiB, 64 -> ~10.6 GiB)
 STEPS=${STEPS:-20000}
 # Spatial holdout: north-east quadrant never appears in training poses.
 REGION=(0 0 245 245)
@@ -20,8 +21,13 @@ if hf download "$DS" config.json >/dev/null 2>&1; then dinov3=true; else echo "D
 [[ -d data/train ]] || visenc data --out data/train --seed 1 --count 20000 --random-views 2 --exclude-region "${REGION[@]}"
 [[ -d data/eval ]] || visenc data --out data/eval --seed 2 --count 3000 --random-views 2
 
-run() { local name=$1; shift; [[ -d runs/$name ]] || visenc distill --data data/train --steps "$STEPS" --out "runs/$name" "$@"; }
-
+# A run is complete once its student checkpoint exists; a crashed run's directory is cleared and redone.
+run() {
+  local name=$1; shift
+  [[ -d runs/$name/student ]] && return
+  rm -rf "runs/$name"
+  visenc distill --data data/train --steps "$STEPS" --batch-size "$BATCH" --out "runs/$name" "$@"
+}
 # Ablations (each changes one factor from `own-pretrained`).
 run own-pretrained   --teacher "$TEACHER" --student "$STUDENT" --views random1 random2 --pair-target own
 run mean-pretrained  --teacher "$TEACHER" --student "$STUDENT" --views random1 random2 --pair-target mean

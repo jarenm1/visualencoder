@@ -140,6 +140,7 @@ def train(args) -> None:
                 "grad_norm": grad_norm.item(),
                 "lr": lr_at(step),
                 "images_per_s": (step + 1) * len(clean) / elapsed,
+                "peak_mem_gib": torch.cuda.max_memory_allocated() / 2**30,
             }
             log.write(json.dumps(rec) + "\n")
             log.flush()
@@ -166,7 +167,7 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--student-aug", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--crop-min-scale", type=float, default=0.4)
     p.add_argument("--steps", type=int, default=20000)
-    p.add_argument("--batch-size", type=int, default=64, help="poses per step (images = poses x views)")
+    p.add_argument("--batch-size", type=int, default=32, help="poses per step (images = poses x views); ~1.6 GiB + 0.14 GiB/pose")
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--min-lr-ratio", type=float, default=0.01)
     p.add_argument("--warmup", type=int, default=1000)
