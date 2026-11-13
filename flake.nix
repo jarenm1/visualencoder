@@ -38,7 +38,9 @@
           # /run/opengl-driver/lib provides the host libcuda.so matching the kernel driver.
           export LD_LIBRARY_PATH=/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath runtimeLibs}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
           uv sync --quiet
-          source .venv/bin/activate
+          # Plain exports (not `source activate`) so direnv can carry them into non-bash shells.
+          export VIRTUAL_ENV="$PWD/.venv"
+          export PATH="$VIRTUAL_ENV/bin:$PATH"
         '';
       };
     };

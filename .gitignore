@@ -5,3 +5,4 @@ runs/
 reports/
 .ipynb_checkpoints/
 assets/
+.direnv/
