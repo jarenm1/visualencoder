@@ -1,0 +1,34 @@
+[project]
+name = "visenc"
+version = "0.1.0"
+description = "Sim-to-real visual encoder: DINOv3 distillation into a ViT with state-grounded evaluation"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "torch==2.14.1",
+    "torchvision",
+    "transformers>=4.56",
+    "safetensors",
+    "numpy",
+    "pillow",
+    "tqdm",
+    "raylib",
+    "jupyterlab",
+    "ipykernel",
+    "matplotlib",
+]
+
+[project.scripts]
+visenc = "visenc.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

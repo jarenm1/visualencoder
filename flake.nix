@@ -1,5 +1,5 @@
 {
-  description = "PyTorch CUDA notebook environment for visual encoder training";
+  description = "Visual encoder (DINOv3 distillation) dev shell: uv-managed PyTorch CUDA";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -7,34 +7,38 @@
     { self, nixpkgs }:
     let
       system = "x86_64-linux";
-      pkgs = import nixpkgs {
-        inherit system;
-        config = {
-          allowUnfree = true; # CUDA is unfree
-          cudaSupport = true;
-          cudaCapabilities = [ "12.0" ]; # RTX 5070 Ti (Blackwell, sm_120)
-        };
-      };
-      python = pkgs.python3.withPackages (
-        ps: with ps; [
-          torch
-          torchvision
-          numpy
-          pandas
-          matplotlib
-          tqdm
-          jupyterlab
-          ipykernel
-          ipywidgets
-        ]
-      );
+      pkgs = import nixpkgs { inherit system; };
+      python = pkgs.python313;
+      # PyPI wheels (torch + bundled CUDA, raylib) dlopen these; NixOS has no FHS /usr/lib.
+      runtimeLibs = with pkgs; [
+        stdenv.cc.cc.lib
+        zlib
+        libGL
+        libx11
+        libxcursor
+        libxrandr
+        libxinerama
+        libxi
+        libxext
+        libxkbcommon
+        wayland
+      ];
     in
     {
       devShells.${system}.default = pkgs.mkShell {
-        packages = [ python ];
+        packages = [
+          python
+          pkgs.uv
+        ];
+        env = {
+          UV_PYTHON = "${python}/bin/python3";
+          UV_PYTHON_DOWNLOADS = "never";
+        };
         shellHook = ''
-          echo "torch $(python -c 'import torch; print(torch.__version__, "cuda:", torch.cuda.is_available())')"
-          echo "run: jupyter lab"
+          # /run/opengl-driver/lib provides the host libcuda.so matching the kernel driver.
+          export LD_LIBRARY_PATH=/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath runtimeLibs}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+          uv sync --quiet
+          source .venv/bin/activate
         '';
       };
     };
