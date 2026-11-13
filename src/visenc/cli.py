@@ -25,6 +25,8 @@ def main() -> None:
     distill.add_args(sub.add_parser("distill", help="distil a frozen teacher encoder into a ViT student"))
     evaluate.add_args(sub.add_parser("eval", help="probe frozen encoders against simulator ground truth"))
     deploy.add_args(sub.add_parser("deploy", help="export ONNX (FP16) and ModelOpt INT8 ONNX for TensorRT on Jetson"))
+    rescore = sub.add_parser("rescore", help="regenerate report.md from a saved report.json")
+    rescore.add_argument("report", type=Path, help="path to report.json")
 
     args = parser.parse_args()
     if args.command == "data":
@@ -38,6 +40,8 @@ def main() -> None:
         distill.train(args)
     elif args.command == "deploy":
         deploy.run(args)
+    elif args.command == "rescore":
+        print(evaluate.rescore(args.report))
     else:
         evaluate.run(args)
 

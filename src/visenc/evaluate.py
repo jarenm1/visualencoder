@@ -26,7 +26,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .city import STATE_GROUPS, STATE_NAMES
+from .city import OBSERVABLE_STATE, STATE_GROUPS, STATE_NAMES
 from .data import ImageFolder, Split
 from .models import PATCH, load_encoder
 
@@ -224,31 +224,50 @@ def view_group(view: str) -> str:
     return "novel" if view.startswith("novel") else "seen"
 
 
+def pose_r2(view_result: dict) -> float:
+    """Headline pose R²: mean over state dimensions except yaw (see city.OBSERVABLE_STATE). Computed from the
+    stored per-dimension R², so older report.json files are re-scored the same way."""
+    per_dim = view_result["state_r2_per_dim"]
+    return float(np.mean([per_dim[n] for n in OBSERVABLE_STATE]))
+
+
 def summary_table(results: list[dict], fit_view: str) -> str:
     others = sorted({v for r in results for v in r["views"] if v != fit_view})
     groups = [g for g in ("seen", "novel") if any(view_group(v) == g for v in others)]
     cols = ["encoder"]
-    for metric in ("state R²", "depth AbsRel", "seg mIoU"):
+    for metric in ("pose R² (no yaw)", "depth AbsRel", "seg mIoU"):
         cols += [f"{metric} {fit_view}", *(f"{metric} {g}" for g in groups)]
     cols += [f"{m} {g}" for m in ("retrieval@1", "patch cos") for g in groups]
     if any("real_domain_accuracy" in r for r in results):
         cols.append("real domain acc")
     lines = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
     for r in results:
-        base = r["views"][fit_view]
+        def value(view: str, key: str) -> float:
+            return pose_r2(r["views"][view]) if key == "pose_r2" else r["views"][view][key]
 
-        def mean(table: dict, key: str, group: str) -> float:
-            vals = [table[v][key] for v in others if view_group(v) == group and v in table]
+        def mean_views(key: str, group: str) -> float:
+            vals = [value(v, key) for v in others if view_group(v) == group and v in r["views"]]
+            return float(np.mean(vals)) if vals else math.nan
+
+        def mean_pairs(key: str, group: str) -> float:
+            vals = [r["pairs"][v][key] for v in others if view_group(v) == group and v in r["pairs"]]
             return float(np.mean(vals)) if vals else math.nan
 
         row: list = [r["spec"]]
-        for key in ("state_r2", "depth_absrel", "semantic_miou"):
-            row += [base[key], *(mean(r["views"], key, g) for g in groups)]
-        row += [mean(r["pairs"], key, g) for key in ("retrieval_at_1", "patch_cosine") for g in groups]
+        for key in ("pose_r2", "depth_absrel", "semantic_miou"):
+            row += [value(fit_view, key), *(mean_views(key, g) for g in groups)]
+        row += [mean_pairs(key, g) for key in ("retrieval_at_1", "patch_cosine") for g in groups]
         if "real domain acc" in cols:
             row.append(r.get("real_domain_accuracy", math.nan))
         lines.append("| " + " | ".join(c if isinstance(c, str) else f"{c:.3f}" for c in row) + " |")
     return "\n".join(lines)
+
+
+def rescore(report_json: Path, fit_view: str = "canonical") -> str:
+    """Regenerate report.md from a saved report.json with the current summary rules."""
+    table = summary_table(json.loads(report_json.read_text()), fit_view)
+    report_json.with_name("report.md").write_text(table + "\n")
+    return table
 
 
 def run(args) -> None:

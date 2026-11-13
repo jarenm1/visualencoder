@@ -282,7 +282,13 @@ class CityLayout:
 
 
 STATE_NAMES = ["pos_x", "pos_y", "pos_z", "yaw_sin", "yaw_cos", "pitch", "roll", "vfov", "clearance", "forward_log_depth"]
-STATE_GROUPS = {"position": slice(0, 3), "orientation": slice(3, 7), "intrinsics": slice(7, 8), "clearance": slice(8, 10)}
+# Yaw is kept apart: in a grid city it is mostly visible only through sun/shadow direction, which the
+# appearance randomisation changes, so a probe fit on the canonical view learns a lighting shortcut.
+STATE_GROUPS = {
+    "position": slice(0, 3), "yaw": slice(3, 5), "pitch_roll": slice(5, 7), "intrinsics": slice(7, 8), "clearance": slice(8, 10),
+}  # fmt: skip
+# Headline pose score: every dimension except yaw.
+OBSERVABLE_STATE = [n for n in STATE_NAMES if not n.startswith("yaw")]
 
 
 def pose_state(pose: Pose, clearance: float, depth: np.ndarray) -> np.ndarray:
