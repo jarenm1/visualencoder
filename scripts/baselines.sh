@@ -42,4 +42,16 @@ if $dinov3; then
   encoders+=("hf:$DS" "hf:$DB" "hf:$DL" run:runs/dinov3-mean-pretrained)
 fi
 
+# Jetson Orin Nano artefacts (ONNX for FP16, ModelOpt INT8 Q/DQ ONNX) and their simulated accuracy.
+deploy_run() {
+  local name=$1
+  [[ -f deploy/$name/deploy.json ]] && return
+  rm -rf "deploy/$name"
+  visenc deploy --encoder "run:runs/$name" --calib data/train --out "deploy/$name"
+}
+for name in own-pretrained mean-pretrained; do
+  deploy_run "$name"
+  encoders+=("fp16:run:runs/$name" "int8:deploy/$name")
+done
+
 visenc eval --data data/eval --heldout-region "${REGION[@]}" --out reports/baselines --encoders "${encoders[@]}"

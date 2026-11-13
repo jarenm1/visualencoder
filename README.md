@@ -70,6 +70,32 @@ Baselines, from the floor upward:
 
 Ablations in `scripts/baselines.sh` each change one factor: pair target, student init, student augmentation, and training on canonical only.
 
+## Jetson Orin Nano deployment
+
+Target: Jetson Orin Nano (JetPack 6, TensorRT 10) running the ViT-S student at the training resolution (320×240, 300 patches).
+
+```sh
+visenc deploy --encoder run:runs/mean-pretrained --calib data/train --out deploy/mean-pretrained
+```
+
+This writes:
+
+- `encoder.onnx`: FP32 weights, static `[1,3,240,320]` float input in [0,1] (ImageNet normalisation is inside the graph). Outputs `cls [1,384]` and `patches [1,300,384]`.
+- `encoder_int8.onnx`: explicit INT8 Q/DQ graph from NVIDIA ModelOpt. It uses SmoothQuant on every Linear/Conv layer, calibrated on 512 rendered views. LayerNorm inputs stay FP16, because the residual stream has outlier channels (final-norm input range ≈ ±400). With ModelOpt's default config, which also quantizes norm inputs, patch cosine to FP32 drops to 0.58.
+- `int8_modelopt.pth`: the quantized model, so `int8:deploy/<name>` can be evaluated.
+- `deploy.json`: cosine of each artefact against PyTorch FP32, plus the `trtexec` commands.
+
+Build the engines on the Jetson; TensorRT engines are tied to the GPU and the TensorRT version:
+
+```sh
+trtexec --onnx=encoder.onnx      --fp16        --saveEngine=encoder_fp16.engine
+trtexec --onnx=encoder_int8.onnx --int8 --fp16 --saveEngine=encoder_int8.engine
+```
+
+Precision is evaluated like any other encoder: `fp16:<spec>` runs the model purely in float16, and `int8:<deploy dir>` runs ModelOpt's simulated INT8. `scripts/baselines.sh` deploys the two pretrained-student runs and adds both precisions to the report.
+
+On the smoke-test student, ONNX INT8 matches simulated INT8 (patch cosine to FP32 0.998 for both), FP16 is unchanged on every probe, and INT8 moves the probes by about 0.01–0.03; the largest change is retrieval@1 (0.705 → 0.670). On-device latency has not been measured yet.
+
 ## Licences
 
 The Kenney kits are CC0, fetched from OpenGameArt mirrors. Poly Haven textures are CC0. LingBot-Vision code and weights are Apache-2.0. DINOv3 weights are under the DINOv3 licence.

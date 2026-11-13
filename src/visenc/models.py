@@ -109,6 +109,8 @@ def load_encoder(spec: str) -> Encoder:
     lingbot:<variant>       pretrained LingBot-Vision (small|base|large|giant)
     lingbot-random:<variant> same LingBot architecture, random init
     run:<dir>               distilled student saved by `visenc distill`
+    fp16:<spec>             any spec above run purely in float16 (FP16 TensorRT stand-in)
+    int8:<deploy dir>       simulated-INT8 model written by `visenc deploy`
     """
     kind, _, arg = spec.partition(":")
     if kind == "pixels":
@@ -123,6 +125,14 @@ def load_encoder(spec: str) -> Encoder:
     if kind == "lingbot-random":
         torch.manual_seed(0)
         return load_lingbot(arg, pretrained=False)
+    if kind == "fp16":
+        from .deploy import FP16
+
+        return FP16(load_encoder(arg))
+    if kind == "int8":
+        from .deploy import load_int8
+
+        return load_int8(Path(arg))
     if kind == "run":
         student = Path(arg) / "student"
         if (student / "lingbot.json").exists():

@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 
-from . import distill, evaluate
+from . import deploy, distill, evaluate
 
 
 def main() -> None:
@@ -20,8 +20,9 @@ def main() -> None:
     data.add_argument("--exclude-region", type=float, nargs=4, metavar=("X0", "Z0", "X1", "Z1"),
                       help="world rectangle no pose may fall in (spatial holdout)")  # fmt: skip
 
-    distill.add_args(sub.add_parser("distill", help="distil a DINOv3 teacher into a ViT student"))
+    distill.add_args(sub.add_parser("distill", help="distil a frozen teacher encoder into a ViT student"))
     evaluate.add_args(sub.add_parser("eval", help="probe frozen encoders against simulator ground truth"))
+    deploy.add_args(sub.add_parser("deploy", help="export ONNX (FP16) and ModelOpt INT8 ONNX for TensorRT on Jetson"))
 
     args = parser.parse_args()
     if args.command == "data":
@@ -33,6 +34,8 @@ def main() -> None:
         )  # fmt: skip
     elif args.command == "distill":
         distill.train(args)
+    elif args.command == "deploy":
+        deploy.run(args)
     else:
         evaluate.run(args)
 

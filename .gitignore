@@ -6,3 +6,4 @@ reports/
 .ipynb_checkpoints/
 assets/
 .direnv/
+deploy/

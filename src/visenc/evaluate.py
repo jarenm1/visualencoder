@@ -93,7 +93,8 @@ class Features:
             else:
                 batch = torch.cat([images[i] for i in idx])
             x = batch.to(self.device).float().div_(255)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            # Precision wrappers (fp16:, int8:) run their own numerics; everything else uses bf16 autocast.
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=getattr(self.encoder, "autocast", True)):
                 cls, tok = self.encoder(x)
             cls, tok = cls.float(), tok.float()
             globals_.append(torch.cat([cls, tok.mean(1)], 1).cpu())

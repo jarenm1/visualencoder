@@ -16,6 +16,10 @@ dependencies = [
     "ipykernel",
     "matplotlib",
     "lingbot-vision",
+    "onnx>=1.23.2",
+    "onnxscript>=0.7.2",
+    "onnxruntime>=1.31.1",
+    "nvidia-modelopt[torch]>=0.48.0",
 ]
 
 [project.scripts]
