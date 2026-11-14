@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 
-from . import deploy, distill, evaluate
+from . import deploy, distill, evaluate, real
 
 
 def main() -> None:
@@ -27,6 +27,9 @@ def main() -> None:
     deploy.add_args(sub.add_parser("deploy", help="export ONNX (FP16) and ModelOpt INT8 ONNX for TensorRT on Jetson"))
     rescore = sub.add_parser("rescore", help="regenerate report.md from a saved report.json")
     rescore.add_argument("report", type=Path, help="path to report.json")
+    uavid = sub.add_parser("uavid", help="download and prepare UAVid real drone frames for sim-to-real eval")
+    uavid.add_argument("--out", type=Path, default=Path("data/uavid"))
+    real.add_args(sub.add_parser("real-eval", help="sim->real and real->real segmentation probes on UAVid"))
 
     args = parser.parse_args()
     if args.command == "data":
@@ -42,6 +45,10 @@ def main() -> None:
         deploy.run(args)
     elif args.command == "rescore":
         print(evaluate.rescore(args.report))
+    elif args.command == "uavid":
+        real.prepare(args.out)
+    elif args.command == "real-eval":
+        real.run(args)
     else:
         evaluate.run(args)
 
