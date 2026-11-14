@@ -27,6 +27,7 @@
     {
       devShells.${system}.default = pkgs.mkShell {
         packages = [
+          pkgs.typst
           python
           pkgs.uv
         ];

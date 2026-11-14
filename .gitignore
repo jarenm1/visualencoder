@@ -7,3 +7,4 @@ reports/
 assets/
 .direnv/
 deploy/
+report/*.pdf
