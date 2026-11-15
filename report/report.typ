@@ -1,7 +1,7 @@
 // Draft project report (Type 1, 3-5 pages). Build: typst compile report/report.typ
 #set document(title: "Appearance-Robust Vision Encoders for Drones via Sim Distillation", author: "Jaren McHugh")
-#set page(paper: "us-letter", margin: 0.9in, numbering: "1")
-#set text(font: "New Computer Modern", size: 10.5pt)
+#set page(paper: "us-letter", margin: 0.8in, numbering: "1")
+#set text(font: "New Computer Modern", size: 10pt)
 #set par(justify: true)
 #set heading(numbering: "1.")
 #show table: set text(size: 9pt)
@@ -71,7 +71,7 @@ distribution used for training, and a *novel* distribution used only for evaluat
 *Splits.* Training: 20,000 poses, two seen looks each, excluding one quadrant of the city. Evaluation: 3,000
 separate poses, each in canonical, two seen and two novel looks. Images are 320×240.
 
-#figure(image("figures/looks.png", width: 100%), caption: [The same four poses in the canonical look, two seen
+#figure(image("figures/looks.png", width: 85%), caption: [The same four poses in the canonical look, two seen
 looks (training distribution) and two novel looks (held-out textures and lighting, evaluation only).]) <fig-looks>
 
 == Distillation
@@ -145,11 +145,7 @@ seeds; the two seeds of each setting differ by at most 0.03 on any metric.
 Standard distillation already beats the off-the-shelf small model. Paired-view consistency improves every
 metric under novel appearance (pose R² +0.11, depth error −17%, segmentation +0.03, retrieval +0.20) with no change on
 the canonical look. With it, the 22M student beats both 300M models on pose, depth and retrieval, and is 0.014 behind
-DINOv3-L on segmentation. @fig-readout shows the student's linear readouts across looks.
-
-#figure(image("figures/readout.png", width: 95%), caption: [Linear-probe readouts of the distilled student for one
-evaluation pose in each look: predicted vs. true segmentation and depth, and depth error. Errors concentrate at the
-distant horizon.]) <fig-readout>
+DINOv3-L on segmentation.
 
 == Ablations
 #figure(
