@@ -7,11 +7,11 @@ Each encoder's per-patch segmentation probe is fit on simulator renders only (ca
 counterpart (human, clutter) in the ground truth.
 """
 
-import matplotlib
-
 from pathlib import Path
 
 import matplotlib
+
+matplotlib.use("Agg")
 import numpy as np
 
 from visenc import explore as X
