@@ -1,6 +1,6 @@
 # visualencoder
 
-Sim-to-real at the visual-encoder level: distil a large vision foundation model (LingBot-Vision by default, DINOv3 once access is granted) into a small ViT. The student is trained and evaluated on one large, static simulated city, where every image comes with exact ground truth.
+Sim-to-real at the visual-encoder level: distil a large vision foundation model (LingBot-Vision by default, or DINOv3) into a small ViT. Paired simulated appearances isolate appearance robustness; independent experiments test geometry generalization, unlabelled-real adaptation, and downstream navigation.
 
 ## Setup
 
@@ -46,7 +46,7 @@ The teacher is a frozen encoder: [LingBot-Vision](https://huggingface.co/collect
 
 - `--pair-target own`: each view distils the teacher's features of itself.
 - `--pair-target mean`: every view distils the teacher features averaged over views, so the student learns one representation per physical state.
-- `--extra-images DIR`: mixes in unlabelled real frames, distilled with `own` targets.
+- `--extra-images DIR_OR_NPY`: mixes in unlabelled real frames, distilled with `own` targets. Prepared `data/uavid/train_rgb.npy` uses the same 4:3 crop as evaluation and never opens masks.
 
 ## Evaluation
 
@@ -69,6 +69,62 @@ Baselines, from the floor upward:
 4. The LingBot-Vision B/L teachers, plus DINOv3 B/L when accessible
 
 Ablations in `scripts/baselines.sh` each change one factor: pair target, student init, student augmentation, and training on canonical only.
+
+### Real drone evaluation
+
+```sh
+visenc uavid --out data/uavid
+visenc real-eval --encoders lingbot:small run:runs/baseline run:runs/mean \
+  --baseline lingbot:small --out reports/real-with-uncertainty
+# Recompute metrics or paired comparisons from saved predictions, without model inference:
+python -m visenc.real rescore --reports reports/real-with-uncertainty/report.json \
+  --baseline lingbot:small --out reports/real-rescored
+```
+
+UAVid train/validation videos must be disjoint. A simulator-fit segmentation probe is applied unchanged to 70 real validation frames; a separate UAVid-train probe measures real→real readout quality. Car detection is **patch ranking**, not bounding boxes: positives have ≥10% car pixels, negatives have none, and intermediate fractions are excluded. Both static and moving cars count. Reports include tie-correct AUROC, non-interpolated average precision, positive/negative counts and prevalence.
+
+Confidence intervals resample whole video sequences (1,000 draws, shared across models and probe directions), not individual patches. Paired differences use those same draws. Only seven validation sequences are available; these intervals exclude training-seed and probe-fitting uncertainty. Cached per-frame predictions, protocol and fit indices accompany every report. The real→real minus sim→real gap must be read alongside both absolute scores: losing general real-image quality can also shrink that gap.
+
+## Independent experiments
+
+### Geometry × consistency
+
+```sh
+python -m visenc.geometry prepare --out data/geometry
+python -m visenc.experiments geometry
+```
+
+The 2×2 design crosses fixed versus three-layout training with `own` versus `mean` targets. Each arm has 20,000 training poses, 10,000 optimizer steps and 64 images/step, with seeds 0 and 1. Matching completed fixed-city controls are reused. All cities retain the same 490 m extent and excluded quadrant; road spacing, districts, building shape/scale and object arrangements vary. Two separate seed-family layouts are held out.
+
+**All encoders use identical canonical probe-fitting images and identical evaluation images.** Probes are never refit on held-out geometry. Reports separate familiar geometry under canonical/seen/novel appearance from held-out geometry under each appearance regime. Layout hashes, pose seeds, budgets and per-scene scores are saved. `--data` also accepts multiple split directories directly for concatenated distillation.
+
+### Unlabelled-real adaptation
+
+```sh
+python -m visenc.experiments mixed
+```
+
+This independent 2×2 crosses simulation-only versus simulation-plus-real images with `own` versus `mean` targets. Only UAVid **training RGB** enters distillation; no real labels or validation frames are used. Both conditions process 64 images/step: 32 paired simulator poses versus 24 paired poses plus 16 real images. Steps, teacher, initialization and training seeds match. The fixed compute budget therefore reduces simulator exposure in the mixed condition; it is not an equal-simulator-exposure comparison.
+
+Each treatment is evaluated independently on the existing simulator split and UAVid. This is **real-data-assisted adaptation**, not simulation-only transfer. Machine-readable results, uncertainty intervals and readable tables live under `reports/experiments/mixed`; geometry outputs are separate under `reports/experiments/geometry`. Incomplete training runs are never deleted or silently reused.
+
+### GPU-owned visual navigation
+
+The separate [`sim/`](sim/) Cargo workspace supplies Vulkan/wgpu-hal rendering, NVIDIA Rust CUDA physics, external-memory/timeline synchronization, and a GPU-resident navigation task. The Python learner borrows CUDA tensor storage and runs the actual frozen visual encoder plus recurrent PPO on the native stream. The superseded host-staged prototype is removed.
+
+```sh
+cd sim && nix develop
+cargo oxide build --arch sm_120 --device-codegen-crate sim_physics,sim_env -- -p sim-env --profile training
+cd ..
+nix develop path:sim --command .venv/bin/python sim/python/train.py profile \
+  --encoder mean --width 320 --height 240 --library .sim-target/training/libsim_env.so \
+  --out runs/gpu-profile
+```
+
+Actual collection and PPO-update traces pass the zero-host-staging/wait gate. Initialization, checkpoint export and post-rollout logging are explicit boundaries outside that claim. Learning success and wall-clock training time are separate measurements; an engineering oracle or profiler pass is not an RL result.
+
+Completed visual PPO runs and learned blind/privileged controls are recorded in [`sim/verification.json`](sim/verification.json); the generated paper table is `report/navigation.typ`. Timings include initialization, training and evaluation, not compilation. This is a three-action lateral-gap task with stabilized forward speed and altitude, one PPO training seed, and 128 independent held-out episodes per policy—not full aerodynamic flight.
+
 
 ## Jetson Orin Nano deployment
 
@@ -95,6 +151,17 @@ trtexec --onnx=encoder_int8.onnx --int8 --fp16 --saveEngine=encoder_int8.engine
 Precision is evaluated like any other encoder: `fp16:<spec>` runs the model purely in float16, and `int8:<deploy dir>` runs ModelOpt's simulated INT8. `scripts/baselines.sh` deploys the two pretrained-student runs and adds both precisions to the report.
 
 On the smoke-test student, ONNX INT8 matches simulated INT8 (patch cosine to FP32 0.998 for both), FP16 is unchanged on every probe, and INT8 moves the probes by about 0.01–0.03; the largest change is retrieval@1 (0.705 → 0.670). On-device latency has not been measured yet.
+
+## Report
+
+Compile explicitly to the repository root so the main PDF is easy to find:
+
+```sh
+nix develop --command typst compile report/report.typ report.pdf
+nix develop --command typst compile report/supplement.typ report/supplement.pdf
+```
+
+The supplement contains secondary ablations and real/layout/trained-policy visual checks. Table generators consume completed measured reports; they do not substitute plans or smoke results for full-budget experiments.
 
 ## Licences
 

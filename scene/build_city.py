@@ -140,20 +140,26 @@ class City:
             self.collections[cls] = col
         self.layout: list[dict] = []
 
-    def place(self, cls: str, kit: str, name: str, x: float, y: float, yaw_deg: float = 0.0, scale: float = 1.0) -> None:
-        """x, y in Blender ground-plane metres; yaw about +Z."""
+    def place(self, cls: str, kit: str, name: str, x: float, y: float, yaw_deg: float = 0.0,
+              scale: float | tuple[float, float, float] = 1.0) -> None:
+        """x, y in Blender ground-plane metres; tuple scale is (width, length, height)."""
         proto = self.lib.get(kit, name)
         inst = proto.copy()
         inst.data = proto.data.copy()
         tag_mesh(inst.data, self.tag_rng.random(), KIND_PAVEMENT if name.startswith("tile-") else None)
-        inst.matrix_world = Matrix.Translation((x, y, 0.0)) @ Matrix.Rotation(math.radians(yaw_deg), 4, "Z") @ Matrix.Scale(scale, 4)
+        axes = (scale, scale, scale) if isinstance(scale, (int, float)) else scale
+        inst.matrix_world = (Matrix.Translation((x, y, 0.0))
+                             @ Matrix.Rotation(math.radians(yaw_deg), 4, "Z")
+                             @ Matrix.Diagonal((*axes, 1.0)))
         self.collections[cls].objects.link(inst)
         corners = [inst.matrix_world @ Vector(c) for c in proto.bound_box]
         lo = [min(c[i] for c in corners) for i in range(3)]
         hi = [max(c[i] for c in corners) for i in range(3)]
         # Blender (x, y, z-up) -> glTF (x, y-up, z = -y)
         self.layout.append(
-            {"class": cls, "asset": f"{kit}:{name}", "min": [lo[0], lo[2], -hi[1]], "max": [hi[0], hi[2], -lo[1]]}
+            {"class": cls, "asset": f"{kit}:{name}", "position": [x, 0.0, -y],
+             "yaw_deg": yaw_deg, "scale": list(axes),
+             "min": [lo[0], lo[2], -hi[1]], "max": [hi[0], hi[2], -lo[1]]}
         )
 
     def ground_plane(self, half: float) -> None:
@@ -169,11 +175,32 @@ class City:
         self.collections["ground"].objects.link(plane)
 
 
-def build(city: City, blocks: int) -> float:
+def build(city: City, blocks: int, varied: bool = True) -> float:
     rng = city.rng
-    n_tiles = blocks * BLOCK + 1
+    # Move road junctions while preserving the fixed arm's extent and pose support.
+    def periods() -> list[int]:
+        if not varied or blocks < 2:
+            return [BLOCK] * blocks
+        pairs = rng.randint(1, blocks // 2)
+        widths = [BLOCK - 1, BLOCK + 1] * pairs + [BLOCK] * (blocks - 2 * pairs)
+        rng.shuffle(widths)
+        return widths
+
+    periods_x, periods_y = periods(), periods()
+    roads_x = [0] + list(np.cumsum(periods_x).astype(int))
+    roads_y = [0] + list(np.cumsum(periods_y).astype(int))
+    n_tiles = max(roads_x[-1], roads_y[-1]) + 1
     half = n_tiles * TILE / 2
     centre = (blocks - 1) / 2
+    district_x = centre + rng.uniform(-0.25, 0.25) * blocks if varied else centre
+    district_y = centre + rng.uniform(-0.25, 0.25) * blocks if varied else centre
+    district_aspect = rng.uniform(0.7, 1.4) if varied else 1.0
+    house_density = rng.uniform(0.4, 0.7) if varied else 0.55
+    vehicle_density = rng.uniform(0.12, 0.32) if varied else 0.22
+    city.design = {"mode": "varied" if varied else "fixed", "periods_x": periods_x,
+                   "periods_y": periods_y, "district_centre": [district_x, district_y],
+                   "district_aspect": district_aspect, "house_density": house_density,
+                   "vehicle_density": vehicle_density}
 
     def tile_xy(i: int, j: int) -> tuple[float, float]:
         return (i + 0.5) * TILE - half, (j + 0.5) * TILE - half
@@ -181,7 +208,7 @@ def build(city: City, blocks: int) -> float:
     # Roads every BLOCK tiles in both directions.
     for i in range(n_tiles):
         for j in range(n_tiles):
-            ri, rj = i % BLOCK == 0, j % BLOCK == 0
+            ri, rj = i in roads_x, j in roads_y
             if not (ri or rj):
                 continue
             x, y = tile_xy(i, j)
@@ -194,30 +221,36 @@ def build(city: City, blocks: int) -> float:
                 side = rng.choice([-1, 1]) * 0.42 * TILE
                 lx, ly = (x + side, y) if ri else (x, y + side)
                 city.place("prop", "roads", "light-square", lx, ly, yaw + (180 if side > 0 else 0))
-            if rng.random() < 0.22:
+            if rng.random() < vehicle_density:
                 lane = rng.choice([-1, 1]) * 0.18 * TILE
                 cx, cy = (x + lane, y) if ri else (x, y + lane)
                 city.place("vehicle", "cars", rng.choice(CARS), cx, cy, yaw + rng.choice([0, 180]))
 
     for bi in range(blocks):
         for bj in range(blocks):
-            r = max(abs(bi - centre), abs(bj - centre)) / max(centre, 1)
+            r = max(abs(bi - district_x) * district_aspect,
+                    abs(bj - district_y) / district_aspect) / max(centre, 1)
             district = "downtown" if r < 0.35 else "suburb" if r < 0.75 else "park"
             if district != "park" and rng.random() < 0.12:
                 district = "park"
-            cells = [(bi * BLOCK + 1 + a, bj * BLOCK + 1 + b) for a in range(3) for b in range(3)]
+            cells = [(i, j) for i in range(roads_x[bi] + 1, roads_x[bi + 1])
+                     for j in range(roads_y[bj] + 1, roads_y[bj + 1])]
             for i, j in cells:
                 x, y = tile_xy(i, j)
                 yaw = 90.0 * rng.randrange(4)
+                # Fit varied footprints inside their lot; height varies independently.
+                building_scale = ((rng.uniform(0.65, 0.95), rng.uniform(0.65, 0.95),
+                                   rng.uniform(0.65, 1.9)) if varied else 1.0)
+                ox, oy = (rng.uniform(-0.06, 0.06) * TILE for _ in range(2)) if varied else (0.0, 0.0)
                 if district == "downtown":
                     city.place("road", "roads", "tile-low", x, y)
                     tower_p = 0.55 * (1 - r / 0.35)
                     name = rng.choice(TOWERS) if rng.random() < tower_p else rng.choice(DOWNTOWN)
-                    city.place("building", "commercial", name, x, y, yaw)
+                    city.place("building", "commercial", name, x + ox, y + oy, yaw, building_scale)
                 elif district == "suburb":
                     roll = rng.random()
-                    if roll < 0.55:
-                        city.place("building", "suburban", rng.choice(HOUSES), x, y, yaw)
+                    if roll < house_density:
+                        city.place("building", "suburban", rng.choice(HOUSES), x + ox, y + oy, yaw, building_scale)
                     elif roll < 0.85:
                         for _ in range(rng.randint(1, 3)):
                             ox, oy = (rng.uniform(-0.35, 0.35) * TILE for _ in range(2))
@@ -292,12 +325,21 @@ def main() -> None:
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--blocks", type=int, default=12, help="city is blocks x blocks; each block is 40 m")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--family", choices=["train", "heldout"], default="train",
+                   help="disjoint build RNG namespace, heldout is never used for training")
+    p.add_argument("--layout-mode", choices=["varied", "fixed"], default="varied")
     args = p.parse_args(argv)
 
+    if args.blocks < 1 or args.seed < 0:
+        p.error("blocks must be positive and seed nonnegative")
+    if args.out.exists() and any(args.out.iterdir()):
+        p.error(f"refusing to overwrite existing scene: {args.out}")
     bpy.ops.wm.read_factory_settings(use_empty=True)
     args.out.mkdir(parents=True, exist_ok=True)
-    city = City(Library(args.assets.resolve()), random.Random(args.seed))
-    half = build(city, args.blocks)
+    # Domain-separated seeds preserve a held-out build-seed family even with equal integer seeds.
+    rng_seed = f"visenc-layout-v2:{args.family}:{args.seed}" if args.layout_mode == "varied" else args.seed
+    city = City(Library(args.assets.resolve()), random.Random(rng_seed))
+    half = build(city, args.blocks, varied=args.layout_mode == "varied")
     export(city, args.out)
     solid = [o for o in city.layout if o["class"] in SOLID]
     (args.out / "layout.json").write_text(
@@ -307,6 +349,11 @@ def main() -> None:
                 "solid_classes": sorted(SOLID),
                 "seed": args.seed,
                 "blocks": args.blocks,
+                "builder_version": 2,
+                "seed_family": args.family,
+                "rng_seed": rng_seed,
+                "design": city.design,
+                "assets_root": str(args.assets.resolve()),
                 "tile_m": TILE,
                 "city_half_extent_m": half,
                 "objects": solid,

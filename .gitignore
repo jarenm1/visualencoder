@@ -8,3 +8,4 @@ assets/
 .direnv/
 deploy/
 report/*.pdf
+.sim-target/

@@ -17,14 +17,30 @@ import math
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.v2 as T
 import torchvision.transforms.v2.functional as TF
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 from .data import ImageFolder, PairedViews, Split
 from .models import Student, load_encoder, load_student, save_backbone
+
+
+class UnlabelledArray(Dataset):
+    """Prepared RGB frames only; never opens semantic labels or validation data."""
+
+    def __init__(self, path: str, size: tuple[int, int]):
+        self.images = np.load(path, mmap_mode="r")
+        if self.images.dtype != np.uint8 or self.images.shape[1:] != (*size, 3):
+            raise ValueError(f"{path}: expected uint8 [N,{size[0]},{size[1]},3], got {self.images.shape}")
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, index):
+        return torch.from_numpy(self.images[index].copy()).permute(2, 0, 1)[None]
 
 
 def shared_crop(views: torch.Tensor, scale: tuple[float, float]) -> torch.Tensor:
@@ -68,16 +84,26 @@ def train(args) -> None:
     out.mkdir(parents=True, exist_ok=False)
     (out / "args.json").write_text(json.dumps(vars(args), indent=2, default=str))
 
-    split = Split(args.data)
-    size = split.size
-    poses = PairedViews(split, args.views)
-    loader = DataLoader(poses, args.batch_size, shuffle=True, num_workers=args.workers, drop_last=True, persistent_workers=True)
+    paths = [args.data] if isinstance(args.data, str) else args.data
+    splits = [Split(path) for path in paths]
+    size = splits[0].size
+    if any(split.size != size or split.meta["classes"] != splits[0].meta["classes"] for split in splits):
+        raise ValueError("training splits must have matching image sizes and class definitions")
+    poses = ConcatDataset([PairedViews(split, args.views) for split in splits])
+    if len(poses) < args.batch_size:
+        raise ValueError("training dataset is smaller than one batch")
+    loader = DataLoader(poses, args.batch_size, shuffle=True, num_workers=args.workers, drop_last=True,
+                        persistent_workers=args.workers > 0)
     batches = _cycle(loader)
     extra = None
     if args.extra_images:
-        extra_ds = ImageFolder(args.extra_images, size)
+        extra_ds = (UnlabelledArray(args.extra_images, size) if Path(args.extra_images).suffix == ".npy"
+                    else ImageFolder(args.extra_images, size))
+        if len(extra_ds) < args.extra_batch_size or args.extra_batch_size < 1:
+            raise ValueError("unlabelled dataset must contain at least one positive-sized extra batch")
         extra = _cycle(
-            DataLoader(extra_ds, args.extra_batch_size, shuffle=True, num_workers=args.workers, drop_last=True, persistent_workers=True)
+            DataLoader(extra_ds, args.extra_batch_size, shuffle=True, num_workers=args.workers, drop_last=True,
+                       persistent_workers=args.workers > 0)
         )
 
     teacher = load_encoder(args.teacher).to(device).eval().requires_grad_(False)
@@ -156,10 +182,10 @@ def save(student: Student, out: Path) -> None:
 
 
 def add_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--data", required=True, help="split directory from `visenc data`")
+    p.add_argument("--data", nargs="+", required=True, help="one or more split directories from `visenc data`")
     p.add_argument("--views", nargs="+", default=["random1", "random2"], help="appearance views per pose, e.g. random1 random2")
     p.add_argument("--pair-target", choices=["own", "mean"], default="own")
-    p.add_argument("--extra-images", help="folder of unlabelled images (e.g. real frames), distilled with own targets")
+    p.add_argument("--extra-images", help="folder or prepared RGB .npy of unlabelled training images; own targets")
     p.add_argument("--extra-batch-size", type=int, default=16)
     p.add_argument("--teacher", default="lingbot:large", help="encoder spec (see visenc.models.load_encoder)")
     p.add_argument("--student", default="lingbot:small", help="hf:<id> or lingbot:<variant>; architecture (and weights if pretrained)")

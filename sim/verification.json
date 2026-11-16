@@ -29,9 +29,9 @@
     "note": "Observed separate target-directory builds, not a controlled compiler benchmark; download/provisioning excluded."
   },
   "learned_state_ceiling": {
-    "summary": "runs/gpu-state-320-seed0-persistent/summary.json",
+    "summary": "runs/gpu-state-320-seed0-validated/summary.json",
     "actual_steps": 999424,
-    "elapsed_seconds_including_initialization_training_evaluation": 238.0407198049943,
+    "elapsed_seconds_including_initialization_training_evaluation": 237.15835340299964,
     "held_out_episodes": 128,
     "successes": 128,
     "collisions": 0,
@@ -46,9 +46,9 @@
     "note": "Reuse one validation environment/stream; avoids per-stream allocator and cuBLAS workspace retention."
   },
   "learned_no_vision_control": {
-    "summary": "runs/gpu-proprio-320-seed0-persistent/summary.json",
+    "summary": "runs/gpu-proprio-320-seed0-validated/summary.json",
     "actual_steps": 999424,
-    "elapsed_seconds_including_initialization_training_evaluation": 235.07352556599653,
+    "elapsed_seconds_including_initialization_training_evaluation": 239.46551435999572,
     "held_out_episodes": 128,
     "successes": 33,
     "collisions": 95
@@ -81,5 +81,35 @@
     "collisions": 0,
     "meaningful_visual_goal_met": true,
     "note": "Measured before the shader-output constructor portability fix; the archived native binary preserves this run's provenance."
+  },
+  "validated_visual_rl": {
+    "actual_steps_per_run": 999424,
+    "held_out_episodes_per_policy": 128,
+    "training_seeds": [0],
+    "timing_scope": "Initialization, training, validation, final evaluation and checkpointing; compilation excluded.",
+    "policies": [
+      {
+        "encoder": "lingbot:small",
+        "summary": "runs/gpu-pretrained-320-seed0-validated/summary.json",
+        "elapsed_seconds": 1531.9847456350035,
+        "successes": 127,
+        "collisions": 1
+      },
+      {
+        "encoder": "run:runs/baseline",
+        "summary": "runs/gpu-baseline-320-seed0-validated/summary.json",
+        "elapsed_seconds": 1542.4190215950002,
+        "successes": 128,
+        "collisions": 0
+      },
+      {
+        "encoder": "run:runs/mean",
+        "summary": "runs/gpu-mean-320-seed0-validated/summary.json",
+        "elapsed_seconds": 1607.2837368980036,
+        "successes": 128,
+        "collisions": 0
+      }
+    ],
+    "note": "All use the Vulkan-validation-clean native build. Simple lateral-gap task with stabilized altitude/forward speed; near-ceiling results do not establish a consistency advantage."
   }
 }

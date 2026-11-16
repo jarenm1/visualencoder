@@ -1,0 +1,497 @@
+[
+  {
+    "run": "runs/gpu-pretrained-320-seed0-validated",
+    "encoder": "lingbot:small",
+    "seed": 0,
+    "actual_steps": 999424,
+    "selected_steps": 262144,
+    "elapsed_seconds": 1531.9847456350035,
+    "width": 320,
+    "height": 240,
+    "success_wilson95": [
+      0.9570737405611394,
+      0.9986195681071257
+    ],
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "result": {
+      "status": "step_budget_complete_rounded_down",
+      "actual_steps": 999424,
+      "requested_steps": 1000000,
+      "selected_steps": 262144,
+      "elapsed_seconds_including_initialization_training_evaluation": 1531.9847456350035,
+      "wall_budget_seconds": 3300.0,
+      "within_wall_budget": true,
+      "compile_excluded": true,
+      "convergence_claim": false,
+      "timings": {
+        "initialization_seconds": 3.472109961003298,
+        "collection_seconds": 1078.3227105880069,
+        "ppo_seconds": 55.552239525990444,
+        "validation_seconds": 368.3552920790171,
+        "final_evaluation_seconds": 26.0354613649979,
+        "checkpoint_seconds": 0.03747831499640597
+      },
+      "final_test": {
+        "visual": {
+          "episodes": 128,
+          "success": 0.9921875,
+          "collision": 0.0078125,
+          "mean_return": 6.127264976501465,
+          "mean_steps": 120.5390625,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.08241024887568725,
+          "policy": "checkpoint",
+          "horizon_terminal": 150
+        },
+        "center": {
+          "episodes": 128,
+          "success": 0.2734375,
+          "collision": 0.7265625,
+          "mean_return": -1.5206222534179688,
+          "mean_steps": 74.5,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.41918136654991217,
+          "policy": "center",
+          "horizon_terminal": 150
+        },
+        "goal_centering": {
+          "episodes": 128,
+          "success": 0.2734375,
+          "collision": 0.7265625,
+          "mean_return": -1.5206222534179688,
+          "mean_steps": 74.5,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.41918136654991217,
+          "policy": "goal_centering",
+          "horizon_terminal": 150
+        },
+        "random": {
+          "episodes": 128,
+          "success": 0.2734375,
+          "collision": 0.7265625,
+          "mean_return": -1.5198410749435425,
+          "mean_steps": 74.578125,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.4191392443823135,
+          "policy": "random",
+          "horizon_terminal": 150
+        },
+        "seed": 200003,
+        "style": 2,
+        "cuda_memory": {
+          "stream": 93824999626000,
+          "allocated_bytes": 233438208,
+          "reserved_bytes": 2889875456,
+          "global_free_bytes": 3400794112,
+          "global_total_bytes": 16608133120
+        }
+      },
+      "acceptance": {
+        "policy_success": 0.9921875,
+        "best_blind_success": 0.2734375,
+        "absolute_gain": 0.71875,
+        "episodes": 128,
+        "meaningful_visual_goal_met": true,
+        "criterion": "visual success >=0.8 and >=0.2 absolute above best blind heuristic on >=128 held-out episodes"
+      },
+      "checkpoint": "runs/gpu-pretrained-320-seed0-validated/best.pt",
+      "last_checkpoint": "runs/gpu-pretrained-320-seed0-validated/last.pt"
+    }
+  },
+  {
+    "run": "runs/gpu-baseline-320-seed0-validated",
+    "encoder": "run:runs/baseline",
+    "seed": 0,
+    "actual_steps": 999424,
+    "selected_steps": 983040,
+    "elapsed_seconds": 1542.4190215950002,
+    "width": 320,
+    "height": 240,
+    "success_wilson95": [
+      0.9708630437264916,
+      1.0
+    ],
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "result": {
+      "status": "step_budget_complete_rounded_down",
+      "actual_steps": 999424,
+      "requested_steps": 1000000,
+      "selected_steps": 983040,
+      "elapsed_seconds_including_initialization_training_evaluation": 1542.4190215950002,
+      "wall_budget_seconds": 3300.0,
+      "within_wall_budget": true,
+      "compile_excluded": true,
+      "convergence_claim": false,
+      "timings": {
+        "initialization_seconds": 3.249357043998316,
+        "collection_seconds": 1083.9969578939927,
+        "ppo_seconds": 55.92924275795667,
+        "validation_seconds": 372.9814215520091,
+        "final_evaluation_seconds": 26.051562665998063,
+        "checkpoint_seconds": 0.025789903003897052
+      },
+      "final_test": {
+        "visual": {
+          "episodes": 128,
+          "success": 1.0,
+          "collision": 0.0,
+          "mean_return": 6.209999084472656,
+          "mean_steps": 121.0,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.0,
+          "policy": "checkpoint",
+          "horizon_terminal": 150
+        },
+        "center": {
+          "episodes": 128,
+          "success": 0.2734375,
+          "collision": 0.7265625,
+          "mean_return": -1.5206222534179688,
+          "mean_steps": 74.5,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.41918136654991217,
+          "policy": "center",
+          "horizon_terminal": 150
+        },
+        "goal_centering": {
+          "episodes": 128,
+          "success": 0.2734375,
+          "collision": 0.7265625,
+          "mean_return": -1.5206222534179688,
+          "mean_steps": 74.5,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.41918136654991217,
+          "policy": "goal_centering",
+          "horizon_terminal": 150
+        },
+        "random": {
+          "episodes": 128,
+          "success": 0.2734375,
+          "collision": 0.7265625,
+          "mean_return": -1.5198410749435425,
+          "mean_steps": 74.578125,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.4191392443823135,
+          "policy": "random",
+          "horizon_terminal": 150
+        },
+        "seed": 200003,
+        "style": 2,
+        "cuda_memory": {
+          "stream": 93824999972688,
+          "allocated_bytes": 233438208,
+          "reserved_bytes": 2889875456,
+          "global_free_bytes": 3434348544,
+          "global_total_bytes": 16608133120
+        }
+      },
+      "acceptance": {
+        "policy_success": 1.0,
+        "best_blind_success": 0.2734375,
+        "absolute_gain": 0.7265625,
+        "episodes": 128,
+        "meaningful_visual_goal_met": true,
+        "criterion": "visual success >=0.8 and >=0.2 absolute above best blind heuristic on >=128 held-out episodes"
+      },
+      "checkpoint": "runs/gpu-baseline-320-seed0-validated/best.pt",
+      "last_checkpoint": "runs/gpu-baseline-320-seed0-validated/last.pt"
+    }
+  },
+  {
+    "run": "runs/gpu-mean-320-seed0-validated",
+    "encoder": "run:runs/mean",
+    "seed": 0,
+    "actual_steps": 999424,
+    "selected_steps": 458752,
+    "elapsed_seconds": 1607.2837368980036,
+    "width": 320,
+    "height": 240,
+    "success_wilson95": [
+      0.9708630437264916,
+      1.0
+    ],
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "result": {
+      "status": "step_budget_complete_rounded_down",
+      "actual_steps": 999424,
+      "requested_steps": 1000000,
+      "selected_steps": 458752,
+      "elapsed_seconds_including_initialization_training_evaluation": 1607.2837368980036,
+      "wall_budget_seconds": 3300.0,
+      "within_wall_budget": true,
+      "compile_excluded": true,
+      "convergence_claim": false,
+      "timings": {
+        "initialization_seconds": 3.742609111002821,
+        "collection_seconds": 1130.1271602739944,
+        "ppo_seconds": 56.72894610904768,
+        "validation_seconds": 390.5010103980021,
+        "final_evaluation_seconds": 25.95678788400255,
+        "checkpoint_seconds": 0.035368205994018354
+      },
+      "final_test": {
+        "visual": {
+          "episodes": 128,
+          "success": 1.0,
+          "collision": 0.0,
+          "mean_return": 6.209999084472656,
+          "mean_steps": 121.0,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.0,
+          "policy": "checkpoint",
+          "horizon_terminal": 150
+        },
+        "center": {
+          "episodes": 128,
+          "success": 0.2734375,
+          "collision": 0.7265625,
+          "mean_return": -1.5206222534179688,
+          "mean_steps": 74.5,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.41918136654991217,
+          "policy": "center",
+          "horizon_terminal": 150
+        },
+        "goal_centering": {
+          "episodes": 128,
+          "success": 0.2734375,
+          "collision": 0.7265625,
+          "mean_return": -1.5206222534179688,
+          "mean_steps": 74.5,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.41918136654991217,
+          "policy": "goal_centering",
+          "horizon_terminal": 150
+        },
+        "random": {
+          "episodes": 128,
+          "success": 0.2734375,
+          "collision": 0.7265625,
+          "mean_return": -1.5198410749435425,
+          "mean_steps": 74.578125,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.4191392443823135,
+          "policy": "random",
+          "horizon_terminal": 150
+        },
+        "seed": 200003,
+        "style": 2,
+        "cuda_memory": {
+          "stream": 93824999442928,
+          "allocated_bytes": 233438208,
+          "reserved_bytes": 2889875456,
+          "global_free_bytes": 3426287616,
+          "global_total_bytes": 16608133120
+        }
+      },
+      "acceptance": {
+        "policy_success": 1.0,
+        "best_blind_success": 0.2734375,
+        "absolute_gain": 0.7265625,
+        "episodes": 128,
+        "meaningful_visual_goal_met": true,
+        "criterion": "visual success >=0.8 and >=0.2 absolute above best blind heuristic on >=128 held-out episodes"
+      },
+      "checkpoint": "runs/gpu-mean-320-seed0-validated/best.pt",
+      "last_checkpoint": "runs/gpu-mean-320-seed0-validated/last.pt"
+    }
+  },
+  {
+    "run": "runs/gpu-state-320-seed0-validated",
+    "encoder": "state",
+    "seed": 0,
+    "actual_steps": 999424,
+    "selected_steps": 65536,
+    "elapsed_seconds": 237.15835340299964,
+    "width": 320,
+    "height": 240,
+    "success_wilson95": [
+      0.9708630437264916,
+      1.0
+    ],
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "result": {
+      "status": "step_budget_complete_rounded_down",
+      "actual_steps": 999424,
+      "requested_steps": 1000000,
+      "selected_steps": 65536,
+      "elapsed_seconds_including_initialization_training_evaluation": 237.15835340299964,
+      "wall_budget_seconds": 3300.0,
+      "within_wall_budget": true,
+      "compile_excluded": true,
+      "convergence_claim": false,
+      "timings": {
+        "initialization_seconds": 2.701781422001659,
+        "collection_seconds": 147.24601139302104,
+        "ppo_seconds": 56.57494934697024,
+        "validation_seconds": 23.874477718010894,
+        "final_evaluation_seconds": 6.47428175299865,
+        "checkpoint_seconds": 0.005205535002460238
+      },
+      "final_test": {
+        "state": {
+          "episodes": 128,
+          "success": 1.0,
+          "collision": 0.0,
+          "mean_return": 6.209999084472656,
+          "mean_steps": 121.0,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.0,
+          "policy": "checkpoint",
+          "horizon_terminal": 150
+        },
+        "center": {
+          "episodes": 128,
+          "success": 0.2734375,
+          "collision": 0.7265625,
+          "mean_return": -1.5206222534179688,
+          "mean_steps": 74.5,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.41918136654991217,
+          "policy": "center",
+          "horizon_terminal": 150
+        },
+        "goal_centering": {
+          "episodes": 128,
+          "success": 0.2734375,
+          "collision": 0.7265625,
+          "mean_return": -1.5206222534179688,
+          "mean_steps": 74.5,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.41918136654991217,
+          "policy": "goal_centering",
+          "horizon_terminal": 150
+        },
+        "random": {
+          "episodes": 128,
+          "success": 0.2734375,
+          "collision": 0.7265625,
+          "mean_return": -1.5198410749435425,
+          "mean_steps": 74.578125,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.4191392443823135,
+          "policy": "random",
+          "horizon_terminal": 150
+        },
+        "seed": 200003,
+        "style": 2,
+        "cuda_memory": {
+          "stream": 93824997472752,
+          "allocated_bytes": 138382848,
+          "reserved_bytes": 167772160,
+          "global_free_bytes": 3361669120,
+          "global_total_bytes": 16608133120
+        }
+      },
+      "acceptance": {
+        "policy_success": 1.0,
+        "best_blind_success": 0.2734375,
+        "absolute_gain": 0.7265625,
+        "episodes": 128,
+        "meaningful_visual_goal_met": false,
+        "criterion": "visual success >=0.8 and >=0.2 absolute above best blind heuristic on >=128 held-out episodes"
+      },
+      "checkpoint": "runs/gpu-state-320-seed0-validated/best.pt",
+      "last_checkpoint": "runs/gpu-state-320-seed0-validated/last.pt"
+    }
+  },
+  {
+    "run": "runs/gpu-proprio-320-seed0-validated",
+    "encoder": "proprio",
+    "seed": 0,
+    "actual_steps": 999424,
+    "selected_steps": 589824,
+    "elapsed_seconds": 239.46551435999572,
+    "width": 320,
+    "height": 240,
+    "success_wilson95": [
+      0.18986902089941152,
+      0.3398691922955691
+    ],
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "result": {
+      "status": "step_budget_complete_rounded_down",
+      "actual_steps": 999424,
+      "requested_steps": 1000000,
+      "selected_steps": 589824,
+      "elapsed_seconds_including_initialization_training_evaluation": 239.46551435999572,
+      "wall_budget_seconds": 3300.0,
+      "within_wall_budget": true,
+      "compile_excluded": true,
+      "convergence_claim": false,
+      "timings": {
+        "initialization_seconds": 2.534664958999201,
+        "collection_seconds": 147.11182577301952,
+        "ppo_seconds": 58.607148470997345,
+        "validation_seconds": 24.477699170995038,
+        "final_evaluation_seconds": 6.463785015002941,
+        "checkpoint_seconds": 0.007796205994964112
+      },
+      "final_test": {
+        "proprio": {
+          "episodes": 128,
+          "success": 0.2578125,
+          "collision": 0.7421875,
+          "mean_return": -1.6868722438812256,
+          "mean_steps": 73.5,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.41138194439883624,
+          "policy": "checkpoint",
+          "horizon_terminal": 150
+        },
+        "center": {
+          "episodes": 128,
+          "success": 0.2734375,
+          "collision": 0.7265625,
+          "mean_return": -1.5206222534179688,
+          "mean_steps": 74.5,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.41918136654991217,
+          "policy": "center",
+          "horizon_terminal": 150
+        },
+        "goal_centering": {
+          "episodes": 128,
+          "success": 0.2734375,
+          "collision": 0.7265625,
+          "mean_return": -1.5206222534179688,
+          "mean_steps": 74.5,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.41918136654991217,
+          "policy": "goal_centering",
+          "horizon_terminal": 150
+        },
+        "random": {
+          "episodes": 128,
+          "success": 0.2734375,
+          "collision": 0.7265625,
+          "mean_return": -1.5198410749435425,
+          "mean_steps": 74.578125,
+          "mean_success_steps": 121.0,
+          "return_standard_error": 0.4191392443823135,
+          "policy": "random",
+          "horizon_terminal": 150
+        },
+        "seed": 200003,
+        "style": 2,
+        "cuda_memory": {
+          "stream": 93825348160032,
+          "allocated_bytes": 138307072,
+          "reserved_bytes": 167772160,
+          "global_free_bytes": 3382640640,
+          "global_total_bytes": 16608133120
+        }
+      },
+      "acceptance": {
+        "policy_success": 0.2578125,
+        "best_blind_success": 0.2734375,
+        "absolute_gain": -0.015625,
+        "episodes": 128,
+        "meaningful_visual_goal_met": false,
+        "criterion": "visual success >=0.8 and >=0.2 absolute above best blind heuristic on >=128 held-out episodes"
+      },
+      "checkpoint": "runs/gpu-proprio-320-seed0-validated/best.pt",
+      "last_checkpoint": "runs/gpu-proprio-320-seed0-validated/last.pt"
+    }
+  }
+]

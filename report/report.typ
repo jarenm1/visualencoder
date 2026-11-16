@@ -1,4 +1,4 @@
-// Draft project report (Type 1, 3-5 pages). Build: typst compile report/report.typ
+// Project report (Type 1, 3-5 pages). Build: typst compile report/report.typ report.pdf
 #set document(title: "Appearance-Robust Vision Encoders for Drones via Sim Distillation", author: "Jaren McHugh")
 #set page(paper: "us-letter", margin: 0.8in, numbering: "1")
 #set text(font: "New Computer Modern", size: 10pt)
@@ -10,30 +10,23 @@
 #align(center)[
   #text(size: 16pt, weight: "bold")[Appearance-Robust Vision Encoders for Drones \ via Distillation in a Randomized Simulator]
   #v(4pt)
-  Jaren McHugh \
-  #text(size: 9pt)[Code: `git.txstate.edu/<path>/visualencoder` (TODO)]
+  Jaren McHugh
 ]
 
 #block(inset: (x: 1.5em))[
   *Abstract.* Robots trained in simulation need visual features that stay stable when lighting and surface
   appearance change, the core of the sim-to-real gap. We distill a large self-supervised vision model
-  (LingBot-Vision ViT-L, 300M parameters) into a small ViT-S (22M) small enough for a Jetson Orin Nano, using a
-  procedurally built city in which only camera pose and appearance vary, so every image has exact depth,
-  segmentation and pose labels. Standard distillation on randomized renders gives little robustness on its own.
+  (LingBot-Vision ViT-L, 300M parameters) into a 22M-parameter ViT-S intended for a small drone, using a
+  procedurally built city with exact depth, segmentation and pose labels. Standard distillation improves transfer
+  but retains sensitivity to appearance.
   Adding a simple *paired-view consistency* target, where two differently lit and textured renders of the same pose
   share one teacher target, improves every metric under held-out textures and lighting (pose R² +0.11, depth error
-  −17%, retrieval 0.75 → 0.95), and the 22M student then beats both 300M teachers on robustness. The model runs in
-  INT8 with no measurable accuracy loss. On real drone footage (UAVid), simulator distillation improves sim-to-real
-  segmentation transfer over the off-the-shelf small model and shrinks the sim-vs-real probe gap by about 40%, but the
-  consistency gain does not carry over, which points to geometry and content, not only appearance, as the remaining gap.
+  −17%, retrieval 0.75 → 0.95). The student beats both 300M models on pose, depth and retrieval under this shift.
+  INT8 export changes probe scores by at most 0.009; embedded-device latency is not measured.
+  On real UAVid footage, simulator distillation improves sim-fit segmentation from 0.492 to 0.539 mIoU,
+  but consistency gives no additional real-image gain. Car AUROC improves without a clear AP improvement,
+  and video-sequence bootstrap intervals expose that distinction.
 ]
-
-= Overview
-We build a vision encoder for a drone: a network that turns each camera frame into features that later modules
-(a control policy, task heads, possibly a language model) consume. The encoder must be small enough for an
-on-board Jetson Orin Nano, and its features must not change when only the appearance of the world changes
-(sun, sky, fog, exposure, surface materials). That is a stand-in for the difference between simulation and
-reality. We train entirely in simulation and measure robustness on appearance conditions never seen in training.
 
 = Introduction
 Large self-supervised vision models such as DINOv3 and LingBot-Vision produce strong general-purpose features but
@@ -47,8 +40,9 @@ needed to get there. Our contributions:
   *held-out* appearance regime (unseen textures and lighting) plus a held-out region of the city.
 + A comparison of off-the-shelf encoders against distilled students under seen and unseen appearance.
 + A simple improvement, paired-view consistency, which turns randomization into robustness.
-+ An INT8 deployment path to the Jetson Orin Nano that preserves accuracy.
++ An INT8 export checked against features and probes, without an on-device speed claim.
 + A sim-to-real check on real drone footage (UAVid) that separates what transfers from what does not.
++ A GPU-owned renderer/physics/interop workspace and timed recurrent-PPO control test with visual, blind and privileged actors.
 
 = Methodology
 
@@ -147,94 +141,75 @@ metric under novel appearance (pose R² +0.11, depth error −17%, segmentation 
 the canonical look. With it, the 22M student beats both 300M models on pose, depth and retrieval, and is 0.014 behind
 DINOv3-L on segmentation.
 
-== Ablations
-#figure(
-  table(
-    columns: (auto, auto, auto, auto, auto),
-    align: (left, center, center, center, center),
-    stroke: none,
-    table.hline(),
-    [*Variant (one change from baseline)*], [*Pose R²*], [*Depth err.*], [*Seg. mIoU*], [*Retrieval*],
-    table.hline(stroke: 0.5pt),
-    [Baseline], [0.465], [0.242], [0.788], [0.747],
-    [No appearance randomization], [0.506], [0.246], [0.769], [0.769],
-    [DINOv3-L as teacher], [−0.134], [0.208], [0.838], [0.800],
-    [Random-init student], [−0.239], [0.387], [0.534], [0.439],
-    [Paired-view consistency], [*0.574*], [*0.201*], [0.821], [*0.951*],
-    table.hline(),
-  ),
-  caption: [Novel appearance regime, single change from the baseline each.],
-) <tab-ablation>
-
-- *Randomization alone does not help:* training only on the canonical look is about as robust as the baseline.
-  When each look copies the teacher on that look, the student also copies the teacher's sensitivity to appearance.
-  Robustness appears only when looks of the same place are tied together.
-- *The teacher's weaknesses are inherited:* a DINOv3 teacher gives the best segmentation, but pose under novel
-  appearance collapses, as it does for DINOv3 itself.
-- *Pretraining is essential:* a randomly initialised student is far worse everywhere.
-
 == Real drone images
 #figure(
   table(
-    columns: (auto, auto, auto, auto, auto),
-    align: (left, center, center, center, center),
+    columns: (auto, auto, auto, auto, auto, auto),
+    align: (left, center, center, center, center, center),
     stroke: none,
     table.hline(),
-    [*Model*], [*Sim→real mIoU* ↑], [*Car AUROC* ↑], [*Real→real mIoU*], [*Gap* ↓],
+    [*Model*], [*Sim→real mIoU* ↑], [*Car AUROC* ↑], [*Car AP* ↑], [*Real→real mIoU*], [*Gap* ↓],
     table.hline(stroke: 0.5pt),
-    [LingBot ViT-S (off the shelf)], [0.492], [0.892], [0.650], [0.158],
-    [LingBot ViT-L (teacher)], [0.561], [0.891], [0.712], [0.151],
-    [DINOv3 ViT-L], [*0.574*], [0.849], [*0.736*], [0.162],
+    [LingBot ViT-S (off the shelf)], [0.492], [0.892], [0.640], [0.650], [0.158],
+    [LingBot ViT-L (teacher)], [0.561], [0.891], [*0.727*], [0.712], [0.151],
+    [DINOv3 ViT-L], [*0.574*], [0.849], [—], [*0.736*], [0.162],
     table.hline(stroke: 0.5pt),
-    [Standard distillation (ours)], [0.540], [*0.909*], [0.632], [0.093],
-    [+ paired-view consistency (ours)], [0.526], [0.906], [0.615], [*0.090*],
+    [Standard distillation (ours)], [0.539], [*0.909*], [0.649], [0.632], [0.093],
+    [Paired-view consistency (ours)], [0.525], [0.905], [0.622], [0.615], [*0.090*],
     table.hline(),
   ),
-  caption: [UAVid validation frames (real). Sim→real: segmentation probe fit on simulator renders only. Car AUROC:
-  detecting patches with ≥10% car with the sim-fit probe. Real→real: probe fit on UAVid train. Gap = real→real −
-  sim→real. Our rows average two seeds (seed spread ≈ 0.01–0.02).],
+  caption: [UAVid validation. Sim→real uses a simulator-fit probe; real→real uses a UAVid-train probe.
+  Car AUROC/AP detect patches with ≥10% car versus car-free patches. Gap = real→real − sim→real.
+  Student rows average two seeds. DINOv3 retains original point estimates; its new AP/CI rerun is unavailable
+  because gated weights cannot be accessed in this environment.],
 ) <tab-real>
 
-@tab-real and @fig-real test the encoders on real footage with a probe that never saw a real label.
-- *Simulator distillation helps transfer.* The distilled ViT-S transfers better than the off-the-shelf ViT-S it
-  started from (mIoU 0.492 → 0.540), detects cars best of all models (AUROC 0.91), and the gap between a sim-fit and a
-  real-fit probe shrinks by about 40% (0.158 → 0.09): its features look more alike across sim and real.
+@tab-real tests transfer with a simulator-fit probe; supplementary figures show qualitative predictions.
+- *Simulator distillation helps transfer.* The distilled ViT-S improves sim→real segmentation over the
+  off-the-shelf ViT-S (mIoU about 0.49 → 0.54) and car AUROC (0.892 → 0.909). The sim-fit versus real-fit probe
+  gap shrinks, but this is not sufficient evidence by itself: lower real→real quality also reduces that gap.
 - *Specialization has a cost.* Fit directly on real images, the students (0.62–0.63) fall slightly below the model they
   started from (0.650): training only on one stylised city trades away some general real-world quality. The large
   models remain best overall on real frames.
-- *The consistency gain does not carry over.* Its large improvements under unseen simulated lighting and materials do
-  not appear on real frames (0.526 vs 0.540, within seed noise). The real gap is evidently not only appearance:
-  real scenes differ in geometry and content (fine detail, signage, people, varied architecture) from our low-poly city.
+- *The consistency gain does not carry over.* Its large gains under unseen simulated lighting and materials do
+  not appear on real frames (about 0.53 vs 0.54, within seed variation). Geometry and content mismatch are plausible
+  explanations; the original fixed-city experiment does not isolate their contribution.
 
-#figure(image("figures/real.png", width: 100%), caption: [Real UAVid frames: ground truth (black = classes with no
-simulator counterpart) and predictions of segmentation probes fit only on simulator renders.]) <fig-real>
+*Car precision and uncertainty.* Across the two training seeds, car average precision is 0.649 for standard
+distillation and 0.622 for paired consistency, versus 0.640 off the shelf. There are 1,671 positive and 17,801
+car-free eligible patches (8.58% positives); ambiguous patches are excluded. AUROC gives tied scores half credit,
+and AP groups tied thresholds. With 1,000 whole-video bootstrap resamples, the standard student's AP improvement
+over the small baseline has a paired 95% interval of −0.038 to +0.044 for seed 0 and −0.046 to +0.058 for seed 1.
+Thus the higher AUROC is not a clear improvement in AP. Only seven validation sequences support these intervals;
+they exclude model-training and probe-fitting uncertainty.
+AP also reverses the AUROC ranking between the large LingBot teacher and the students.
 
 == Deployment
 For the shipped model (paired-view consistency), INT8 matches FP32 (feature cosine 0.998) and every probe metric moves
 by at most 0.009 (largest: novel-look retrieval 0.957 → 0.948); FP16 is identical. On-device latency on the Jetson is
 still to be measured.
 
+#include "navigation.typ"
+
+All visual encoders nearly saturate this initial task. It establishes control-relevant visual information and
+under-hour learning, but not an advantage for paired consistency over standard distillation.
+
 = Conclusion
-Distilling a large vision model into a small one inside a randomized simulator does not by itself produce
-appearance-robust features. Explicitly tying different looks of the same scene to one target does: it improves
-robustness to unseen textures and lighting on every metric at no cost on the canonical look, and lets a 22M-parameter
-encoder outperform 300M-parameter models under appearance shift while running in INT8 on an embedded GPU. On real
-drone footage, simulator distillation improves transfer over the small model it starts from, but the consistency gain
-stays in simulation: closing the rest of the sim-to-real gap needs more than appearance randomization.
+Simulator distillation improves transfer over the off-the-shelf small encoder. Paired-view targets provide
+further robustness to unseen simulated textures and lighting: averaged over two seeds, the 22M student improves
+every measured novel-appearance metric and beats the 300M models on pose, depth and retrieval.
+INT8 export preserves these probe scores closely, but Jetson latency is unmeasured. On real drone footage,
+the consistency gain does not carry over, and higher car AUROC does not establish better precision.
+Appearance robustness, real-image transfer and downstream control must be evaluated independently.
 
-*Limitations.* One stylised city and one renderer; linear probes measure what features contain, not downstream task
-performance; two seeds per setting; real-image evaluation is segmentation only, on 70 frames of one dataset.
+*Limitations.* Offline appearance results use one stylised city; the separate lateral-gap task does not test
+full flight or city navigation. The main distillation comparisons have two training seeds, PPO has one.
+Real-image uncertainty rests on only seven video sequences (70 frames), and embedded-device latency is unmeasured.
 
-*Future work.*
-+ Mix unlabelled real frames into distillation to keep general real-world quality while specializing.
-+ Richer simulated geometry and content (detailed buildings, people, signage), not only appearance.
-+ On-device latency of the INT8 engine on the Jetson Orin Nano.
-+ An RL control policy on the frozen encoder, with temporal memory, in the drone simulator.
-+ Task heads (depth, segmentation, obstacle clearance) and a foveated crop for distant targets.
-+ A small language model (e.g. Gemma) reading the encoder's tokens for high-level goals.
 
 #v(6pt)
-#text(size: 9pt)[*References (to complete).* LingBot-Vision (Robbyant, 2026); DINOv3 (Meta, 2025); Hinton et al.,
+#text(size: 9pt)[*References.* LingBot-Vision (Robbyant, 2026); DINOv3 (Meta, 2025); Hinton et al.,
 Distilling the Knowledge in a Neural Network (2015); Tobin et al., Domain Randomization (2017); Xiao et al.,
 SmoothQuant (2023); Lyu et al., UAVid: A Semantic Segmentation Dataset for UAV Imagery (2020, CC BY-NC-SA 4.0);
-Kenney and Poly Haven asset libraries (CC0).]
+Kenney and Poly Haven asset libraries (CC0); #link("https://github.com/NVIDIA/cuda-rust")[NVIDIA CUDA Rust]
+(commit `348895e`); #link("https://github.com/gfx-rs/wgpu")[wgpu 30].]

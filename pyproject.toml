@@ -40,3 +40,8 @@ lingbot-vision = { git = "https://github.com/robbyant/lingbot-vision", rev = "15
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
+
+[tool.basedpyright]
+extraPaths = ["src", "sim/python"]
+venvPath = "."
+venv = ".venv"
