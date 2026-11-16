@@ -3,6 +3,7 @@
 Run inside nix develop: python scripts/show_experiments.py
 The default writes report/experiments.typ and reports/experiments/showcase.json.
 Use --study geometry or --study mixed to showcase one completed study independently.
+Geometry also emits report/geometry-extra.typ with global and real-transfer readouts.
 Missing experiments are errors, never replaced with plans, smoke results or zeros.
 """
 
@@ -47,8 +48,11 @@ def table(headers, rows, caption):
 def geometry_results(protocol):
     geometry = {arm: values_by_spec(REPORTS / f"geometry/{arm}/report.json")
                 for arm in ("fixed", "multi")}
+    real = values_by_spec(REPORTS / "geometry/real/report.json")
     summary: list[dict[str, object]] = []
     cells = []
+    global_cells = []
+    real_means: dict[tuple[str, str], list[float]] = {}
     for arm, source in (("fixed", "controls"), ("multi", "treatments")):
         payload = read_json(REPORTS / f"geometry/{arm}/report.json")
         if payload["protocol"]["arm_semantics"] != "encoder training geometry label only":
@@ -62,14 +66,42 @@ def geometry_results(protocol):
                         geometry[arm], specs, lambda row, r=regime, m=metric: row["summary"][r][m])
             label = f"{arm}, {'standard' if target == 'own' else 'paired'}"
             cells.append([label, *(f"{v['mean']:.3f}" for v in metrics.values())])
-            summary.append({"arm": arm, "target": target, "specs": specs, "metrics": metrics})
+            global_metrics = {}
+            for regime in ("familiar/novel", "heldout/canonical", "heldout/novel"):
+                global_metrics[f"{regime}/pose_r2"] = mean_seed(
+                    geometry[arm], specs, lambda row, r=regime: row["summary"][r]["pose_r2"])
+            for regime in ("familiar/novel", "heldout/novel"):
+                global_metrics[f"{regime}/retrieval_at_1"] = mean_seed(
+                    geometry[arm], specs, lambda row, r=regime: row["summary"][r]["pairs"]["retrieval_at_1"])
+            global_cells.append([label, *(f"{v['mean']:.3f}" for v in global_metrics.values())])
+            real_metrics = {
+                "sim_to_real_miou": mean_seed(real, specs, lambda row: row["sim_to_real"]["miou"]),
+                "car_auroc": mean_seed(real, specs, lambda row: row["sim_to_real"]["vehicle_auroc"]),
+                "car_ap": mean_seed(real, specs, lambda row: row["sim_to_real"]["vehicle_ap"]),
+                "real_to_real_miou": mean_seed(real, specs, lambda row: row["real_to_real"]["miou"]),
+            }
+            real_means[arm, target] = [float(v["mean"]) for v in real_metrics.values()]
+            summary.append({"arm": arm, "target": target, "specs": specs, "metrics": metrics,
+                            "global_metrics": global_metrics, "real_metrics": real_metrics})
     text = "== Geometry versus appearance\n"
     text += "Training geometry and consistency are crossed at a fixed 20,000-pose, 10,000-step budget. "
-    text += "All encoders use the same canonical probe-fitting poses and test images; held-out layouts never enter probe fitting. "
+    text += "Canonical probes fit 750 original-city poses; all encoders share 750 familiar and 1,500 held-out test poses. "
     text += "City extent and camera support are matched. Each entry averages two training seeds.\n\n"
-    text += table(["Training", "Appearance IoU ↑", "Depth ↓", "Geometry IoU ↑", "Depth ↓", "Both IoU ↑", "Depth ↓"],
+    text += table(["Training", "App. IoU ↑", "Depth ↓", "Geo. IoU ↑", "Depth ↓", "Both IoU ↑", "Depth ↓"],
                   cells,
                   "Independent geometry experiment. Appearance: original city, novel look. Geometry: held-out layouts, canonical look. Both: held-out layouts and novel looks. Depth is AbsRel; per-scene and seed-level results accompany the code.")
+    extra = "== Additional geometry readouts\n"
+    extra += table(["Training", "App. pose R²", "Geo. pose R²", "Both pose R²", "App. retrieval", "Both retrieval"],
+                   global_cells,
+                   "Same geometry probe protocol as the main table. Retrieval candidates: 750 within each layout. App., Geo., and Both denote the appearance-only, geometry-only, and combined shifts.")
+    deltas = []
+    for target in ("own", "mean"):
+        values = [new - old for new, old in zip(real_means["multi", target], real_means["fixed", target])]
+        deltas.append(["standard" if target == "own" else "paired", *(f"{value:+.4f}" for value in values)])
+    extra += table(["Target", "Δ real IoU", "Δ car AUROC", "Δ car AP", "Δ real-fit IoU"],
+                   deltas,
+                   "Geometry intervention on UAVid: three-layout minus fixed-layout training, averaged over matched seeds. These descriptive differences are not equivalence tests; real-image scores retain the same simulator-fit and real-fit probe protocols.")
+    (ROOT / "report/geometry-extra.typ").write_text(extra)
     return text, summary
 
 

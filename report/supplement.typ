@@ -37,10 +37,22 @@ learning from scratch is impossible at a larger budget.
 #figure(image("figures/real.png", width: 100%), caption: [Real UAVid frames: ground truth (black = classes with no
 simulator counterpart) and predictions of segmentation probes fit only on simulator renders. These examples are not the aggregate accuracy estimate.])
 
+= Precision export
+The original simulation-only paired-target student is exported to ONNX for TensorRT FP16. NVIDIA ModelOpt
+inserts SmoothQuant on linear layers, calibrated on 512 renders. LayerNorm inputs remain FP16: residual-stream
+outliers up to ±400 make the default configuration destructive (feature cosine 0.58).
+
+INT8 feature cosine to FP32 is 0.998 and every measured probe changes by at most 0.009
+(largest: novel retrieval 0.957 → 0.948); FP16 leaves reported probe scores unchanged.
+This check does not cover the newly adapted/layout-trained students. No Jetson latency is claimed.
+Tools include PyTorch, Transformers, ModelOpt, ONNX Runtime, TensorRT, Blender and raylib, with Nix/uv environments.
+
 = Geometry and appearance support
 #figure(image("figures/geometry.png", width: 100%), caption: [Columns: original city, two additional training layouts,
 and two held-out layouts. Top: canonical appearance; bottom: novel appearance at the same pose within each layout.
 Representative urban views are selected by ground-truth coverage and camera height, not encoder predictions.])
+
+#include "geometry-extra.typ"
 
 = Actual trained-policy rollout
 #figure(image("figures/navigation.png", width: 100%), caption: [Frames from the paired-consistency visual policy in a

@@ -1,3 +1,19 @@
+== Geometry versus appearance
+Training geometry and consistency are crossed at a fixed 20,000-pose, 10,000-step budget. Canonical probes fit 750 original-city poses; all encoders share 750 familiar and 1,500 held-out test poses. City extent and camera support are matched. Each entry averages two training seeds.
+
+#figure(table(
+  columns: (auto, auto, auto, auto, auto, auto, auto),
+  align: (left, center, center, center, center, center, center),
+  stroke: none, table.hline(),
+  [*Training*], [*App. IoU ↑*], [*Depth ↓*], [*Geo. IoU ↑*], [*Depth ↓*], [*Both IoU ↑*], [*Depth ↓*],
+  table.hline(stroke: 0.5pt),
+  [fixed, standard], [0.786], [0.231], [0.835], [0.170], [0.781], [0.233],
+  [fixed, paired], [0.817], [0.196], [0.841], [0.167], [0.813], [0.201],
+  [multi, standard], [0.788], [0.236], [0.836], [0.170], [0.787], [0.239],
+  [multi, paired], [0.817], [0.194], [0.842], [0.167], [0.815], [0.203],
+  table.hline(),
+), caption: [Independent geometry experiment. Appearance: original city, novel look. Geometry: held-out layouts, canonical look. Both: held-out layouts and novel looks. Depth is AbsRel; per-scene and seed-level results accompany the code.])
+
 == Unlabelled-real adaptation
 Only UAVid training RGB is added; labels and validation frames are excluded from distillation. Both conditions use 64 images/step: 32 paired simulator poses versus 24 paired poses plus 16 real frames. This matches compute and optimizer steps, not simulator exposure; it is real-data-assisted adaptation, not sim-only transfer.
 

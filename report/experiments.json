@@ -1,0 +1,681 @@
+{
+  "protocols": {
+    "geometry": {
+      "steps": 10000,
+      "seeds": [
+        0,
+        1
+      ],
+      "images_per_step": 64,
+      "manifest": "/home/jaren/visualencoder/data/geometry/geometry.json",
+      "controls": {
+        "own": [
+          "run:/home/jaren/visualencoder/runs/baseline",
+          "run:/home/jaren/visualencoder/runs/baseline-seed1"
+        ],
+        "mean": [
+          "run:/home/jaren/visualencoder/runs/mean",
+          "run:/home/jaren/visualencoder/runs/mean-seed1"
+        ]
+      },
+      "treatments": {
+        "own": [
+          "run:/home/jaren/visualencoder/runs/experiments/geometry-multi-own-seed0-steps10000",
+          "run:/home/jaren/visualencoder/runs/experiments/geometry-multi-own-seed1-steps10000"
+        ],
+        "mean": [
+          "run:/home/jaren/visualencoder/runs/experiments/geometry-multi-mean-seed0-steps10000",
+          "run:/home/jaren/visualencoder/runs/experiments/geometry-multi-mean-seed1-steps10000"
+        ]
+      },
+      "probe_protocol": "Fit familiar canonical only; apply unchanged to heldout geometry and appearance."
+    },
+    "mixed": {
+      "steps": 10000,
+      "seeds": [
+        0,
+        1
+      ],
+      "images_per_step": 64,
+      "controls": {
+        "own": [
+          "run:/home/jaren/visualencoder/runs/baseline",
+          "run:/home/jaren/visualencoder/runs/baseline-seed1"
+        ],
+        "mean": [
+          "run:/home/jaren/visualencoder/runs/mean",
+          "run:/home/jaren/visualencoder/runs/mean-seed1"
+        ]
+      },
+      "treatments": {
+        "own": [
+          "run:/home/jaren/visualencoder/runs/experiments/mixed-own-seed0-steps10000",
+          "run:/home/jaren/visualencoder/runs/experiments/mixed-own-seed1-steps10000"
+        ],
+        "mean": [
+          "run:/home/jaren/visualencoder/runs/experiments/mixed-mean-seed0-steps10000",
+          "run:/home/jaren/visualencoder/runs/experiments/mixed-mean-seed1-steps10000"
+        ]
+      },
+      "sim_poses_per_step": {
+        "control": 32,
+        "mixed": 24
+      },
+      "real_frames_per_step": 16,
+      "unlabelled_source": "/home/jaren/visualencoder/data/uavid/train_rgb.npy",
+      "training_sequences": [
+        "seq1",
+        "seq10",
+        "seq11",
+        "seq12",
+        "seq13",
+        "seq14",
+        "seq15",
+        "seq2",
+        "seq3",
+        "seq31",
+        "seq32",
+        "seq33",
+        "seq34",
+        "seq35",
+        "seq4",
+        "seq5",
+        "seq6",
+        "seq7",
+        "seq8",
+        "seq9"
+      ],
+      "validation_sequences": [
+        "seq16",
+        "seq17",
+        "seq18",
+        "seq19",
+        "seq20",
+        "seq36",
+        "seq37"
+      ],
+      "labels_used_for_distillation": false,
+      "interpretation": "Real-data-assisted adaptation; equal image/optimizer budget, less simulator exposure."
+    }
+  },
+  "geometry": [
+    {
+      "arm": "fixed",
+      "target": "own",
+      "specs": [
+        "run:/home/jaren/visualencoder/runs/baseline",
+        "run:/home/jaren/visualencoder/runs/baseline-seed1"
+      ],
+      "metrics": {
+        "familiar/novel/semantic_miou": {
+          "mean": 0.78601391485175,
+          "min": 0.7853239755631597,
+          "max": 0.7867038541403402,
+          "seeds": 2
+        },
+        "familiar/novel/depth_absrel": {
+          "mean": 0.23126475615985287,
+          "min": 0.22690245695582514,
+          "max": 0.23562705536388057,
+          "seeds": 2
+        },
+        "heldout/canonical/semantic_miou": {
+          "mean": 0.8347486827232447,
+          "min": 0.8334832789182021,
+          "max": 0.8360140865282871,
+          "seeds": 2
+        },
+        "heldout/canonical/depth_absrel": {
+          "mean": 0.17016254871344738,
+          "min": 0.16814974092210708,
+          "max": 0.17217535650478769,
+          "seeds": 2
+        },
+        "heldout/novel/semantic_miou": {
+          "mean": 0.781422041873773,
+          "min": 0.7792335427512471,
+          "max": 0.7836105409962988,
+          "seeds": 2
+        },
+        "heldout/novel/depth_absrel": {
+          "mean": 0.2331874052047207,
+          "min": 0.2280173139549294,
+          "max": 0.23835749645451196,
+          "seeds": 2
+        }
+      },
+      "global_metrics": {
+        "familiar/novel/pose_r2": {
+          "mean": 0.363456292077899,
+          "min": 0.3559657819569111,
+          "max": 0.37094680219888687,
+          "seeds": 2
+        },
+        "heldout/canonical/pose_r2": {
+          "mean": 0.5278283543884754,
+          "min": 0.524984572082758,
+          "max": 0.5306721366941929,
+          "seeds": 2
+        },
+        "heldout/novel/pose_r2": {
+          "mean": 0.3528408845886588,
+          "min": 0.34912044554948807,
+          "max": 0.35656132362782955,
+          "seeds": 2
+        },
+        "familiar/novel/retrieval_at_1": {
+          "mean": 0.7143333333333333,
+          "min": 0.712,
+          "max": 0.7166666666666667,
+          "seeds": 2
+        },
+        "heldout/novel/retrieval_at_1": {
+          "mean": 0.7251666666666667,
+          "min": 0.722,
+          "max": 0.7283333333333334,
+          "seeds": 2
+        }
+      },
+      "real_metrics": {
+        "sim_to_real_miou": {
+          "mean": 0.539295871122306,
+          "min": 0.5338166377035654,
+          "max": 0.5447751045410467,
+          "seeds": 2
+        },
+        "car_auroc": {
+          "mean": 0.9093817509226867,
+          "min": 0.9092675990909675,
+          "max": 0.9094959027544058,
+          "seeds": 2
+        },
+        "car_ap": {
+          "mean": 0.6493778542453584,
+          "min": 0.6415299430141352,
+          "max": 0.6572257654765816,
+          "seeds": 2
+        },
+        "real_to_real_miou": {
+          "mean": 0.6321079162542462,
+          "min": 0.6304917317179302,
+          "max": 0.6337241007905623,
+          "seeds": 2
+        }
+      }
+    },
+    {
+      "arm": "fixed",
+      "target": "mean",
+      "specs": [
+        "run:/home/jaren/visualencoder/runs/mean",
+        "run:/home/jaren/visualencoder/runs/mean-seed1"
+      ],
+      "metrics": {
+        "familiar/novel/semantic_miou": {
+          "mean": 0.8167583873504771,
+          "min": 0.8139727535175606,
+          "max": 0.8195440211833935,
+          "seeds": 2
+        },
+        "familiar/novel/depth_absrel": {
+          "mean": 0.19593970859071375,
+          "min": 0.19564731439299715,
+          "max": 0.19623210278843037,
+          "seeds": 2
+        },
+        "heldout/canonical/semantic_miou": {
+          "mean": 0.8410718550661312,
+          "min": 0.839484913392162,
+          "max": 0.8426587967401005,
+          "seeds": 2
+        },
+        "heldout/canonical/depth_absrel": {
+          "mean": 0.16703627302527496,
+          "min": 0.1652963194253249,
+          "max": 0.168776226625225,
+          "seeds": 2
+        },
+        "heldout/novel/semantic_miou": {
+          "mean": 0.8128625928628793,
+          "min": 0.8120511502271534,
+          "max": 0.8136740354986053,
+          "seeds": 2
+        },
+        "heldout/novel/depth_absrel": {
+          "mean": 0.2013382572358709,
+          "min": 0.20046372648419158,
+          "max": 0.2022127879875502,
+          "seeds": 2
+        }
+      },
+      "global_metrics": {
+        "familiar/novel/pose_r2": {
+          "mean": 0.53480607829988,
+          "min": 0.5338555946946144,
+          "max": 0.5357565619051456,
+          "seeds": 2
+        },
+        "heldout/canonical/pose_r2": {
+          "mean": 0.5279703047126532,
+          "min": 0.5277555286884308,
+          "max": 0.5281850807368755,
+          "seeds": 2
+        },
+        "heldout/novel/pose_r2": {
+          "mean": 0.4911701027303934,
+          "min": 0.48962551914155483,
+          "max": 0.492714686319232,
+          "seeds": 2
+        },
+        "familiar/novel/retrieval_at_1": {
+          "mean": 0.953,
+          "min": 0.95,
+          "max": 0.956,
+          "seeds": 2
+        },
+        "heldout/novel/retrieval_at_1": {
+          "mean": 0.9415,
+          "min": 0.9406666666666667,
+          "max": 0.9423333333333334,
+          "seeds": 2
+        }
+      },
+      "real_metrics": {
+        "sim_to_real_miou": {
+          "mean": 0.5251258763902011,
+          "min": 0.515748256311428,
+          "max": 0.5345034964689743,
+          "seeds": 2
+        },
+        "car_auroc": {
+          "mean": 0.9052744365688477,
+          "min": 0.9026368081379514,
+          "max": 0.907912064999744,
+          "seeds": 2
+        },
+        "car_ap": {
+          "mean": 0.6220678719906569,
+          "min": 0.603866611558439,
+          "max": 0.640269132422875,
+          "seeds": 2
+        },
+        "real_to_real_miou": {
+          "mean": 0.6150583344218183,
+          "min": 0.613163531361619,
+          "max": 0.6169531374820176,
+          "seeds": 2
+        }
+      }
+    },
+    {
+      "arm": "multi",
+      "target": "own",
+      "specs": [
+        "run:/home/jaren/visualencoder/runs/experiments/geometry-multi-own-seed0-steps10000",
+        "run:/home/jaren/visualencoder/runs/experiments/geometry-multi-own-seed1-steps10000"
+      ],
+      "metrics": {
+        "familiar/novel/semantic_miou": {
+          "mean": 0.787934453796896,
+          "min": 0.7871459243228326,
+          "max": 0.7887229832709592,
+          "seeds": 2
+        },
+        "familiar/novel/depth_absrel": {
+          "mean": 0.23559256625331274,
+          "min": 0.23346496957998508,
+          "max": 0.2377201629266404,
+          "seeds": 2
+        },
+        "heldout/canonical/semantic_miou": {
+          "mean": 0.8357658342385476,
+          "min": 0.8343299251070981,
+          "max": 0.837201743369997,
+          "seeds": 2
+        },
+        "heldout/canonical/depth_absrel": {
+          "mean": 0.17014434563382608,
+          "min": 0.16777919663213894,
+          "max": 0.17250949463551318,
+          "seeds": 2
+        },
+        "heldout/novel/semantic_miou": {
+          "mean": 0.7871889541515154,
+          "min": 0.7849226927745633,
+          "max": 0.7894552155284674,
+          "seeds": 2
+        },
+        "heldout/novel/depth_absrel": {
+          "mean": 0.23933241218749385,
+          "min": 0.23495147483924037,
+          "max": 0.24371334953574736,
+          "seeds": 2
+        }
+      },
+      "global_metrics": {
+        "familiar/novel/pose_r2": {
+          "mean": 0.38306317292153835,
+          "min": 0.35563232749700546,
+          "max": 0.41049401834607124,
+          "seeds": 2
+        },
+        "heldout/canonical/pose_r2": {
+          "mean": 0.49832610227167606,
+          "min": 0.4949526861310005,
+          "max": 0.5016995184123516,
+          "seeds": 2
+        },
+        "heldout/novel/pose_r2": {
+          "mean": 0.35811186488717794,
+          "min": 0.3474610336124897,
+          "max": 0.3687626961618662,
+          "seeds": 2
+        },
+        "familiar/novel/retrieval_at_1": {
+          "mean": 0.6990000000000001,
+          "min": 0.6986666666666667,
+          "max": 0.6993333333333334,
+          "seeds": 2
+        },
+        "heldout/novel/retrieval_at_1": {
+          "mean": 0.7476666666666667,
+          "min": 0.7446666666666667,
+          "max": 0.7506666666666667,
+          "seeds": 2
+        }
+      },
+      "real_metrics": {
+        "sim_to_real_miou": {
+          "mean": 0.5366786850626477,
+          "min": 0.5315960323541332,
+          "max": 0.5417613377711622,
+          "seeds": 2
+        },
+        "car_auroc": {
+          "mean": 0.9098628241590123,
+          "min": 0.8981934594345472,
+          "max": 0.9215321888834774,
+          "seeds": 2
+        },
+        "car_ap": {
+          "mean": 0.648344020576741,
+          "min": 0.6312996431914677,
+          "max": 0.6653883979620143,
+          "seeds": 2
+        },
+        "real_to_real_miou": {
+          "mean": 0.6192769744957056,
+          "min": 0.6107523348128527,
+          "max": 0.6278016141785584,
+          "seeds": 2
+        }
+      }
+    },
+    {
+      "arm": "multi",
+      "target": "mean",
+      "specs": [
+        "run:/home/jaren/visualencoder/runs/experiments/geometry-multi-mean-seed0-steps10000",
+        "run:/home/jaren/visualencoder/runs/experiments/geometry-multi-mean-seed1-steps10000"
+      ],
+      "metrics": {
+        "familiar/novel/semantic_miou": {
+          "mean": 0.8174036355002511,
+          "min": 0.8166217694749175,
+          "max": 0.8181855015255847,
+          "seeds": 2
+        },
+        "familiar/novel/depth_absrel": {
+          "mean": 0.19437341660953758,
+          "min": 0.19337323248714128,
+          "max": 0.19537360073193388,
+          "seeds": 2
+        },
+        "heldout/canonical/semantic_miou": {
+          "mean": 0.84172226436416,
+          "min": 0.8409981785528909,
+          "max": 0.842446350175429,
+          "seeds": 2
+        },
+        "heldout/canonical/depth_absrel": {
+          "mean": 0.16700820686760903,
+          "min": 0.16476951288795097,
+          "max": 0.16924690084726712,
+          "seeds": 2
+        },
+        "heldout/novel/semantic_miou": {
+          "mean": 0.8146957629459702,
+          "min": 0.8145849249365047,
+          "max": 0.8148066009554358,
+          "seeds": 2
+        },
+        "heldout/novel/depth_absrel": {
+          "mean": 0.20334610433717126,
+          "min": 0.20228875082996958,
+          "max": 0.20440345784437294,
+          "seeds": 2
+        }
+      },
+      "global_metrics": {
+        "familiar/novel/pose_r2": {
+          "mean": 0.5417449306696653,
+          "min": 0.5378201194107533,
+          "max": 0.5456697419285774,
+          "seeds": 2
+        },
+        "heldout/canonical/pose_r2": {
+          "mean": 0.4954169727861881,
+          "min": 0.48973071947693825,
+          "max": 0.501103226095438,
+          "seeds": 2
+        },
+        "heldout/novel/pose_r2": {
+          "mean": 0.4731678441166878,
+          "min": 0.46129688061773777,
+          "max": 0.4850388076156378,
+          "seeds": 2
+        },
+        "familiar/novel/retrieval_at_1": {
+          "mean": 0.9443333333333334,
+          "min": 0.9433333333333334,
+          "max": 0.9453333333333334,
+          "seeds": 2
+        },
+        "heldout/novel/retrieval_at_1": {
+          "mean": 0.9450000000000001,
+          "min": 0.9443333333333334,
+          "max": 0.9456666666666667,
+          "seeds": 2
+        }
+      },
+      "real_metrics": {
+        "sim_to_real_miou": {
+          "mean": 0.5145032652072803,
+          "min": 0.5058947787408806,
+          "max": 0.5231117516736801,
+          "seeds": 2
+        },
+        "car_auroc": {
+          "mean": 0.9026583912555965,
+          "min": 0.8913215393361901,
+          "max": 0.913995243175003,
+          "seeds": 2
+        },
+        "car_ap": {
+          "mean": 0.6082390380991646,
+          "min": 0.6024614201520133,
+          "max": 0.6140166560463158,
+          "seeds": 2
+        },
+        "real_to_real_miou": {
+          "mean": 0.5999628494566485,
+          "min": 0.5868211421229333,
+          "max": 0.6131045567903637,
+          "seeds": 2
+        }
+      }
+    }
+  ],
+  "mixed": [
+    {
+      "condition": "sim only",
+      "target": "own",
+      "specs": [
+        "run:/home/jaren/visualencoder/runs/baseline",
+        "run:/home/jaren/visualencoder/runs/baseline-seed1"
+      ],
+      "metrics": {
+        "sim_to_real_miou": {
+          "mean": 0.539295871122306,
+          "min": 0.5338166377035654,
+          "max": 0.5447751045410467,
+          "seeds": 2
+        },
+        "car_auroc": {
+          "mean": 0.9093817509226867,
+          "min": 0.9092675990909675,
+          "max": 0.9094959027544058,
+          "seeds": 2
+        },
+        "car_ap": {
+          "mean": 0.6493778542453584,
+          "min": 0.6415299430141352,
+          "max": 0.6572257654765816,
+          "seeds": 2
+        },
+        "real_to_real_miou": {
+          "mean": 0.6321079162542462,
+          "min": 0.6304917317179302,
+          "max": 0.6337241007905623,
+          "seeds": 2
+        },
+        "sim_novel_miou": {
+          "mean": 0.7882077366515039,
+          "min": 0.7857172042614453,
+          "max": 0.7906982690415625,
+          "seeds": 2
+        }
+      }
+    },
+    {
+      "condition": "sim only",
+      "target": "mean",
+      "specs": [
+        "run:/home/jaren/visualencoder/runs/mean",
+        "run:/home/jaren/visualencoder/runs/mean-seed1"
+      ],
+      "metrics": {
+        "sim_to_real_miou": {
+          "mean": 0.5251258763902011,
+          "min": 0.515748256311428,
+          "max": 0.5345034964689743,
+          "seeds": 2
+        },
+        "car_auroc": {
+          "mean": 0.9052744365688477,
+          "min": 0.9026368081379514,
+          "max": 0.907912064999744,
+          "seeds": 2
+        },
+        "car_ap": {
+          "mean": 0.6220678719906569,
+          "min": 0.603866611558439,
+          "max": 0.640269132422875,
+          "seeds": 2
+        },
+        "real_to_real_miou": {
+          "mean": 0.6150583344218183,
+          "min": 0.613163531361619,
+          "max": 0.6169531374820176,
+          "seeds": 2
+        },
+        "sim_novel_miou": {
+          "mean": 0.821088793171481,
+          "min": 0.8200246053785798,
+          "max": 0.8221529809643822,
+          "seeds": 2
+        }
+      }
+    },
+    {
+      "condition": "sim + real",
+      "target": "own",
+      "specs": [
+        "run:/home/jaren/visualencoder/runs/experiments/mixed-own-seed0-steps10000",
+        "run:/home/jaren/visualencoder/runs/experiments/mixed-own-seed1-steps10000"
+      ],
+      "metrics": {
+        "sim_to_real_miou": {
+          "mean": 0.553496105519476,
+          "min": 0.536960038760945,
+          "max": 0.570032172278007,
+          "seeds": 2
+        },
+        "car_auroc": {
+          "mean": 0.8980610695322324,
+          "min": 0.8856350433987077,
+          "max": 0.910487095665757,
+          "seeds": 2
+        },
+        "car_ap": {
+          "mean": 0.6971245850000758,
+          "min": 0.6793548094262327,
+          "max": 0.7148943605739188,
+          "seeds": 2
+        },
+        "real_to_real_miou": {
+          "mean": 0.6887949356500094,
+          "min": 0.6877323011481931,
+          "max": 0.6898575701518256,
+          "seeds": 2
+        },
+        "sim_novel_miou": {
+          "mean": 0.7837850711053136,
+          "min": 0.7813223242638487,
+          "max": 0.7862478179467786,
+          "seeds": 2
+        }
+      }
+    },
+    {
+      "condition": "sim + real",
+      "target": "mean",
+      "specs": [
+        "run:/home/jaren/visualencoder/runs/experiments/mixed-mean-seed0-steps10000",
+        "run:/home/jaren/visualencoder/runs/experiments/mixed-mean-seed1-steps10000"
+      ],
+      "metrics": {
+        "sim_to_real_miou": {
+          "mean": 0.5726553009109812,
+          "min": 0.5623397375203136,
+          "max": 0.5829708643016488,
+          "seeds": 2
+        },
+        "car_auroc": {
+          "mean": 0.8964867290217056,
+          "min": 0.892645774544972,
+          "max": 0.9003276834984392,
+          "seeds": 2
+        },
+        "car_ap": {
+          "mean": 0.7025970096307351,
+          "min": 0.6996772606531257,
+          "max": 0.7055167586083445,
+          "seeds": 2
+        },
+        "real_to_real_miou": {
+          "mean": 0.6895770239194265,
+          "min": 0.6865801805841798,
+          "max": 0.6925738672546732,
+          "seeds": 2
+        },
+        "sim_novel_miou": {
+          "mean": 0.8181664049024839,
+          "min": 0.8151997040958785,
+          "max": 0.8211331057090894,
+          "seeds": 2
+        }
+      }
+    }
+  ]
+}

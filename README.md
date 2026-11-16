@@ -163,7 +163,7 @@ nix develop --command typst compile report/report.typ report.pdf
 nix develop --command typst compile report/supplement.typ report/supplement.pdf
 ```
 
-The supplement contains secondary ablations and real/layout/trained-policy visual checks. Table generators consume completed measured reports; they do not substitute plans or smoke results for full-budget experiments.
+The supplement contains secondary ablations, precision checks, global/real-transfer geometry readouts, and real/layout/trained-policy visual checks. Table generators consume completed measured reports; they do not substitute plans or smoke results for full-budget experiments.
 
 ## Licences
 

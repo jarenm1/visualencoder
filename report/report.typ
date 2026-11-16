@@ -14,19 +14,15 @@
 ]
 
 #block(inset: (x: 1.5em))[
-  *Abstract.* Robots trained in simulation need visual features that stay stable when lighting and surface
-  appearance change. We distill a large self-supervised vision model
-  (LingBot-Vision ViT-L, 300M parameters) into a 22M-parameter ViT-S intended for a small drone, using a
-  procedurally built city with exact depth, segmentation and pose labels. Standard distillation improves transfer
-  but retains sensitivity to appearance.
-  Adding a simple *paired-view consistency* target, where two differently lit and textured renders of the same pose
-  share one teacher target, improves every metric under held-out textures and lighting (pose R² +0.11, depth error
-  −17%, retrieval 0.75 → 0.95). The student beats both 300M models on pose, depth and retrieval under this shift.
-  INT8 export changes probe scores by at most 0.009; embedded-device latency is not measured.
-  Simulation-only distillation improves UAVid sim-fit segmentation from 0.492 to 0.539 mIoU,
-  but paired consistency adds no real-image gain in that setting. Higher car AUROC does not establish better AP.
-  Adding unlabelled real RGB improves real-image quality and precision with little change in novel-simulator IoU.
-  A GPU-native control test learns within an hour, but nearly saturates across all visual encoders.
+  *Abstract.* We distill a 300M-parameter vision model into a 22M student using randomized city images.
+  Sharing teacher targets between appearance variants improves novel-appearance readouts, but does not
+  by itself improve real UAVid precision. Matched two-seed interventions separate layout variation from
+  unlabelled-real exposure: additional layouts within a shared asset library add little at fixed compute,
+  while mixing real RGB improves segmentation and car average precision with little loss of simulated
+  robustness. AUROC and probe-gap rankings disagree with precision and absolute quality. Whole-video
+  bootstrap intervals expose uncertainty, with only seven validation videos. A separate Vulkan/NVIDIA Rust CUDA
+  pipeline trains frozen-encoder recurrent policies within an hour; near-ceiling task results do not establish
+  an encoder-ranking advantage. INT8 preserves measured probe scores, but embedded-device latency is unmeasured.
 ]
 
 = Introduction
@@ -36,14 +32,10 @@ Domain randomization varies simulated appearance to improve robustness to distri
 
 Our question is whether combining the two yields a small encoder that is robust to appearance change, and what is
 needed to get there. Our contributions:
-+ A simulator and benchmark: one fixed city where only pose and appearance vary, with exact ground truth and a
-  *held-out* appearance regime (unseen textures and lighting) plus a held-out region of the city.
-+ A comparison of off-the-shelf encoders against distilled students under seen and unseen appearance.
-+ A simple improvement, paired-view consistency, which turns randomization into robustness.
-+ An INT8 export checked against features and probes, without an on-device speed claim.
-+ A sim-to-real check on real drone footage (UAVid) that separates what transfers from what does not.
-+ An independent fixed-image-budget test of unlabelled-real exposure crossed with paired consistency.
-+ A GPU-owned renderer/physics/interop workspace and timed recurrent-PPO control test with visual, blind and privileged actors.
++ An appearance benchmark and an independently matched layout × consistency experiment.
++ Paired-target distillation compared against pretrained encoders and standard distillation.
++ Unlabelled-real adaptation evaluated with car AP and whole-video uncertainty, not AUROC alone.
++ A GPU-owned control pipeline with timed PPO, blind/privileged controls and a separate INT8 probe check.
 
 = Methodology
 
@@ -90,8 +82,8 @@ RTX 5070 Ti.
 Features are frozen and read out with *linear* (ridge regression) probes, so scores reflect what the features
 contain rather than probe capacity. Probes are fit on the canonical look of 80% of the evaluation poses and tested
 on every look of the rest (442 poses). Metrics:
-- *Pose R²*: global feature → state (position, pitch, roll, field of view, clearance). Yaw is excluded because it is
-  only visible through sun direction, a lighting shortcut.
+- *Pose R²*: global feature → state (position, pitch, roll, field of view, clearance). Yaw is excluded from
+  this aggregate to avoid letting sun-direction shortcuts dominate its interpretation.
 - *Depth*: per-patch log depth, absolute relative error (lower is better).
 - *Segmentation*: per-patch class, mean IoU.
 - *Retrieval\@1*: given a canonical image, find the same pose among all test poses in another look (no fitting).
@@ -104,12 +96,8 @@ is fit on simulator renders only and applied unchanged to the real validation fr
 UAVid train shows how much the features hold about real images at all; the difference between the two is the part of
 the sim-to-real gap the features do not close.
 
-== Deployment and tools
-The student is exported to ONNX for a TensorRT FP16 engine. For INT8, NVIDIA ModelOpt inserts SmoothQuant
-quantization on every linear layer, calibrated on 512 renders. LayerNorm inputs stay in FP16 because the residual
-stream has outlier channels (values up to ±400) that the default configuration destroys (feature cosine 0.58).
-Tools: PyTorch 2.14, HuggingFace Transformers, Blender, raylib, NVIDIA ModelOpt, ONNX Runtime, TensorRT; Nix and uv
-for a reproducible environment.
+*Precision.* An ONNX/SmoothQuant export of the original simulation-only paired student changes probe scores
+by at most 0.009. Calibration and precision checks are in the supplement; Jetson latency is unmeasured.
 
 = Results
 
@@ -184,12 +172,12 @@ Thus the higher AUROC is not a clear improvement in AP. Only seven validation se
 they exclude model-training and probe-fitting uncertainty.
 AP also reverses the AUROC ranking between the large LingBot teacher and the students.
 
-== Deployment
-For the shipped model (paired-view consistency), INT8 matches FP32 (feature cosine 0.998) and every probe metric moves
-by at most 0.009 (largest: novel-look retrieval 0.957 → 0.948); FP16 is identical. On-device latency on the Jetson is
-still to be measured.
 
-#include "mixed.typ"
+#include "experiments.typ"
+
+*Cross-intervention comparison.* Extra training layouts give only small dense-readout changes and no
+consistent real-transfer gain at this budget. They retain the same asset library, so this is not a test of
+arbitrary real-world geometry or content. Global readouts and real-transfer effects are in the supplement.
 
 In the mixed condition, real-image readout quality and car AP improve, without an AUROC improvement.
 For paired targets, the matched-seed AP gain has video-bootstrap 95% intervals of 0.011–0.168 and 0.002–0.152.
@@ -203,17 +191,17 @@ All visual encoders nearly saturate this initial task. It establishes control-re
 under-hour learning, but not an advantage for paired consistency over standard distillation.
 
 = Conclusion
-Simulator distillation improves transfer over the off-the-shelf small encoder. Paired-view targets provide
-further robustness to unseen simulated textures and lighting: averaged over two seeds, the 22M student improves
-every measured novel-appearance metric and beats the 300M models on pose, depth and retrieval.
-INT8 export preserves these probe scores closely, but Jetson latency is unmeasured.
+In the original fixed-city benchmark, paired-view targets improve every measured novel-appearance readout.
+Extra training layouts within the shared assets add little at the same budget and do not improve real transfer
+in these two seeds; this does not establish that richer geometry is irrelevant.
+INT8 preserves the original student's probe scores closely, but Jetson latency is unmeasured.
 Simulation-only consistency gives no clear real-image gain; adding unlabelled real RGB improves readout quality
 and car AP without increasing AUROC. GPU control learns within an hour but nearly saturates, establishing pipeline
 feasibility rather than an encoder-ranking advantage. These objectives must be evaluated independently.
 
-*Limitations.* Offline appearance results use one stylised city; the separate lateral-gap task does not test
-full flight or city navigation. The main distillation comparisons have two training seeds, PPO has one.
-Real-image uncertainty rests on only seven video sequences (70 frames), and embedded-device latency is unmeasured.
+*Limitations.* Three training cities and two held-out layouts share one stylised asset library, with a fixed
+compute budget. The separate lateral-gap task does not test full flight or city navigation. Distillation uses
+two training seeds, PPO one. Real-image uncertainty rests on only seven videos; embedded latency is unmeasured.
 
 
 #v(6pt)
