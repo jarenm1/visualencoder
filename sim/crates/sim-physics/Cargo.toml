@@ -1,0 +1,14 @@
+[package]
+name = "sim-physics"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Batched Rust CUDA rigid-body integration and zero-copy image preprocessing"
+
+[dependencies]
+sim-state = { path = "../sim-state" }
+bytemuck.workspace = true
+cuda-core.workspace = true
+cuda-device.workspace = true
+cuda-host.workspace = true
+thiserror.workspace = true

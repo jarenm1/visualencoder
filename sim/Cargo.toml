@@ -1,0 +1,59 @@
+[workspace]
+members = [
+    "crates/sim-state",
+    "crates/sim-interop",
+    "crates/sim-render",
+    "crates/sim-physics",
+    "crates/sim-env",
+    "apps/sim-smoke",
+]
+# Ordinary host iteration never invokes the device compiler.
+default-members = ["crates/sim-state", "crates/sim-interop", "crates/sim-render"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+bytemuck = { version = "1.24", default-features = false, features = ["derive"] }
+glam = { version = "0.30", features = ["bytemuck"] }
+ash = "0.38"
+wgpu = { version = "30.0.1", default-features = false, features = ["vulkan", "wgsl", "std", "parking_lot"] }
+wgpu-hal = { version = "30.0.1", default-features = false, features = ["vulkan"] }
+pollster = "0.4"
+cuda-core = { git = "https://github.com/NVIDIA/cuda-rust", rev = "348895e421a92d13a2c3a843ccb20ed1fb8b7f8b" }
+cuda-bindings = { git = "https://github.com/NVIDIA/cuda-rust", rev = "348895e421a92d13a2c3a843ccb20ed1fb8b7f8b" }
+cuda-device = { git = "https://github.com/NVIDIA/cuda-rust", rev = "348895e421a92d13a2c3a843ccb20ed1fb8b7f8b" }
+cuda-host = { git = "https://github.com/NVIDIA/cuda-rust", rev = "348895e421a92d13a2c3a843ccb20ed1fb8b7f8b" }
+sim-state = { path = "crates/sim-state" }
+sim-interop = { path = "crates/sim-interop" }
+sim-render = { path = "crates/sim-render" }
+sim-physics = { path = "crates/sim-physics" }
+
+[profile.dev]
+opt-level = 0
+debug = 1
+incremental = true
+codegen-units = 256
+lto = false
+
+[profile.dev.build-override]
+opt-level = 0
+debug = false
+codegen-units = 256
+
+[profile.release]
+opt-level = 3
+# CUDA artifact objects do not contain host LLVM bitcode for cross-crate LTO.
+lto = false
+codegen-units = 1
+incremental = false
+
+[profile.training]
+inherits = "release"
+debug = "line-tables-only"

@@ -1,0 +1,9 @@
+[package]
+name = "sim-state"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "No-std layouts shared by simulation rendering and CUDA physics"
+
+[dependencies]
+bytemuck.workspace = true

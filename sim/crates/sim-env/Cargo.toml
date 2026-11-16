@@ -1,0 +1,22 @@
+[package]
+name = "sim-env"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "GPU-resident visual gap-flight environment with a C ABI"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+cuda-core.workspace = true
+cuda-device.workspace = true
+cuda-host.workspace = true
+glam.workspace = true
+wgpu.workspace = true
+sim-state = { path = "../sim-state" }
+sim-interop = { path = "../sim-interop" }
+sim-render = { path = "../sim-render" }
+sim-physics = { path = "../sim-physics" }

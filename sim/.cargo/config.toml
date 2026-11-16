@@ -1,0 +1,12 @@
+[build]
+# Keep generated binaries outside the source-only Nix flake directory.
+target-dir = "../.sim-target"
+jobs = 8
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[alias]
+host = "build"
+training = "oxide build --arch sm_120 --device-codegen-crate sim_physics -- -p sim-smoke --profile training"

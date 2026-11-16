@@ -1,0 +1,85 @@
+{
+  "hardware": "NVIDIA GeForce RTX 5070 Ti, driver 595.112.07",
+  "toolchain": "Rust 1.99.1, NVIDIA cuda-rust 348895e421a92d13a2c3a843ccb20ed1fb8b7f8b, CUDA 13.2.51",
+  "cpu_tests": {"state_and_interop_passed": 7, "task_geometry_and_rng_passed": 2, "terminal_gae_passed": 3, "trace_verifier_passed": 5},
+  "gpu_exchange_tests": {"passed": 2, "repeated_bidirectional_handoffs": 128},
+  "render_cuda_smoke": {
+    "frames": 64,
+    "cameras": 2,
+    "resolution": [320, 240],
+    "batch_elapsed_ms": 86.04,
+    "camera_frames_per_second": 1487.7,
+    "checks": ["analytic translation", "gravity cancellation", "finite normalized quaternion", "nonzero torque rotation", "every RGBA-to-NCHW pixel", "metric depth", "visible ground and moving object IDs"],
+    "host_transfers": "Initialization and explicit final correctness/image readback; no end-to-end profiler claim in this record."
+  },
+  "native_task_engineering_oracle": {
+    "environments": 16,
+    "steps": 150,
+    "resolution": [320, 240],
+    "borrowed_pointer_identity_verified": true,
+    "completed_episodes": 16,
+    "successes": 16,
+    "elapsed_seconds": 0.10739,
+    "note": "Privileged gap-steering oracle verifies task solvability and native tensor transport, not learned policy performance. No encoder inference in this measurement."
+  },
+  "build_observations": {
+    "llvm_host_cold_seconds": 23.26,
+    "cranelift_host_cold_seconds": 11.51,
+    "cuda_app_incremental_seconds": 1.66,
+    "note": "Observed separate target-directory builds, not a controlled compiler benchmark; download/provisioning excluded."
+  },
+  "learned_state_ceiling": {
+    "summary": "runs/gpu-state-320-seed0-persistent/summary.json",
+    "actual_steps": 999424,
+    "elapsed_seconds_including_initialization_training_evaluation": 238.0407198049943,
+    "held_out_episodes": 128,
+    "successes": 128,
+    "collisions": 0,
+    "note": "Privileged-state PPO control, not a visual policy."
+  },
+  "persistent_validation_memory": {
+    "report": "runs/gpu-memory-fixed/memory-check.json",
+    "complete_evaluations": 5,
+    "same_stream": true,
+    "allocated_growth_after_warmup_bytes": 0,
+    "reserved_growth_after_warmup_bytes": 0,
+    "note": "Reuse one validation environment/stream; avoids per-stream allocator and cuBLAS workspace retention."
+  },
+  "learned_no_vision_control": {
+    "summary": "runs/gpu-proprio-320-seed0-persistent/summary.json",
+    "actual_steps": 999424,
+    "elapsed_seconds_including_initialization_training_evaluation": 235.07352556599653,
+    "held_out_episodes": 128,
+    "successes": 33,
+    "collisions": 95
+  },
+  "vulkan_validation": {
+    "command": "sim/scripts/check-validation.sh",
+    "executable": ".sim-target/training/sim-smoke",
+    "frames": 8,
+    "cameras": 2,
+    "reported_errors": 0,
+    "regression": "Direct shader stage-output constructors avoid invalid SPIR-V Offset decorations on function-local structs."
+  },
+  "end_to_end_zero_host_staging_profile": {
+    "encoder": "run:runs/mean",
+    "environments": 16,
+    "resolution": [320, 240],
+    "collection": {"cuda_calls": 41617, "linked_gpu_activities": 35153, "host_transfers_or_waits": 0},
+    "ppo_update": {"cuda_calls": 3934, "linked_gpu_activities": 8958, "host_transfers_or_waits": 0},
+    "trace": "runs/gpu-benchmark-validated/batch-16/trace.json",
+    "scope": "Initialized collection and PPO updates only; explicit initialization, logging and checkpoint boundaries excluded.",
+    "limitation": "CUDA Kineto activities and correlated driver/runtime calls; Vulkan draw timing is not isolated."
+  },
+  "first_completed_visual_rl": {
+    "summary": "runs/gpu-mean-320-seed0-persistent/summary.json",
+    "native_archive": "runs/native-before-output-constructor-fix/libsim_env.so",
+    "actual_steps": 999424,
+    "elapsed_seconds_including_initialization_training_evaluation": 1607.0646648449983,
+    "held_out_episodes": 128,
+    "successes": 128,
+    "collisions": 0,
+    "meaningful_visual_goal_met": true,
+    "note": "Measured before the shader-output constructor portability fix; the archived native binary preserves this run's provenance."
+  }
+}
