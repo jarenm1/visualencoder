@@ -1,0 +1,346 @@
+[
+  {
+    "target": "own",
+    "seed": 0,
+    "spec": "run:/home/jaren/visualencoder/runs/experiments/mixed-own-seed0-steps10000",
+    "paired_vs_baseline": {
+      "spec": "run:/home/jaren/visualencoder/runs/baseline",
+      "sim_to_real": {
+        "miou": {
+          "difference": 0.0031434010573796467,
+          "ci95": {
+            "low": -0.034685673101854664,
+            "high": 0.06267381596485004,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_auroc": {
+          "difference": -0.02363255569225986,
+          "ci95": {
+            "low": -0.08242823621776849,
+            "high": 0.008871382662903196,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_ap": {
+          "difference": 0.03782486641209748,
+          "ci95": {
+            "low": -0.03632977280954887,
+            "high": 0.10767379954899456,
+            "valid_resamples": 1000
+          }
+        }
+      },
+      "real_to_real": {
+        "miou": {
+          "difference": 0.054008200357630765,
+          "ci95": {
+            "low": 0.014225401929053416,
+            "high": 0.064456280884064,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_auroc": {
+          "difference": 0.01514808758617403,
+          "ci95": {
+            "low": 0.01001144136051941,
+            "high": 0.03593104666266704,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_ap": {
+          "difference": 0.08372550836588599,
+          "ci95": {
+            "low": 0.054481130030954936,
+            "high": 0.15175371945720914,
+            "valid_resamples": 1000
+          }
+        }
+      },
+      "gap": {
+        "miou": {
+          "difference": 0.05086479930025112,
+          "ci95": {
+            "low": -0.01882139657720655,
+            "high": 0.09186201464139639,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_auroc": {
+          "difference": 0.03878064327843389,
+          "ci95": {
+            "low": 0.010578167571328678,
+            "high": 0.09764026115943722,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_ap": {
+          "difference": 0.04590064195378851,
+          "ci95": {
+            "low": 0.002774160418227057,
+            "high": 0.1265698299126557,
+            "valid_resamples": 1000
+          }
+        }
+      }
+    }
+  },
+  {
+    "target": "own",
+    "seed": 1,
+    "spec": "run:/home/jaren/visualencoder/runs/experiments/mixed-own-seed1-steps10000",
+    "paired_vs_baseline": {
+      "spec": "run:/home/jaren/visualencoder/runs/baseline-seed1",
+      "sim_to_real": {
+        "miou": {
+          "difference": 0.025257067736960237,
+          "ci95": {
+            "low": 0.002348340530011983,
+            "high": 0.05863377672969302,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_auroc": {
+          "difference": 0.0009911929113511908,
+          "ci95": {
+            "low": -0.01813462940244731,
+            "high": 0.015002241463647092,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_ap": {
+          "difference": 0.05766859509733713,
+          "ci95": {
+            "low": 0.003548877890930058,
+            "high": 0.12378114456669906,
+            "valid_resamples": 1000
+          }
+        }
+      },
+      "real_to_real": {
+        "miou": {
+          "difference": 0.059365838433895424,
+          "ci95": {
+            "low": 0.028086638692692012,
+            "high": 0.07308069455918867,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_auroc": {
+          "difference": 0.015583683310982033,
+          "ci95": {
+            "low": 0.009759718010488685,
+            "high": 0.032665247061314955,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_ap": {
+          "difference": 0.08957999493427404,
+          "ci95": {
+            "low": 0.060219370789869185,
+            "high": 0.1535804088243991,
+            "valid_resamples": 1000
+          }
+        }
+      },
+      "gap": {
+        "miou": {
+          "difference": 0.03410877069693519,
+          "ci95": {
+            "low": 0.0017220595397111741,
+            "high": 0.05175955307712323,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_auroc": {
+          "difference": 0.014592490399630842,
+          "ci95": {
+            "low": 0.001973993781933739,
+            "high": 0.04580459996637648,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_ap": {
+          "difference": 0.031911399836936916,
+          "ci95": {
+            "low": 0.0012177317421093045,
+            "high": 0.09585285924480459,
+            "valid_resamples": 1000
+          }
+        }
+      }
+    }
+  },
+  {
+    "target": "mean",
+    "seed": 0,
+    "spec": "run:/home/jaren/visualencoder/runs/experiments/mixed-mean-seed0-steps10000",
+    "paired_vs_baseline": {
+      "spec": "run:/home/jaren/visualencoder/runs/mean",
+      "sim_to_real": {
+        "miou": {
+          "difference": 0.04659148120888568,
+          "ci95": {
+            "low": 0.008556608989560309,
+            "high": 0.09060653518337027,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_auroc": {
+          "difference": -0.002309124639512272,
+          "ci95": {
+            "low": -0.052154896474663315,
+            "high": 0.02592544444322632,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_ap": {
+          "difference": 0.09581064909468673,
+          "ci95": {
+            "low": 0.011299189890294131,
+            "high": 0.1680672912151314,
+            "valid_resamples": 1000
+          }
+        }
+      },
+      "real_to_real": {
+        "miou": {
+          "difference": 0.07941033589305413,
+          "ci95": {
+            "low": 0.04369580130018296,
+            "high": 0.09493845968049364,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_auroc": {
+          "difference": 0.01990787101673397,
+          "ci95": {
+            "low": 0.014813889891393123,
+            "high": 0.04177177153288986,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_ap": {
+          "difference": 0.1087427480740567,
+          "ci95": {
+            "low": 0.07445723512837668,
+            "high": 0.18798896005951946,
+            "valid_resamples": 1000
+          }
+        }
+      },
+      "gap": {
+        "miou": {
+          "difference": 0.03281885468416845,
+          "ci95": {
+            "low": -0.011955508287872613,
+            "high": 0.05866297825548325,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_auroc": {
+          "difference": 0.02221699565624624,
+          "ci95": {
+            "low": -0.00427784119162633,
+            "high": 0.0766455419564475,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_ap": {
+          "difference": 0.012932098979369977,
+          "ci95": {
+            "low": -0.03476953132522653,
+            "high": 0.09716180656471873,
+            "valid_resamples": 1000
+          }
+        }
+      }
+    }
+  },
+  {
+    "target": "mean",
+    "seed": 1,
+    "spec": "run:/home/jaren/visualencoder/runs/experiments/mixed-mean-seed1-steps10000",
+    "paired_vs_baseline": {
+      "spec": "run:/home/jaren/visualencoder/runs/mean-seed1",
+      "sim_to_real": {
+        "miou": {
+          "difference": 0.04846736783267447,
+          "ci95": {
+            "low": 0.018957897475299634,
+            "high": 0.08040776415311757,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_auroc": {
+          "difference": -0.015266290454772014,
+          "ci95": {
+            "low": -0.03942931786892021,
+            "high": 0.004609712557500312,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_ap": {
+          "difference": 0.06524762618546953,
+          "ci95": {
+            "low": 0.001880080540032525,
+            "high": 0.15161876279140876,
+            "valid_resamples": 1000
+          }
+        }
+      },
+      "real_to_real": {
+        "miou": {
+          "difference": 0.06962704310216217,
+          "ci95": {
+            "low": 0.029567668395181657,
+            "high": 0.09373125284882855,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_auroc": {
+          "difference": 0.0181533181975837,
+          "ci95": {
+            "low": 0.01153706748126589,
+            "high": 0.03720941475279105,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_ap": {
+          "difference": 0.105026540285176,
+          "ci95": {
+            "low": 0.0678067320046878,
+            "high": 0.19601830291958375,
+            "valid_resamples": 1000
+          }
+        }
+      },
+      "gap": {
+        "miou": {
+          "difference": 0.0211596752694877,
+          "ci95": {
+            "low": -0.01406142522068788,
+            "high": 0.04104377153919116,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_auroc": {
+          "difference": 0.033419608652355715,
+          "ci95": {
+            "low": 0.011932604373683042,
+            "high": 0.07099498638362649,
+            "valid_resamples": 1000
+          }
+        },
+        "vehicle_ap": {
+          "difference": 0.039778914099706464,
+          "ci95": {
+            "low": 0.0022130587932875424,
+            "high": 0.11789994480803902,
+            "valid_resamples": 1000
+          }
+        }
+      }
+    }
+  }
+]

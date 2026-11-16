@@ -108,6 +108,8 @@ This independent 2×2 crosses simulation-only versus simulation-plus-real images
 
 Each treatment is evaluated independently on the existing simulator split and UAVid. This is **real-data-assisted adaptation**, not simulation-only transfer. Machine-readable results, uncertainty intervals and readable tables live under `reports/experiments/mixed`; geometry outputs are separate under `reports/experiments/geometry`. Incomplete training runs are never deleted or silently reused.
 
+`python scripts/show_experiments.py --study mixed` generates that study's paper table without requiring geometry results; `--study geometry` selects the other study. The default requires both completed studies. Missing or incomplete-budget results are errors, not silently omitted.
+
 ### GPU-owned visual navigation
 
 The separate [`sim/`](sim/) Cargo workspace supplies Vulkan/wgpu-hal rendering, NVIDIA Rust CUDA physics, external-memory/timeline synchronization, and a GPU-resident navigation task. The Python learner borrows CUDA tensor storage and runs the actual frozen visual encoder plus recurrent PPO on the native stream. The superseded host-staged prototype is removed.
