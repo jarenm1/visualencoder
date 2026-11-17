@@ -62,3 +62,15 @@ Measurements: `runs/city-benchmark-final/benchmark.json`. The final batch-16 tra
 The privileged error-diffused route oracle completed 128/128 episodes in each split with zero collisions (`runs/city-oracle-quantized/oracle-diagnostic.json`). This checks task solvability, not learned-policy performance. Simple nearest-heading pursuit cut inside clear route chords; world-frame velocity error diffusion removes that quantization error without changing geometry or routes.
 
 Actual camera views: `runs/city-smoke/city-cameras.png`. Eight blind-forward episodes collided; hover preserved position exactly over the finite horizon. The same run reported no Vulkan validation errors.
+
+Each city learner executed 2,999,808 transitions with matched PPO settings and one training seed:
+
+| Policy inputs | Successes / 128 | Collisions / 128 | Process minutes |
+|---|---:|---:|---:|
+| Frozen paired encoder + proprioception | 84 | 24 | 50.05 |
+| Proprioception only | 0 | 0 | 13.34 |
+| Privileged waypoint state + proprioception | 127 | 1 | 13.57 |
+
+Runs: `runs/city-{mean,proprio,state}-320-seed0`. Times include initialization and evaluation. Validation selected the visual checkpoint at 1,572,864 steps. All three blind heuristics scored 0/128. The visual 80% success target was **not met**; these results do not claim convergence or an advantage over other visual encoders. Privileged waypoints are not visual-policy inputs.
+
+The fixed first test rollout succeeds in 234 steps (11.7s): `reports/experiments/city-navigation-rollout/rollout.gif`, with actual world-path diagnostics beside it. Tables and intervals: `report/city-navigation.typ` and `.json`; architecture/timing/rollout evidence is compiled into `report/supplement.pdf`.

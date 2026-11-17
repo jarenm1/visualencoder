@@ -21,8 +21,8 @@
   while mixing real RGB improves segmentation and car average precision with little loss of simulated
   robustness. AUROC and probe-gap rankings disagree with precision and absolute quality. Whole-video
   bootstrap intervals expose uncertainty, with only seven validation videos. A separate Vulkan/NVIDIA Rust CUDA
-  pipeline trains frozen-encoder recurrent policies within an hour; near-ceiling task results do not establish
-  an encoder-ranking advantage. INT8 preserves measured probe scores, but embedded-device latency is unmeasured.
+  pipeline trains frozen-encoder recurrent policies within an hour, but an actual-city pilot remains below
+  80% success; neither convergence nor an encoder-ranking advantage is established. INT8 preserves measured probe scores, but embedded-device latency is unmeasured.
 ]
 
 = Introduction
@@ -187,8 +187,12 @@ reinforcing why gap size alone is not a quality objective.
 
 #include "navigation.typ"
 
-All visual encoders nearly saturate this initial task. It establishes control-relevant visual information and
-under-hour learning, but not an advantage for paired consistency over standard distillation.
+All visual encoders nearly saturate the initial gap task; this establishes under-hour feasibility, not an
+advantage for paired consistency. An actual-city extension shares 1.80M triangles across cameras and uses the
+same geometry for GPU collision. Its paired-student policy succeeds on 84/128 held-out episodes (65.6%) after
+3.00M transitions in 50.05 minutes, versus 0/128 for each blind heuristic. It does not meet the 80% target.
+Matched learned proprioception-only control scores 0/128, while privileged waypoint state reaches 127/128.
+This separate pilot uses goal-facing, altitude-stabilized kinematic control, not rotor flight; details are in the supplement.
 
 = Conclusion
 In the original fixed-city benchmark, paired-view targets improve every measured novel-appearance readout.
@@ -196,12 +200,12 @@ Extra training layouts within the shared assets add little at the same budget an
 in these two seeds; this does not establish that richer geometry is irrelevant.
 INT8 preserves the original student's probe scores closely, but Jetson latency is unmeasured.
 Simulation-only consistency gives no clear real-image gain; adding unlabelled real RGB improves readout quality
-and car AP without increasing AUROC. GPU control learns within an hour but nearly saturates, establishing pipeline
-feasibility rather than an encoder-ranking advantage. These objectives must be evaluated independently.
+and car AP without increasing AUROC. GPU control trains within an hour, but actual city navigation remains
+challenging; these results do not establish an encoder-ranking advantage. The objectives must be evaluated independently.
 
 *Limitations.* Three training cities and two held-out layouts share one stylised asset library, with a fixed
-compute budget. The separate lateral-gap task does not test full flight or city navigation. Distillation uses
-two training seeds, PPO one. Real-image uncertainty rests on only seven videos; embedded latency is unmeasured.
+compute budget. City navigation uses a goal-facing camera and stabilized kinematic velocity, not full flight.
+Distillation uses two training seeds, PPO one. Real-image uncertainty rests on only seven videos; embedded latency is unmeasured.
 
 
 #v(6pt)

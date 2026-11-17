@@ -1,3 +1,4 @@
+// Build: typst compile --root . report/supplement.typ report/supplement.pdf
 #set document(title: "Supplement: Appearance-Robust Vision Encoders for Drones", author: "Jaren McHugh")
 #set page(paper: "us-letter", margin: 0.8in, numbering: "1")
 #set text(font: "New Computer Modern", size: 10pt)
@@ -54,7 +55,55 @@ Representative urban views are selected by ground-truth coverage and camera heig
 
 #include "geometry-extra.typ"
 
-= Actual trained-policy rollout
+= Original gap-task rollout
 #figure(image("figures/navigation.png", width: 100%), caption: [Frames from the paired-consistency visual policy in a
 separate held-out rollout. The episode finished successfully after 121 steps. This single inspection episode is not
 the aggregate 128-episode result; the recorded GIF and transition metadata accompany the code.])
+
+#pagebreak()
+
+= City renderer and task engineering
+#let city = json("../sim/verification.json").city_navigation
+The city extension imports the same #city.render_and_collision_triangles transformed GLB triangles for rendering
+and swept-sphere collision. Independent agents share static geometry; 16m render chunks are culled on the GPU
+and dispatched through persistent indexed indirect commands. RGB uses the original palette materials rather
+than the distillation renderer's phototextures, normal maps and shadows.
+
+#figure(table(
+  columns: (auto, auto, auto, auto),
+  align: (center, center, center, center),
+  stroke: none, table.hline(),
+  [*Environments*], [*Native images/s*], [*Encoder images/s*], [*Full PPO transitions/s*],
+  table.hline(stroke: 0.5pt),
+  ..city.city_benchmark.batches.map(row => (
+    [#row.environments],
+    [#calc.round(row.native_images_per_second)],
+    [#calc.round(row.encoder_images_per_second)],
+    [#calc.round(row.full_ppo_transitions_per_second)],
+  )).flatten(),
+  table.hline(),
+), caption: [Actual city, RTX 5070 Ti, 320×240 RGB and the frozen paired-consistency encoder.
+Native includes kinematic control, exact collision, Vulkan culling/rasterization, packing and CUDA conversion;
+it is not isolated draw timing. Concurrent workstation workloads were not controlled.])
+
+The batch-16 profile checks #city.zero_host_staging.collection.cuda_runtime_calls CUDA runtime calls in collection
+and #city.zero_host_staging.ppo_update.cuda_runtime_calls in PPO updates, with zero host transfers or host waits
+in either scope. GPU packing, conversion and rollout feature copies remain; initialization, batch-end metrics
+and artifact export are outside the claim. Vulkan validation reports no errors.
+
+Before learning, a privileged route oracle completes 128/128 episodes in each district without collision.
+World-frame velocity error diffusion prevents discrete-heading pursuit from cutting inside clear path chords.
+This is task-solvability evidence, not a visual-policy result. Eight blind-forward test episodes all collide;
+hover leaves position unchanged through the finite horizon.
+
+#figure(image("figures/city-cameras.png", width: 100%), caption: [Actual GPU-rendered initial test-route views at
+6m altitude. Cameras face their final goals, which lie behind actual geometry. These are unselected initialized
+views, not learned-policy trajectories.])
+
+#pagebreak()
+#include "city-navigation.typ"
+
+#figure(image("figures/city-navigation.png", width: 100%), caption: [The fixed first test episode of the actual
+trained city visual policy, reaching its goal after 234 steps (11.7s), without collision. Frames and the
+exported world trajectory show one inspection episode, not the aggregate success estimate. The image encoder
+is frozen; only the recurrent PPO actor and critic are trained.])

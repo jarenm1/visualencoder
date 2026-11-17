@@ -1,0 +1,1004 @@
+[
+  {
+    "run": "runs/city-mean-320-seed0",
+    "encoder": "run:runs/mean",
+    "seed": 0,
+    "actual_steps": 2999808,
+    "selected_steps": 1572864,
+    "elapsed_seconds": 3002.7694592110056,
+    "width": 320,
+    "height": 240,
+    "task_contract": {
+      "abi_version": 2,
+      "action_count": 9,
+      "actions": [
+        "hover",
+        "forward",
+        "forward_right",
+        "right",
+        "backward_right",
+        "backward",
+        "backward_left",
+        "left",
+        "forward_left"
+      ],
+      "altitude_m": 6.0,
+      "autoreset": "Terminal reward/done/success/collision retained; observation and diagnostics belong to reset episode. Episode counter increments on any terminal. Explicit reset clears counters/outputs.",
+      "bvh_node_count": 524287,
+      "city_fingerprint": "sha256:62e67df07b2bff3c13aed8983e8dd3dbc5393d33c4f98c3895b8f73cb43fb217",
+      "collision_radius_m": 0.3499999940395355,
+      "control_hz": 20,
+      "controls": "Altitude exactly stabilized at6m. Immediate3m/s horizontal velocity; six exact swept120Hz substeps per20Hz action. Level gimballed camera yaws toward final goal each observation; action frame held within the control step. One shared city; agents neither render nor collide with each other.",
+      "diagnostics": [
+        "world_x",
+        "world_y",
+        "world_z",
+        "goal_x",
+        "goal_y",
+        "goal_z",
+        "route_id",
+        "clock_steps"
+      ],
+      "goal_radius_m": 1.0,
+      "horizon": 320,
+      "neutral_action": 0,
+      "physics_hz": 120,
+      "privileged": [
+        "next_waypoint_right_m/32",
+        "next_waypoint_forward_m/32",
+        "remaining_path_m/48",
+        "elapsed_clock_fraction"
+      ],
+      "privileged_convention": "Right positive camera-right; forward positive toward goal-facing camera forward; identical32m scale for waypoint components. Privileged state only for explicit state ceiling, never default visual/proprio actor.",
+      "proprio": [
+        "goal_right_m=0",
+        "goal_up_m",
+        "goal_view_z_m=-distance",
+        "velocity_right_m_s",
+        "velocity_up_m_s",
+        "velocity_forward_m_s",
+        "remaining_clock_fraction",
+        "previous_action_div8"
+      ],
+      "reward": {
+        "collision": -5.0,
+        "potential": "remaining=distance to next waypoint + its suffix polyline distance; reward=.2*(old_remaining-new_remaining)-.01+terminal_bonus; advance nonfinal waypoint within.25m; success actual final-goal distance<=1m; collision takes precedence; horizon320 is terminal with zero extra bonus",
+        "progress_per_m": 0.2,
+        "success": 5.0,
+        "time_per_step": -0.01
+      },
+      "route_counts": {
+        "test": 128,
+        "train": 128,
+        "validation": 128
+      },
+      "route_split_definition": {
+        "actual_length_ranges_m": [
+          [
+            16.246212005615234,
+            37.96961975097656
+          ],
+          [
+            14.511665344238281,
+            37.841644287109375
+          ],
+          [
+            12.246211051940918,
+            37.96862030029297
+          ]
+        ],
+        "catalog_seeds": [
+          7324142150989215761,
+          13317361681456312935,
+          3414073405398897667
+        ],
+        "catalog_version": 1,
+        "district_centers_xz_m": [
+          [
+            -98.0,
+            -98.0
+          ],
+          [
+            98.0,
+            -98.0
+          ],
+          [
+            98.0,
+            98.0
+          ]
+        ],
+        "district_half_size_m": 32.0,
+        "grid_spacing_m": 2.0,
+        "length_range_m": [
+          12.0,
+          38.0
+        ],
+        "minimum_detour_m": 2.0,
+        "minimum_detour_ratio": 1.08,
+        "minimum_direct_distance_m": 8.0,
+        "planning_radius_m": 0.8500000238418579,
+        "route_rule": "All splits require direct swept-sphere line blocked at radius .35m. Starts/goals and every path chord are clear at .85m. Samples must be sky-clear to y=256m. Dijkstra shortest paths on the exact-sweep eight-connected 2m grid, then greedy farthest-visible shortcut. 128 distinct unordered start/goal pairs per split, at most four routes per start. Fixed independently seeded catalogs; reset seed selects episodes only; no easy curriculum or fallback."
+      },
+      "speed_m_s": 3.0,
+      "task": "city-block-navigation-v1",
+      "triangle_count": 1799347,
+      "waypoint_radius_m": 0.25
+    },
+    "success_wilson95": [
+      0.5704962778456513,
+      0.7328984233188773
+    ],
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "result": {
+      "status": "step_budget_complete_rounded_down",
+      "actual_steps": 2999808,
+      "requested_steps": 3000000,
+      "selected_steps": 1572864,
+      "elapsed_seconds_including_initialization_training_evaluation": 3002.7694592110056,
+      "wall_budget_seconds": 3300.0,
+      "within_wall_budget": true,
+      "compile_excluded": true,
+      "convergence_claim": false,
+      "timings": {
+        "initialization_seconds": 3.753902302007191,
+        "collection_seconds": 2279.526274683856,
+        "ppo_seconds": 212.68063163511397,
+        "validation_seconds": 456.4277823089942,
+        "final_evaluation_seconds": 49.86496117399656,
+        "checkpoint_seconds": 0.01737992100242991
+      },
+      "final_test": {
+        "visual": {
+          "episodes": 128,
+          "success": 0.65625,
+          "collision": 0.1875,
+          "mean_return": 1.2033584117889404,
+          "mean_steps": 209.1015625,
+          "mean_success_steps": 202.86904761904762,
+          "return_standard_error": 0.35904142212053414,
+          "policy": "checkpoint",
+          "horizon_terminal": 320
+        },
+        "hover": {
+          "episodes": 128,
+          "success": 0.0,
+          "collision": 0.0,
+          "mean_return": -3.1999974250793457,
+          "mean_steps": 320.0,
+          "mean_success_steps": null,
+          "return_standard_error": 8.802585996305485e-05,
+          "policy": "hover",
+          "horizon_terminal": 320
+        },
+        "goal_centering": {
+          "episodes": 128,
+          "success": 0.0,
+          "collision": 1.0,
+          "mean_return": -4.26325798034668,
+          "mean_steps": 56.234375,
+          "mean_success_steps": null,
+          "return_standard_error": 0.05935885859712034,
+          "policy": "goal_centering",
+          "horizon_terminal": 320
+        },
+        "random": {
+          "episodes": 128,
+          "success": 0.0,
+          "collision": 0.1328125,
+          "mean_return": -3.6782262325286865,
+          "mean_steps": 299.4375,
+          "mean_success_steps": null,
+          "return_standard_error": 0.11900087394077473,
+          "policy": "random",
+          "horizon_terminal": 320
+        },
+        "seed": 200003,
+        "style": 2,
+        "cuda_memory": {
+          "stream": 93824999817968,
+          "allocated_bytes": 197666816,
+          "reserved_bytes": 2518679552,
+          "global_free_bytes": 5069275136,
+          "global_total_bytes": 16608133120
+        },
+        "native_metadata": {
+          "abi_version": 2,
+          "action_count": 9,
+          "actions": [
+            "hover",
+            "forward",
+            "forward_right",
+            "right",
+            "backward_right",
+            "backward",
+            "backward_left",
+            "left",
+            "forward_left"
+          ],
+          "altitude_m": 6.0,
+          "autoreset": "Terminal reward/done/success/collision retained; observation and diagnostics belong to reset episode. Episode counter increments on any terminal. Explicit reset clears counters/outputs.",
+          "bvh_node_count": 524287,
+          "city_fingerprint": "sha256:62e67df07b2bff3c13aed8983e8dd3dbc5393d33c4f98c3895b8f73cb43fb217",
+          "city_path": "/home/jaren/visualencoder/assets/city",
+          "collision_radius_m": 0.3499999940395355,
+          "control_hz": 20,
+          "controls": "Altitude exactly stabilized at6m. Immediate3m/s horizontal velocity; six exact swept120Hz substeps per20Hz action. Level gimballed camera yaws toward final goal each observation; action frame held within the control step. One shared city; agents neither render nor collide with each other.",
+          "diagnostics": [
+            "world_x",
+            "world_y",
+            "world_z",
+            "goal_x",
+            "goal_y",
+            "goal_z",
+            "route_id",
+            "clock_steps"
+          ],
+          "goal_radius_m": 1.0,
+          "horizon": 320,
+          "neutral_action": 0,
+          "physics_hz": 120,
+          "privileged": [
+            "next_waypoint_right_m/32",
+            "next_waypoint_forward_m/32",
+            "remaining_path_m/48",
+            "elapsed_clock_fraction"
+          ],
+          "privileged_convention": "Right positive camera-right; forward positive toward goal-facing camera forward; identical32m scale for waypoint components. Privileged state only for explicit state ceiling, never default visual/proprio actor.",
+          "proprio": [
+            "goal_right_m=0",
+            "goal_up_m",
+            "goal_view_z_m=-distance",
+            "velocity_right_m_s",
+            "velocity_up_m_s",
+            "velocity_forward_m_s",
+            "remaining_clock_fraction",
+            "previous_action_div8"
+          ],
+          "reward": {
+            "collision": -5.0,
+            "potential": "remaining=distance to next waypoint + its suffix polyline distance; reward=.2*(old_remaining-new_remaining)-.01+terminal_bonus; advance nonfinal waypoint within.25m; success actual final-goal distance<=1m; collision takes precedence; horizon320 is terminal with zero extra bonus",
+            "progress_per_m": 0.2,
+            "success": 5.0,
+            "time_per_step": -0.01
+          },
+          "route_counts": {
+            "test": 128,
+            "train": 128,
+            "validation": 128
+          },
+          "route_split_definition": {
+            "actual_length_ranges_m": [
+              [
+                16.246212005615234,
+                37.96961975097656
+              ],
+              [
+                14.511665344238281,
+                37.841644287109375
+              ],
+              [
+                12.246211051940918,
+                37.96862030029297
+              ]
+            ],
+            "catalog_seeds": [
+              7324142150989215761,
+              13317361681456312935,
+              3414073405398897667
+            ],
+            "catalog_version": 1,
+            "district_centers_xz_m": [
+              [
+                -98.0,
+                -98.0
+              ],
+              [
+                98.0,
+                -98.0
+              ],
+              [
+                98.0,
+                98.0
+              ]
+            ],
+            "district_half_size_m": 32.0,
+            "grid_spacing_m": 2.0,
+            "length_range_m": [
+              12.0,
+              38.0
+            ],
+            "minimum_detour_m": 2.0,
+            "minimum_detour_ratio": 1.08,
+            "minimum_direct_distance_m": 8.0,
+            "planning_radius_m": 0.8500000238418579,
+            "route_rule": "All splits require direct swept-sphere line blocked at radius .35m. Starts/goals and every path chord are clear at .85m. Samples must be sky-clear to y=256m. Dijkstra shortest paths on the exact-sweep eight-connected 2m grid, then greedy farthest-visible shortcut. 128 distinct unordered start/goal pairs per split, at most four routes per start. Fixed independently seeded catalogs; reset seed selects episodes only; no easy curriculum or fallback."
+          },
+          "speed_m_s": 3.0,
+          "split": "test",
+          "style": 2,
+          "task": "city-block-navigation-v1",
+          "triangle_count": 1799347,
+          "waypoint_radius_m": 0.25
+        }
+      },
+      "acceptance": {
+        "policy_success": 0.65625,
+        "best_blind_success": 0.0,
+        "absolute_gain": 0.65625,
+        "episodes": 128,
+        "meaningful_visual_goal_met": false,
+        "criterion": "visual success >=0.8 and >=0.2 absolute above best blind heuristic on >=128 held-out episodes"
+      },
+      "checkpoint": "runs/city-mean-320-seed0/best.pt",
+      "last_checkpoint": "runs/city-mean-320-seed0/last.pt"
+    }
+  },
+  {
+    "run": "runs/city-proprio-320-seed0",
+    "encoder": "proprio",
+    "seed": 0,
+    "actual_steps": 2999808,
+    "selected_steps": 262144,
+    "elapsed_seconds": 800.2036799579946,
+    "width": 320,
+    "height": 240,
+    "task_contract": {
+      "abi_version": 2,
+      "action_count": 9,
+      "actions": [
+        "hover",
+        "forward",
+        "forward_right",
+        "right",
+        "backward_right",
+        "backward",
+        "backward_left",
+        "left",
+        "forward_left"
+      ],
+      "altitude_m": 6.0,
+      "autoreset": "Terminal reward/done/success/collision retained; observation and diagnostics belong to reset episode. Episode counter increments on any terminal. Explicit reset clears counters/outputs.",
+      "bvh_node_count": 524287,
+      "city_fingerprint": "sha256:62e67df07b2bff3c13aed8983e8dd3dbc5393d33c4f98c3895b8f73cb43fb217",
+      "collision_radius_m": 0.3499999940395355,
+      "control_hz": 20,
+      "controls": "Altitude exactly stabilized at6m. Immediate3m/s horizontal velocity; six exact swept120Hz substeps per20Hz action. Level gimballed camera yaws toward final goal each observation; action frame held within the control step. One shared city; agents neither render nor collide with each other.",
+      "diagnostics": [
+        "world_x",
+        "world_y",
+        "world_z",
+        "goal_x",
+        "goal_y",
+        "goal_z",
+        "route_id",
+        "clock_steps"
+      ],
+      "goal_radius_m": 1.0,
+      "horizon": 320,
+      "neutral_action": 0,
+      "physics_hz": 120,
+      "privileged": [
+        "next_waypoint_right_m/32",
+        "next_waypoint_forward_m/32",
+        "remaining_path_m/48",
+        "elapsed_clock_fraction"
+      ],
+      "privileged_convention": "Right positive camera-right; forward positive toward goal-facing camera forward; identical32m scale for waypoint components. Privileged state only for explicit state ceiling, never default visual/proprio actor.",
+      "proprio": [
+        "goal_right_m=0",
+        "goal_up_m",
+        "goal_view_z_m=-distance",
+        "velocity_right_m_s",
+        "velocity_up_m_s",
+        "velocity_forward_m_s",
+        "remaining_clock_fraction",
+        "previous_action_div8"
+      ],
+      "reward": {
+        "collision": -5.0,
+        "potential": "remaining=distance to next waypoint + its suffix polyline distance; reward=.2*(old_remaining-new_remaining)-.01+terminal_bonus; advance nonfinal waypoint within.25m; success actual final-goal distance<=1m; collision takes precedence; horizon320 is terminal with zero extra bonus",
+        "progress_per_m": 0.2,
+        "success": 5.0,
+        "time_per_step": -0.01
+      },
+      "route_counts": {
+        "test": 128,
+        "train": 128,
+        "validation": 128
+      },
+      "route_split_definition": {
+        "actual_length_ranges_m": [
+          [
+            16.246212005615234,
+            37.96961975097656
+          ],
+          [
+            14.511665344238281,
+            37.841644287109375
+          ],
+          [
+            12.246211051940918,
+            37.96862030029297
+          ]
+        ],
+        "catalog_seeds": [
+          7324142150989215761,
+          13317361681456312935,
+          3414073405398897667
+        ],
+        "catalog_version": 1,
+        "district_centers_xz_m": [
+          [
+            -98.0,
+            -98.0
+          ],
+          [
+            98.0,
+            -98.0
+          ],
+          [
+            98.0,
+            98.0
+          ]
+        ],
+        "district_half_size_m": 32.0,
+        "grid_spacing_m": 2.0,
+        "length_range_m": [
+          12.0,
+          38.0
+        ],
+        "minimum_detour_m": 2.0,
+        "minimum_detour_ratio": 1.08,
+        "minimum_direct_distance_m": 8.0,
+        "planning_radius_m": 0.8500000238418579,
+        "route_rule": "All splits require direct swept-sphere line blocked at radius .35m. Starts/goals and every path chord are clear at .85m. Samples must be sky-clear to y=256m. Dijkstra shortest paths on the exact-sweep eight-connected 2m grid, then greedy farthest-visible shortcut. 128 distinct unordered start/goal pairs per split, at most four routes per start. Fixed independently seeded catalogs; reset seed selects episodes only; no easy curriculum or fallback."
+      },
+      "speed_m_s": 3.0,
+      "task": "city-block-navigation-v1",
+      "triangle_count": 1799347,
+      "waypoint_radius_m": 0.25
+    },
+    "success_wilson95": [
+      0.0,
+      0.029136956273508416
+    ],
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "result": {
+      "status": "step_budget_complete_rounded_down",
+      "actual_steps": 2999808,
+      "requested_steps": 3000000,
+      "selected_steps": 262144,
+      "elapsed_seconds_including_initialization_training_evaluation": 800.2036799579946,
+      "wall_budget_seconds": 3300.0,
+      "within_wall_budget": true,
+      "compile_excluded": true,
+      "convergence_claim": false,
+      "timings": {
+        "initialization_seconds": 3.374460174993146,
+        "collection_seconds": 513.6519285801041,
+        "ppo_seconds": 221.43793008098146,
+        "validation_seconds": 45.5978247429739,
+        "final_evaluation_seconds": 15.62641643200186,
+        "checkpoint_seconds": 0.005890574000659399
+      },
+      "final_test": {
+        "proprio": {
+          "episodes": 128,
+          "success": 0.0,
+          "collision": 0.0,
+          "mean_return": -3.1999974250793457,
+          "mean_steps": 320.0,
+          "mean_success_steps": null,
+          "return_standard_error": 8.802585996305485e-05,
+          "policy": "checkpoint",
+          "horizon_terminal": 320
+        },
+        "hover": {
+          "episodes": 128,
+          "success": 0.0,
+          "collision": 0.0,
+          "mean_return": -3.1999974250793457,
+          "mean_steps": 320.0,
+          "mean_success_steps": null,
+          "return_standard_error": 8.802585996305485e-05,
+          "policy": "hover",
+          "horizon_terminal": 320
+        },
+        "goal_centering": {
+          "episodes": 128,
+          "success": 0.0,
+          "collision": 1.0,
+          "mean_return": -4.26325798034668,
+          "mean_steps": 56.234375,
+          "mean_success_steps": null,
+          "return_standard_error": 0.05935885859712034,
+          "policy": "goal_centering",
+          "horizon_terminal": 320
+        },
+        "random": {
+          "episodes": 128,
+          "success": 0.0,
+          "collision": 0.1328125,
+          "mean_return": -3.6782262325286865,
+          "mean_steps": 299.4375,
+          "mean_success_steps": null,
+          "return_standard_error": 0.11900087394077473,
+          "policy": "random",
+          "horizon_terminal": 320
+        },
+        "seed": 200003,
+        "style": 2,
+        "cuda_memory": {
+          "stream": 93824998212320,
+          "allocated_bytes": 136475136,
+          "reserved_bytes": 146800640,
+          "global_free_bytes": 7251034112,
+          "global_total_bytes": 16608133120
+        },
+        "native_metadata": {
+          "abi_version": 2,
+          "action_count": 9,
+          "actions": [
+            "hover",
+            "forward",
+            "forward_right",
+            "right",
+            "backward_right",
+            "backward",
+            "backward_left",
+            "left",
+            "forward_left"
+          ],
+          "altitude_m": 6.0,
+          "autoreset": "Terminal reward/done/success/collision retained; observation and diagnostics belong to reset episode. Episode counter increments on any terminal. Explicit reset clears counters/outputs.",
+          "bvh_node_count": 524287,
+          "city_fingerprint": "sha256:62e67df07b2bff3c13aed8983e8dd3dbc5393d33c4f98c3895b8f73cb43fb217",
+          "city_path": "/home/jaren/visualencoder/assets/city",
+          "collision_radius_m": 0.3499999940395355,
+          "control_hz": 20,
+          "controls": "Altitude exactly stabilized at6m. Immediate3m/s horizontal velocity; six exact swept120Hz substeps per20Hz action. Level gimballed camera yaws toward final goal each observation; action frame held within the control step. One shared city; agents neither render nor collide with each other.",
+          "diagnostics": [
+            "world_x",
+            "world_y",
+            "world_z",
+            "goal_x",
+            "goal_y",
+            "goal_z",
+            "route_id",
+            "clock_steps"
+          ],
+          "goal_radius_m": 1.0,
+          "horizon": 320,
+          "neutral_action": 0,
+          "physics_hz": 120,
+          "privileged": [
+            "next_waypoint_right_m/32",
+            "next_waypoint_forward_m/32",
+            "remaining_path_m/48",
+            "elapsed_clock_fraction"
+          ],
+          "privileged_convention": "Right positive camera-right; forward positive toward goal-facing camera forward; identical32m scale for waypoint components. Privileged state only for explicit state ceiling, never default visual/proprio actor.",
+          "proprio": [
+            "goal_right_m=0",
+            "goal_up_m",
+            "goal_view_z_m=-distance",
+            "velocity_right_m_s",
+            "velocity_up_m_s",
+            "velocity_forward_m_s",
+            "remaining_clock_fraction",
+            "previous_action_div8"
+          ],
+          "reward": {
+            "collision": -5.0,
+            "potential": "remaining=distance to next waypoint + its suffix polyline distance; reward=.2*(old_remaining-new_remaining)-.01+terminal_bonus; advance nonfinal waypoint within.25m; success actual final-goal distance<=1m; collision takes precedence; horizon320 is terminal with zero extra bonus",
+            "progress_per_m": 0.2,
+            "success": 5.0,
+            "time_per_step": -0.01
+          },
+          "route_counts": {
+            "test": 128,
+            "train": 128,
+            "validation": 128
+          },
+          "route_split_definition": {
+            "actual_length_ranges_m": [
+              [
+                16.246212005615234,
+                37.96961975097656
+              ],
+              [
+                14.511665344238281,
+                37.841644287109375
+              ],
+              [
+                12.246211051940918,
+                37.96862030029297
+              ]
+            ],
+            "catalog_seeds": [
+              7324142150989215761,
+              13317361681456312935,
+              3414073405398897667
+            ],
+            "catalog_version": 1,
+            "district_centers_xz_m": [
+              [
+                -98.0,
+                -98.0
+              ],
+              [
+                98.0,
+                -98.0
+              ],
+              [
+                98.0,
+                98.0
+              ]
+            ],
+            "district_half_size_m": 32.0,
+            "grid_spacing_m": 2.0,
+            "length_range_m": [
+              12.0,
+              38.0
+            ],
+            "minimum_detour_m": 2.0,
+            "minimum_detour_ratio": 1.08,
+            "minimum_direct_distance_m": 8.0,
+            "planning_radius_m": 0.8500000238418579,
+            "route_rule": "All splits require direct swept-sphere line blocked at radius .35m. Starts/goals and every path chord are clear at .85m. Samples must be sky-clear to y=256m. Dijkstra shortest paths on the exact-sweep eight-connected 2m grid, then greedy farthest-visible shortcut. 128 distinct unordered start/goal pairs per split, at most four routes per start. Fixed independently seeded catalogs; reset seed selects episodes only; no easy curriculum or fallback."
+          },
+          "speed_m_s": 3.0,
+          "split": "test",
+          "style": 2,
+          "task": "city-block-navigation-v1",
+          "triangle_count": 1799347,
+          "waypoint_radius_m": 0.25
+        }
+      },
+      "acceptance": {
+        "policy_success": 0.0,
+        "best_blind_success": 0.0,
+        "absolute_gain": 0.0,
+        "episodes": 128,
+        "meaningful_visual_goal_met": false,
+        "criterion": "visual success >=0.8 and >=0.2 absolute above best blind heuristic on >=128 held-out episodes"
+      },
+      "checkpoint": "runs/city-proprio-320-seed0/best.pt",
+      "last_checkpoint": "runs/city-proprio-320-seed0/last.pt"
+    }
+  },
+  {
+    "run": "runs/city-state-320-seed0",
+    "encoder": "state",
+    "seed": 0,
+    "actual_steps": 2999808,
+    "selected_steps": 2621440,
+    "elapsed_seconds": 814.3522375949979,
+    "width": 320,
+    "height": 240,
+    "task_contract": {
+      "abi_version": 2,
+      "action_count": 9,
+      "actions": [
+        "hover",
+        "forward",
+        "forward_right",
+        "right",
+        "backward_right",
+        "backward",
+        "backward_left",
+        "left",
+        "forward_left"
+      ],
+      "altitude_m": 6.0,
+      "autoreset": "Terminal reward/done/success/collision retained; observation and diagnostics belong to reset episode. Episode counter increments on any terminal. Explicit reset clears counters/outputs.",
+      "bvh_node_count": 524287,
+      "city_fingerprint": "sha256:62e67df07b2bff3c13aed8983e8dd3dbc5393d33c4f98c3895b8f73cb43fb217",
+      "collision_radius_m": 0.3499999940395355,
+      "control_hz": 20,
+      "controls": "Altitude exactly stabilized at6m. Immediate3m/s horizontal velocity; six exact swept120Hz substeps per20Hz action. Level gimballed camera yaws toward final goal each observation; action frame held within the control step. One shared city; agents neither render nor collide with each other.",
+      "diagnostics": [
+        "world_x",
+        "world_y",
+        "world_z",
+        "goal_x",
+        "goal_y",
+        "goal_z",
+        "route_id",
+        "clock_steps"
+      ],
+      "goal_radius_m": 1.0,
+      "horizon": 320,
+      "neutral_action": 0,
+      "physics_hz": 120,
+      "privileged": [
+        "next_waypoint_right_m/32",
+        "next_waypoint_forward_m/32",
+        "remaining_path_m/48",
+        "elapsed_clock_fraction"
+      ],
+      "privileged_convention": "Right positive camera-right; forward positive toward goal-facing camera forward; identical32m scale for waypoint components. Privileged state only for explicit state ceiling, never default visual/proprio actor.",
+      "proprio": [
+        "goal_right_m=0",
+        "goal_up_m",
+        "goal_view_z_m=-distance",
+        "velocity_right_m_s",
+        "velocity_up_m_s",
+        "velocity_forward_m_s",
+        "remaining_clock_fraction",
+        "previous_action_div8"
+      ],
+      "reward": {
+        "collision": -5.0,
+        "potential": "remaining=distance to next waypoint + its suffix polyline distance; reward=.2*(old_remaining-new_remaining)-.01+terminal_bonus; advance nonfinal waypoint within.25m; success actual final-goal distance<=1m; collision takes precedence; horizon320 is terminal with zero extra bonus",
+        "progress_per_m": 0.2,
+        "success": 5.0,
+        "time_per_step": -0.01
+      },
+      "route_counts": {
+        "test": 128,
+        "train": 128,
+        "validation": 128
+      },
+      "route_split_definition": {
+        "actual_length_ranges_m": [
+          [
+            16.246212005615234,
+            37.96961975097656
+          ],
+          [
+            14.511665344238281,
+            37.841644287109375
+          ],
+          [
+            12.246211051940918,
+            37.96862030029297
+          ]
+        ],
+        "catalog_seeds": [
+          7324142150989215761,
+          13317361681456312935,
+          3414073405398897667
+        ],
+        "catalog_version": 1,
+        "district_centers_xz_m": [
+          [
+            -98.0,
+            -98.0
+          ],
+          [
+            98.0,
+            -98.0
+          ],
+          [
+            98.0,
+            98.0
+          ]
+        ],
+        "district_half_size_m": 32.0,
+        "grid_spacing_m": 2.0,
+        "length_range_m": [
+          12.0,
+          38.0
+        ],
+        "minimum_detour_m": 2.0,
+        "minimum_detour_ratio": 1.08,
+        "minimum_direct_distance_m": 8.0,
+        "planning_radius_m": 0.8500000238418579,
+        "route_rule": "All splits require direct swept-sphere line blocked at radius .35m. Starts/goals and every path chord are clear at .85m. Samples must be sky-clear to y=256m. Dijkstra shortest paths on the exact-sweep eight-connected 2m grid, then greedy farthest-visible shortcut. 128 distinct unordered start/goal pairs per split, at most four routes per start. Fixed independently seeded catalogs; reset seed selects episodes only; no easy curriculum or fallback."
+      },
+      "speed_m_s": 3.0,
+      "task": "city-block-navigation-v1",
+      "triangle_count": 1799347,
+      "waypoint_radius_m": 0.25
+    },
+    "success_wilson95": [
+      0.9570737405611394,
+      0.9986195681071257
+    ],
+    "gpu": "NVIDIA GeForce RTX 5070 Ti",
+    "result": {
+      "status": "step_budget_complete_rounded_down",
+      "actual_steps": 2999808,
+      "requested_steps": 3000000,
+      "selected_steps": 2621440,
+      "elapsed_seconds_including_initialization_training_evaluation": 814.3522375949979,
+      "wall_budget_seconds": 3300.0,
+      "within_wall_budget": true,
+      "compile_excluded": true,
+      "convergence_claim": false,
+      "timings": {
+        "initialization_seconds": 3.376325334000285,
+        "collection_seconds": 529.5482654773514,
+        "ppo_seconds": 220.55061918479623,
+        "validation_seconds": 45.16730205601198,
+        "final_evaluation_seconds": 15.175755211996147,
+        "checkpoint_seconds": 0.01667137998447288
+      },
+      "final_test": {
+        "state": {
+          "episodes": 128,
+          "success": 0.9921875,
+          "collision": 0.0078125,
+          "mean_return": 8.406678199768066,
+          "mean_steps": 208.96875,
+          "mean_success_steps": 209.75590551181102,
+          "return_standard_error": 0.12585002237038326,
+          "policy": "checkpoint",
+          "horizon_terminal": 320
+        },
+        "hover": {
+          "episodes": 128,
+          "success": 0.0,
+          "collision": 0.0,
+          "mean_return": -3.1999974250793457,
+          "mean_steps": 320.0,
+          "mean_success_steps": null,
+          "return_standard_error": 8.802585996305485e-05,
+          "policy": "hover",
+          "horizon_terminal": 320
+        },
+        "goal_centering": {
+          "episodes": 128,
+          "success": 0.0,
+          "collision": 1.0,
+          "mean_return": -4.26325798034668,
+          "mean_steps": 56.234375,
+          "mean_success_steps": null,
+          "return_standard_error": 0.05935885859712034,
+          "policy": "goal_centering",
+          "horizon_terminal": 320
+        },
+        "random": {
+          "episodes": 128,
+          "success": 0.0,
+          "collision": 0.1328125,
+          "mean_return": -3.6782262325286865,
+          "mean_steps": 299.4375,
+          "mean_success_steps": null,
+          "return_standard_error": 0.11900087394077473,
+          "policy": "random",
+          "horizon_terminal": 320
+        },
+        "seed": 200003,
+        "style": 2,
+        "cuda_memory": {
+          "stream": 93824999036960,
+          "allocated_bytes": 136500736,
+          "reserved_bytes": 146800640,
+          "global_free_bytes": 7139098624,
+          "global_total_bytes": 16608133120
+        },
+        "native_metadata": {
+          "abi_version": 2,
+          "action_count": 9,
+          "actions": [
+            "hover",
+            "forward",
+            "forward_right",
+            "right",
+            "backward_right",
+            "backward",
+            "backward_left",
+            "left",
+            "forward_left"
+          ],
+          "altitude_m": 6.0,
+          "autoreset": "Terminal reward/done/success/collision retained; observation and diagnostics belong to reset episode. Episode counter increments on any terminal. Explicit reset clears counters/outputs.",
+          "bvh_node_count": 524287,
+          "city_fingerprint": "sha256:62e67df07b2bff3c13aed8983e8dd3dbc5393d33c4f98c3895b8f73cb43fb217",
+          "city_path": "/home/jaren/visualencoder/assets/city",
+          "collision_radius_m": 0.3499999940395355,
+          "control_hz": 20,
+          "controls": "Altitude exactly stabilized at6m. Immediate3m/s horizontal velocity; six exact swept120Hz substeps per20Hz action. Level gimballed camera yaws toward final goal each observation; action frame held within the control step. One shared city; agents neither render nor collide with each other.",
+          "diagnostics": [
+            "world_x",
+            "world_y",
+            "world_z",
+            "goal_x",
+            "goal_y",
+            "goal_z",
+            "route_id",
+            "clock_steps"
+          ],
+          "goal_radius_m": 1.0,
+          "horizon": 320,
+          "neutral_action": 0,
+          "physics_hz": 120,
+          "privileged": [
+            "next_waypoint_right_m/32",
+            "next_waypoint_forward_m/32",
+            "remaining_path_m/48",
+            "elapsed_clock_fraction"
+          ],
+          "privileged_convention": "Right positive camera-right; forward positive toward goal-facing camera forward; identical32m scale for waypoint components. Privileged state only for explicit state ceiling, never default visual/proprio actor.",
+          "proprio": [
+            "goal_right_m=0",
+            "goal_up_m",
+            "goal_view_z_m=-distance",
+            "velocity_right_m_s",
+            "velocity_up_m_s",
+            "velocity_forward_m_s",
+            "remaining_clock_fraction",
+            "previous_action_div8"
+          ],
+          "reward": {
+            "collision": -5.0,
+            "potential": "remaining=distance to next waypoint + its suffix polyline distance; reward=.2*(old_remaining-new_remaining)-.01+terminal_bonus; advance nonfinal waypoint within.25m; success actual final-goal distance<=1m; collision takes precedence; horizon320 is terminal with zero extra bonus",
+            "progress_per_m": 0.2,
+            "success": 5.0,
+            "time_per_step": -0.01
+          },
+          "route_counts": {
+            "test": 128,
+            "train": 128,
+            "validation": 128
+          },
+          "route_split_definition": {
+            "actual_length_ranges_m": [
+              [
+                16.246212005615234,
+                37.96961975097656
+              ],
+              [
+                14.511665344238281,
+                37.841644287109375
+              ],
+              [
+                12.246211051940918,
+                37.96862030029297
+              ]
+            ],
+            "catalog_seeds": [
+              7324142150989215761,
+              13317361681456312935,
+              3414073405398897667
+            ],
+            "catalog_version": 1,
+            "district_centers_xz_m": [
+              [
+                -98.0,
+                -98.0
+              ],
+              [
+                98.0,
+                -98.0
+              ],
+              [
+                98.0,
+                98.0
+              ]
+            ],
+            "district_half_size_m": 32.0,
+            "grid_spacing_m": 2.0,
+            "length_range_m": [
+              12.0,
+              38.0
+            ],
+            "minimum_detour_m": 2.0,
+            "minimum_detour_ratio": 1.08,
+            "minimum_direct_distance_m": 8.0,
+            "planning_radius_m": 0.8500000238418579,
+            "route_rule": "All splits require direct swept-sphere line blocked at radius .35m. Starts/goals and every path chord are clear at .85m. Samples must be sky-clear to y=256m. Dijkstra shortest paths on the exact-sweep eight-connected 2m grid, then greedy farthest-visible shortcut. 128 distinct unordered start/goal pairs per split, at most four routes per start. Fixed independently seeded catalogs; reset seed selects episodes only; no easy curriculum or fallback."
+          },
+          "speed_m_s": 3.0,
+          "split": "test",
+          "style": 2,
+          "task": "city-block-navigation-v1",
+          "triangle_count": 1799347,
+          "waypoint_radius_m": 0.25
+        }
+      },
+      "acceptance": {
+        "policy_success": 0.9921875,
+        "best_blind_success": 0.0,
+        "absolute_gain": 0.9921875,
+        "episodes": 128,
+        "meaningful_visual_goal_met": false,
+        "criterion": "visual success >=0.8 and >=0.2 absolute above best blind heuristic on >=128 held-out episodes"
+      },
+      "checkpoint": "runs/city-state-320-seed0/best.pt",
+      "last_checkpoint": "runs/city-state-320-seed0/last.pt"
+    }
+  }
+]

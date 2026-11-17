@@ -1,6 +1,7 @@
 {
   "hardware": "NVIDIA GeForce RTX 5070 Ti, driver 595.112.07",
   "toolchain": "Rust 1.99.1, NVIDIA cuda-rust 348895e421a92d13a2c3a843ccb20ed1fb8b7f8b, CUDA 13.2.51",
+  "historical_scope": "Original top-level measurements below describe the earlier gap task. Current city task measurements are under city_navigation; historical results are not relabelled as city results.",
   "cpu_tests": {"state_and_interop_passed": 7, "task_geometry_and_rng_passed": 2, "terminal_gae_passed": 3, "trace_verifier_passed": 5},
   "gpu_exchange_tests": {"passed": 2, "repeated_bidirectional_handoffs": 128},
   "render_cuda_smoke": {
@@ -111,5 +112,95 @@
       }
     ],
     "note": "All use the Vulkan-validation-clean native build. Simple lateral-gap task with stabilized altitude/forward speed; near-ceiling results do not establish a consistency advantage."
+  },
+  "city_navigation": {
+    "source_commit": "42c39c2",
+    "task": "city-block-navigation-v1",
+    "native_abi": 2,
+    "scene_fingerprint": "sha256:62e67df07b2bff3c13aed8983e8dd3dbc5393d33c4f98c3895b8f73cb43fb217",
+    "render_and_collision_triangles": 1799347,
+    "bvh_nodes": 524287,
+    "render_chunk_metres": 16,
+    "shared_geometry_per_environment_batch": true,
+    "control": "Kinematic fixed-altitude 6m navigation, hover or eight 3m/s goal-frame headings, automatic goal-facing camera; six 120Hz swept collision substeps per 20Hz action. Not rotor flight.",
+    "route_protocol": "128 blocked-direct-line, collision-free-waypoint routes in each of three spatially disjoint 64m districts. Finite 320-control-step horizon.",
+    "cpu_checks": {"state_and_collision_passed": 7, "bvh_passed": 1, "terminal_gae_and_sequence_passed": 3, "actual_city_render_collision_geometry_agreement": "passed; generated-asset smoke is explicitly opt-in"},
+    "city_gpu_smoke": {
+      "episodes": 8,
+      "blind_forward_collisions": 8,
+      "hover_position_max_error_metres": 0,
+      "vulkan_validation_errors": 0,
+      "camera_image": "runs/city-smoke/city-cameras.png",
+      "measurements": "runs/city-smoke/smoke.json"
+    },
+    "privileged_route_oracle": {
+      "episodes_per_split": 128,
+      "successes": {"train": 128, "validation": 128, "test": 128},
+      "collisions": 0,
+      "controller": "World-frame error-diffused quantization of waypoint velocity into nine commands",
+      "learned_or_visual_evidence": false,
+      "measurements": "runs/city-oracle-quantized/oracle-diagnostic.json"
+    },
+    "city_benchmark": {
+      "resolution": [320, 240],
+      "encoder": "run:runs/mean",
+      "batches": [
+        {"environments": 16, "native_images_per_second": 8754.900606389347, "encoder_images_per_second": 1626.4709571838398, "full_ppo_transitions_per_second": 1200.7504866426013},
+        {"environments": 32, "native_images_per_second": 9616.267178476033, "encoder_images_per_second": 1539.3899644809824, "full_ppo_transitions_per_second": 1201.4151976445705},
+        {"environments": 64, "native_images_per_second": 11734.564876066474, "encoder_images_per_second": 1367.138749424613, "full_ppo_transitions_per_second": 1080.4959711809834}
+      ],
+      "native_scope": "Kinematic control, exact collision, Vulkan culling/rasterization, sensor packing and CUDA conversion; not isolated draw time",
+      "concurrent_workloads_controlled": false,
+      "measurements": "runs/city-benchmark-final/benchmark.json"
+    },
+    "zero_host_staging": {
+      "collection": {"cuda_runtime_calls": 41300, "linked_gpu_activities": 34834, "host_transfers_or_waits": 0},
+      "ppo_update": {"cuda_runtime_calls": 4062, "linked_gpu_activities": 9086, "host_transfers_or_waits": 0},
+      "note": "Initialization, end-batch metrics and image/checkpoint export are excluded. GPU packing, conversion and rollout feature copies still occur.",
+      "measurements": "runs/city-profile-final/verification.json"
+    },
+    "learned_visual_rl": {
+      "summary": "runs/city-mean-320-seed0/summary.json",
+      "encoder": "run:runs/mean",
+      "actual_steps": 2999808,
+      "selected_steps": 1572864,
+      "elapsed_seconds_including_initialization_training_evaluation": 3002.7694592110056,
+      "held_out_episodes": 128,
+      "successes": 84,
+      "collisions": 24,
+      "blind_heuristic_successes": 0,
+      "within_one_hour": true,
+      "success_target": 0.8,
+      "success_target_met": false,
+      "convergence_claim": false
+    },
+    "matched_learned_controls": {
+      "actual_steps_per_policy": 2999808,
+      "held_out_episodes_per_policy": 128,
+      "proprioception_only": {
+        "summary": "runs/city-proprio-320-seed0/summary.json",
+        "selected_steps": 262144,
+        "elapsed_seconds": 800.2036799579946,
+        "successes": 0,
+        "collisions": 0
+      },
+      "privileged_waypoint_state": {
+        "summary": "runs/city-state-320-seed0/summary.json",
+        "selected_steps": 2621440,
+        "elapsed_seconds": 814.3522375949979,
+        "successes": 127,
+        "collisions": 1,
+        "visual_policy": false
+      },
+      "note": "Matched PPO settings, transition budget, one training seed and first-episode test protocol; vision encoder remains frozen in the visual arm."
+    },
+    "visual_inspection_rollout": {
+      "metadata": "reports/experiments/city-navigation-rollout/rollout.json",
+      "animation": "reports/experiments/city-navigation-rollout/rollout.gif",
+      "steps": 234,
+      "success": true,
+      "collision": false,
+      "note": "Fixed first final-test episode, not a replacement for the aggregate estimate."
+    }
   }
 }
