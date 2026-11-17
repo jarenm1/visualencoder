@@ -1,4 +1,4 @@
-//! CUDA kernels for city-drone-goal-v2 (ABI v5).
+//! CUDA kernels for city-drone-goal-v3 (ABI v6).
 //!
 //! Each env thread owns one environment `i`. It writes only drone body `i`, camera
 //! matrices `i`, and row `i` of every per-env field. The appearance kernel owns one
@@ -28,8 +28,6 @@ pub(crate) struct Config {
     /// of bounds, success is reported once without ending the episode, and there is no timeout.
     pub free_flight: u32,
     pub city_half_extent: f32,
-    /// Optional bounded training reward; coverage itself is measured in both modes.
-    pub exploration_enabled: u32,
     pub tan_half_vfov: f32,
     /// Fixed 4:3 visibility/projection aspect.
     pub aspect: f32,
@@ -51,8 +49,6 @@ pub(crate) struct EnvState {
     pub target_half: [f32; 4],
     /// Clamped action applied on the last step.
     pub action: [f32; 4],
-    /// Clamped action applied on the step before.
-    pub prev_action: [f32; 4],
     /// Per-episode GPS offset: noisy target = target + gps_offset.
     pub gps_offset: [f32; 4],
     /// Yaw-only setpoint quaternion (xyzw, rotation about world +y), velocity mode only.
@@ -77,9 +73,7 @@ pub(crate) struct EnvState {
     pub event: u32,
     /// Per-episode GPS availability, sampled at reset (0 or 1).
     pub gps_available: u32,
-    pub exploration_seeded: u32,
-    pub exploration_unique: u32,
-    pub exploration_paid: u32,
+    pub observed_tiles: u32,
 }
 
 #[repr(C)]
@@ -112,9 +106,9 @@ pub(crate) struct Buffers {
     /// Appearance key per camera slot: the catalog index whose appearance it renders.
     pub keys: *mut u32,
     /// Per-env 128x128 observed surface-tile ledger, 512 words; never policy input.
-    pub exploration_seen: *mut u32,
-    /// [current unique tiles, cumulative bonus, last bonus, terminal unique tiles].
-    pub exploration: *mut f32,
+    pub coverage_seen: *mut u32,
+    /// [current unique tiles, terminal unique tiles, terminal consecutive hold steps].
+    pub episode_diagnostics: *mut f32,
 }
 
 /// Arguments of the per-pixel appearance kernel.
@@ -160,21 +154,8 @@ pub(crate) mod device {
         THRUST_TAU, VELOCITY_GAIN, VELOCITY_MAX_HORIZONTAL, VELOCITY_MAX_VERTICAL, YAW_RATE_MAX,
         box_anchor, box_distance, camera_basis, segment_box_entry,
     };
+    use sim_state::drone::{goal_reward, hold_outcome};
 
-    /// Per-step reward terms of the standoff task.
-    const TIME_COST: f32 = 0.01;
-    const SMOOTHNESS_COST: f32 = 0.02;
-    const RATE_COST: f32 = 0.005;
-    /// Yaw spinning is the dominant failure of the v4 policy; it costs 0.02 per step at full rate.
-    const YAW_COST: f32 = 0.02;
-    /// Per-step standoff bonus while within STANDOFF_MAX and facing the target, scaled from 1 at
-    /// rest to 0 at BRAKE_SPEED: a gradient toward stopping before the first full hold succeeds
-    /// (an all-or-nothing hold bonus left v5 policies circling targets at ~2.6 m/s).
-    const HOLD_REWARD: f32 = 0.1;
-    const BRAKE_SPEED: f32 = 3.0;
-    const SUCCESS_REWARD: f32 = 10.0;
-    const CRASH_PENALTY: f32 = 10.0;
-    const OOB_PENALTY: f32 = 5.0;
     /// Free-flight ceiling above the landable plane (metres): above the tallest towers.
     const FREE_CEILING: f32 = 100.0;
     /// The occlusion test stops this far before the target box (metres).
@@ -432,7 +413,6 @@ pub(crate) mod device {
             target: pack(target),
             target_half: pack(half),
             action: [0.0; 4],
-            prev_action: [0.0; 4],
             gps_offset: pack(gps),
             yaw_setpoint: heading_quat(rot),
             initial_distance: spec.stats[1],
@@ -449,9 +429,7 @@ pub(crate) mod device {
             hold: 0,
             event: 0,
             gps_available: gps_available as u32,
-            exploration_seeded: 0,
-            exploration_unique: 0,
-            exploration_paid: 0,
+            observed_tiles: 0,
         };
         let body = BodyState {
             position: pack(position),
@@ -462,7 +440,7 @@ pub(crate) mod device {
         unsafe {
             let mut word = 0usize;
             while word < 512 {
-                *buffers.exploration_seen.add(i * 512 + word) = 0;
+                *buffers.coverage_seen.add(i * 512 + word) = 0;
                 word += 1;
             }
             *buffers.bodies.add(i) = body;
@@ -737,7 +715,6 @@ pub(crate) mod device {
             };
             k += 1;
         }
-        st.prev_action = st.action;
         st.action = a;
 
         // Rates mode: body-rate and thrust commands are fixed for the whole control step.
@@ -837,16 +814,14 @@ pub(crate) mod device {
         }
     }
 
-    // Reward, termination flags, and autoreset for env `i` after a control step. Success is a
-    // held standoff: within STANDOFF_MAX of the target box, slower than HOLD_SPEED and facing
-    // it for HOLD_STEPS consecutive steps. Progress is rewarded only down to STANDOFF_NEAR.
+    // The policy must approach, brake and retain its goal through the fixed episode horizon.
+    // No action override or early-success reset: success requires the final three-second hold.
     #[inline(always)]
     unsafe fn finish_env(buffers: Buffers, config: Config, i: usize) {
         let mut st = unsafe { *buffers.states.add(i) };
         let body = unsafe { *buffers.bodies.add(i) };
         let p = xyz(body.position);
         let v = xyz(body.velocity);
-        let w_b = rotate_inverse(body.rotation, xyz(body.angular_velocity));
         let center = xyz(st.target);
         let half = xyz(st.target_half);
         let d = box_distance(p, center, half);
@@ -858,43 +833,22 @@ pub(crate) mod device {
         let (_, _, facing) = unsafe { anchor_view(buffers, config, add(p, eye_off), cam_forward, cam_up, center, half) };
         let near = !crash && !oob && d <= STANDOFF_MAX && facing;
         let holding = near && speed <= HOLD_SPEED;
-        st.hold = if holding { st.hold + 1 } else { 0 };
         let free = config.free_flight != 0;
-        // Free flight reports success on the step the hold completes and keeps flying.
-        let success = if free { st.hold == HOLD_STEPS } else { st.hold >= HOLD_STEPS };
-        let done = crash || oob || (!free && (success || st.step >= HORIZON));
+        let outcome = hold_outcome(st.hold, st.step, holding, crash, oob, free);
+        st.hold = outcome.hold;
+        let success = outcome.success;
+        let done = outcome.done;
         if free && st.step >= HORIZON {
             // No timeout in free flight; the observed clock wraps within its trained range.
             st.step = 0;
         }
 
-        let mut da2 = 0.0f32;
-        let mut k = 0usize;
-        while k < 4 {
-            let diff = st.action[k] - st.prev_action[k];
-            da2 += diff * diff;
-            k += 1;
-        }
-        let rate_sq = dot(w_b, w_b);
-        let yaw = w_b[1] / YAW_RATE_MAX;
         let effective = maxf(d, STANDOFF_NEAR);
-        let mut reward = (st.previous_distance - effective) - TIME_COST - SMOOTHNESS_COST * da2 / 4.0
-            - RATE_COST * rate_sq / (MAX_RATES[0] * MAX_RATES[0]) - YAW_COST * yaw * yaw;
-        if near {
-            reward += HOLD_REWARD * clampf(1.0 - speed / BRAKE_SPEED, 0.0, 1.0);
-        }
-        if success {
-            reward += SUCCESS_REWARD;
-        }
-        if crash {
-            reward -= CRASH_PENALTY;
-        }
-        if oob {
-            reward -= OOB_PENALTY;
-        }
+        let reward = goal_reward(st.previous_distance - effective, speed, near, success, done && !success);
 
         unsafe {
-            *buffers.exploration.add(i * 4 + 3) = if done { st.exploration_unique as f32 } else { -1.0 };
+            *buffers.episode_diagnostics.add(i * 3 + 1) = if done { st.observed_tiles as f32 } else { -1.0 };
+            *buffers.episode_diagnostics.add(i * 3 + 2) = if done { st.hold as f32 } else { -1.0 };
             *buffers.rewards.add(i) = reward;
             *buffers.done.add(i) = if done { 1.0 } else { 0.0 };
             *buffers.success.add(i) = if success { 1.0 } else { 0.0 };
@@ -1040,24 +994,23 @@ pub(crate) mod device {
         st.hold = 0;
         // A new target is a new task from here: the episode clock restarts.
         st.step = 0;
-        st.exploration_seeded = 0;
-        st.exploration_unique = 0;
-        st.exploration_paid = 0;
+        st.observed_tiles = 0;
         let mut word = 0usize;
         while word < 512 {
-            unsafe { *buffers.exploration_seen.add(i * 512 + word) = 0; }
+            unsafe { *buffers.coverage_seen.add(i * 512 + word) = 0; }
             word += 1;
         }
-        unsafe { *buffers.exploration.add(i * 4 + 3) = -1.0; }
+        unsafe {
+            *buffers.episode_diagnostics.add(i * 3 + 1) = -1.0;
+            *buffers.episode_diagnostics.add(i * 3 + 2) = -1.0;
+        }
         unsafe {
             *buffers.states.add(i) = st;
             observe_env(buffers, config, i);
         }
     }
 
-    /// Read actual observation depth only after its render. One thread owns a whole ledger,
-    /// so revisits need neither atomics nor an approximate hash. Initial/reset views seed
-    /// without payment; reference-image renders never call this kernel.
+    /// Actual-camera surface coverage, measured only for diagnosis. Never used in reward.
     #[kernel]
     pub unsafe fn coverage(buffers: Buffers, config: Config, args: ImageArgs) {
         let i = thread::index_1d().get();
@@ -1088,7 +1041,7 @@ pub(crate) mod device {
                     let tz = ((hit[2] + h) * (128.0 / (2.0 * h))) as u32;
                     if tx < 128 && tz < 128 {
                         let tile = tz * 128 + tx;
-                        let address = unsafe { buffers.exploration_seen.add(i * 512 + (tile / 32) as usize) };
+                        let address = unsafe { buffers.coverage_seen.add(i * 512 + (tile / 32) as usize) };
                         let old = unsafe { *address };
                         let bit = 1u32 << (tile % 32);
                         if old & bit == 0 {
@@ -1100,21 +1053,9 @@ pub(crate) mod device {
             }
             sample += 1;
         }
-        st.exploration_unique += newly_seen;
-        let terminal = unsafe { *buffers.done.add(i) > 0.5 || *buffers.success.add(i) > 0.5 };
-        let mut paid = 0u32;
-        if st.exploration_seeded != 0 && config.exploration_enabled != 0 && !terminal {
-            let remaining = 40 - st.exploration_paid;
-            paid = if newly_seen < remaining { newly_seen } else { remaining };
-        }
-        st.exploration_seeded = 1;
-        st.exploration_paid += paid;
-        let bonus = paid as f32 * 0.05;
+        st.observed_tiles += newly_seen;
         unsafe {
-            *buffers.exploration.add(i * 4) = st.exploration_unique as f32;
-            *buffers.exploration.add(i * 4 + 1) = st.exploration_paid as f32 * 0.05;
-            *buffers.exploration.add(i * 4 + 2) = bonus;
-            *buffers.rewards.add(i) += bonus;
+            *buffers.episode_diagnostics.add(i * 3) = st.observed_tiles as f32;
             *buffers.states.add(i) = st;
         }
     }
@@ -1134,10 +1075,9 @@ pub(crate) mod device {
             *buffers.oob.add(i) = 0.0;
             *buffers.bucket.add(i) = -1.0;
             *buffers.gps_available.add(i) = -1.0;
-            *buffers.exploration.add(i * 4) = 0.0;
-            *buffers.exploration.add(i * 4 + 1) = 0.0;
-            *buffers.exploration.add(i * 4 + 2) = 0.0;
-            *buffers.exploration.add(i * 4 + 3) = -1.0;
+            *buffers.episode_diagnostics.add(i * 3) = 0.0;
+            *buffers.episode_diagnostics.add(i * 3 + 1) = -1.0;
+            *buffers.episode_diagnostics.add(i * 3 + 2) = -1.0;
             observe_env(buffers, config, i);
         }
     }

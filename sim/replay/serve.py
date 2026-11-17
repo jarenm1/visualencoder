@@ -309,7 +309,7 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="bind address (default: localhost only)")
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--live", action="store_true", help="enable typed instructions (Gemma 4 + policy recording)")
-    parser.add_argument("--checkpoint", type=Path, default=REPO / "runs/drone5-mean-seed0/best.pt")
+    parser.add_argument("--checkpoint", type=Path, default=REPO / "runs/drone8-mean-hold-seed0/best.pt")
     parser.add_argument("--live-out", type=Path, default=REPO / "runs/replay-live")
     parser.add_argument("--model", default="google/gemma-4-E4B-it")
     parser.add_argument("--live-envs", type=int, default=32, help="environments recorded per instruction")

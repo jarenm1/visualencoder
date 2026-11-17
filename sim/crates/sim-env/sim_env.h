@@ -1,4 +1,4 @@
-/* city-drone-goal-v2, C ABI v5.
+/* city-drone-goal-v3, C ABI v6.
  *
  * All tensor storage is CUDA device memory on the stream returned by
  * sim_env_stream(). Buffers are valid until sim_env_destroy(). Calls must be
@@ -14,7 +14,7 @@
 extern "C" {
 #endif
 
-#define SIM_ENV_ABI_VERSION 5
+#define SIM_ENV_ABI_VERSION 6
 
 /* Field identifiers for sim_env_buffer(). */
 enum sim_env_field {
@@ -52,9 +52,8 @@ enum sim_env_field {
     SIM_ENV_FIELD_GPS_AVAILABLE = 14,
     /* float32 [n, 4]: normalized goal crops [x0, y0, x1, y1] written by sim_env_render_goals(). */
     SIM_ENV_FIELD_GOAL_CROPS = 15,
-    /* float32 [n, 4]: unique observed tiles, cumulative novelty bonus,
-     * last-step novelty bonus, ended-episode unique observed tiles. Not actor input. */
-    SIM_ENV_FIELD_EXPLORATION = 16,
+    /* float32 [n, 3]: current/terminal unique tiles, terminal consecutive hold steps; diagnostic only. */
+    SIM_ENV_FIELD_EPISODE_DIAGNOSTICS = 16,
     SIM_ENV_FIELD_COUNT = 17
 };
 
@@ -101,10 +100,6 @@ int sim_env_retarget(void *env, const float *targets);
  * timeout. Takes effect on the next step. */
 int sim_env_set_free_flight(void *env, uint32_t enabled);
 
-/* Training-only optional novelty reward: +0.05 per new observed world tile after the initial
- * view, at most +2 per episode. Disabled by default; coverage metrics are measured regardless.
- * Existing base task metadata is unchanged; callers must record augmentation in run provenance. */
-int sim_env_set_exploration(void *env, uint32_t enabled);
 
 /* Device pointer to field storage (see enum), or 0 on error. */
 uint64_t sim_env_buffer(void *env, int32_t field);

@@ -1,9 +1,9 @@
-//! Constants and counter-based hashing for city-drone-goal-v2 (ABI v5).
+//! Constants and counter-based hashing for city-drone-goal-v3 (ABI v6).
 //!
 //! Plain integer and constant definitions shared by the host and the CUDA kernels.
 
-pub const TASK_NAME: &str = "city-drone-goal-v2";
-pub const ABI_VERSION: u32 = 5;
+pub const TASK_NAME: &str = "city-drone-goal-v3";
+pub const ABI_VERSION: u32 = 6;
 pub const ACTION_DIM: usize = 4;
 pub const SENSOR_DIM: usize = 19;
 pub const PRIVILEGED_DIM: usize = 29;

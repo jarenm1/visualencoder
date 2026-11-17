@@ -1,4 +1,4 @@
-//! GPU-resident city drone visual-goal environment (city-drone-goal-v2, ABI v5).
+//! GPU-resident city drone visual-goal environment (city-drone-goal-v3, ABI v6).
 //! See `sim_env.h` for the ABI. Build with cargo oxide and device-codegen-crate sim_physics,sim_env.
 //!
 //! Targets are placed objects of the imported city (buildings, vehicles, vegetation, props);
@@ -112,7 +112,7 @@ pub struct Env {
     exclusions: DeviceBuffer<u8>,
     materials: DeviceBuffer<u8>,
     keys: DeviceBuffer<u8>,
-    exploration_seen: DeviceBuffer<u8>,
+    coverage_seen: DeviceBuffer<u8>,
     outputs: [DeviceBuffer<u8>; FIELD_COUNT],
     config: Config,
     width: u32,
@@ -201,7 +201,7 @@ impl Env {
         let rgb_bytes = count * 3 * height as usize * width as usize * 4;
         let states = allocate(count * size_of::<EnvState>())?;
         let keys = allocate(count * 4)?;
-        let exploration_seen = allocate(count * 512 * 4)?;
+        let coverage_seen = allocate(count * 512 * 4)?;
         let outputs: [DeviceBuffer<u8>; FIELD_COUNT] = [
             allocate(rgb_bytes)?,
             allocate(count * SENSOR_DIM * 4)?,
@@ -219,7 +219,7 @@ impl Env {
             allocate(count * 4)?,
             allocate(count * 4)?,
             allocate(count * 4 * 4)?,
-            allocate(count * 4 * 4)?,
+            allocate(count * 3 * 4)?,
         ];
 
         let exchange = Exchange::new(gpu.clone(), vec![state.clone(), cameras.clone(), rendered.clone()])?;
@@ -239,7 +239,6 @@ impl Env {
             landable_height: city.landable.height,
             free_flight: 0,
             city_half_extent: city.half_extent,
-            exploration_enabled: 0,
             tan_half_vfov: (dynamics::CAMERA_VFOV_RAD * 0.5).tan(),
             aspect: CAMERA_ASPECT,
             projection_x: projection[0],
@@ -263,7 +262,7 @@ impl Env {
             exclusions,
             materials,
             keys,
-            exploration_seen,
+            coverage_seen,
             outputs,
             config,
             width,
@@ -303,8 +302,8 @@ impl Env {
             gps_available: self.outputs[14].cu_deviceptr() as *mut f32,
             crops: self.outputs[15].cu_deviceptr() as *mut f32,
             keys: self.keys.cu_deviceptr() as *mut u32,
-            exploration_seen: self.exploration_seen.cu_deviceptr() as *mut u32,
-            exploration: self.outputs[16].cu_deviceptr() as *mut f32,
+            coverage_seen: self.coverage_seen.cu_deviceptr() as *mut u32,
+            episode_diagnostics: self.outputs[16].cu_deviceptr() as *mut f32,
         }
     }
 
@@ -382,11 +381,6 @@ impl Env {
         self.config.free_flight = enabled as u32;
     }
 
-    /// Optional training-only reward augmentation. Base task observations/actions stay unchanged.
-    /// Checkpoints record this flag separately from the base task contract.
-    pub fn set_exploration(&mut self, enabled: bool) {
-        self.config.exploration_enabled = enabled as u32;
-    }
 
     /// Renders every camera slot, then applies the randomized appearance into `field`
     /// (0: observation, 10: goal views).
@@ -503,14 +497,15 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, district: &drone::D
         },
         "success": {
             "standoff_max_m": dynamics::STANDOFF_MAX, "hold_speed_mps": dynamics::HOLD_SPEED,
-            "hold_steps": dynamics::HOLD_STEPS,
+            "hold_steps": dynamics::HOLD_STEPS, "arrival_steps": dynamics::ARRIVAL_STEPS,
+            "timing": "training succeeds only at horizon after the final three-second uninterrupted hold; no early success termination",
             "facing": "anchor (target-box point nearest the camera ray) inside the frustum, sight line clear to 2 cm before the box",
         },
         "landing": {"max_speed_mps": dynamics::LANDING_SPEED, "max_tilt_rad": dynamics::LANDING_TILT_RAD},
         "ceiling_m": dynamics::CEILING,
         "reward": {
-            "terms": "(max(d_prev, 3) - max(d_box, 3)) - 0.01 - 0.02*|a - a_prev|^2/4 - 0.005*|w_b|^2/3.5^2 - 0.02*(w_yaw/1.5)^2 + 0.1*near*clamp(1 - speed/3, 0, 1) + 10*success - 10*crash - 5*oob; near = within 6 m of the box and facing it",
-            "done": "crash || oob || success || step >= horizon; no bootstrap",
+            "terms": "(max(d_prev, 3) - max(d_box, 3)) - 0.01 + 0.1*near*clamp(1 - speed/3, 0, 1) + 10*terminal_success - 10*terminal_failure; near = within 6 m of the box and facing it",
+            "done": "crash || oob || step >= horizon; no bootstrap; success requires hold_steps at horizon",
         },
         "sensors": {
             "dim": SENSOR_DIM,
@@ -577,9 +572,9 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, district: &drone::D
             {"index": 13, "name": "oob", "dtype": "float32", "shape": ["n"]},
             {"index": 14, "name": "gps_available", "dtype": "float32", "shape": ["n"]},
             {"index": 15, "name": "goal_crops", "dtype": "float32", "shape": ["n", 4]},
-            {"index": 16, "name": "exploration", "dtype": "float32", "shape": ["n", 4],
-             "layout": ["current unique observed tiles", "current cumulative novelty reward",
-                        "last-step novelty reward", "ended episode unique observed tiles"]},
+            {"index": 16, "name": "episode_diagnostics", "dtype": "float32", "shape": ["n", 3],
+             "layout": ["current unique observed tiles", "ended episode unique observed tiles",
+                        "ended episode consecutive hold steps"]},
         ],
     });
     // Flat keys consumed by learner/replay checks (inserted after the macro to

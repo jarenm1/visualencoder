@@ -1,6 +1,6 @@
 # GPU-resident quadrotor visual-goal learning
 
-Task `city-drone-goal-v2`, ABI v5. A quadrotor in the imported city must fly to an object shown only as a goal image — a crop of some camera view of that object — and hold a standoff in front of it. Targets are the city's own buildings, vehicles, trees and props. The native CUDA environment owns dynamics, sensors, rendering, appearance randomization and reward; Python owns the learner, evaluation and reporting.
+Task `city-drone-goal-v3`, ABI v6. A quadrotor in the imported city must fly to an object shown only as a goal crop and maintain a standoff. Targets are the city's own buildings, vehicles, trees and props. Native CUDA owns dynamics, sensors, rendering, appearance randomization and reward; Python owns learning and evaluation. Flight commands come from the policy, not scripted search or stopping.
 
 Use the root Python environment (`nix develop` from the repository root installs it) and the simulator's CUDA/Vulkan shell when launching native learning.
 
@@ -21,12 +21,13 @@ nix develop path:sim --command .venv/bin/python sim/python/train.py benchmark \
 
 nix develop path:sim --command .venv/bin/python sim/python/train.py train \
   --encoder mean --num-envs 128 --eval-envs 256 \
-  --total-steps 6000000 --validation-every 1000000 --wall-seconds 3300 \
-  --out runs/drone4-mean-seed0
+  --encoder-precision fp16 --goal-refresh-steps 30 \
+  --total-steps 2000000 --validation-every 500000 --wall-seconds 0 \
+  --out runs/drone8-mean-hold-seed0
 
 nix develop path:sim --command .venv/bin/python sim/python/train.py eval \
-  --checkpoint runs/drone-mean/best.pt --split test \
-  --library .sim-target/training/libsim_env.so --out runs/drone-mean-test
+  --checkpoint runs/drone8-mean-hold-seed0/best.pt --split test \
+  --library .sim-target/training/libsim_env.so --out runs/drone8-mean-hold-test
 
 nix develop path:sim --command .venv/bin/python sim/python/train.py probe --out runs/drone-probe
 
@@ -51,8 +52,9 @@ Unit tests need no simulator: `cd sim/python && python -m unittest`.
 - GPS: proprioception lanes 14–16 hold the GPS hint to the target box centre (right, up, −forward) in metres / 32, with a per-episode 3–15 m error; lane 18 is `gps_available`. With GPS denied the hint is zero. `--no-gps-fraction` sets the probability that an episode denies GPS; evaluation reports GPS available and GPS denied separately.
 - Curriculum buckets are `visible`, `partial` and `hidden`. Start weights are (0.8, 0.15, 0.05) with floors (0.10, 0.10, 0.05). Adaptive promotion and demotion use per-bucket EMA success. Evaluation always uses uniform weights. The curriculum tensor is `[w_visible, w_partial, w_hidden, p_no_gps, appearance]`.
 - Targets: placed objects of `assets/city/layout.json` of class building, vehicle, vegetation or prop whose box lies inside the split's district; vegetation and props must stand ≥2 m (box gap) from any object of their class so a crop identifies one object. Episodes draw the class uniformly, then the object.
-- Success (standoff): within 6 m of the target's bounding box, slower than 1 m/s and facing it — the box point nearest the camera ray (the anchor) inside the frustum and unoccluded — for 15 consecutive steps (0.5 s). Reward: progress in box distance (no reward below 3 m), −0.01 per step, action smoothness, body-rate and yaw-rate costs (−0.02 per step at full yaw rate), a standoff bonus while within 6 m and facing of 0.1 × (1 − speed/3 m/s) per step, +10 success, −10 crash, −5 out-of-bounds. (With an all-or-nothing hold bonus the policy found targets but circled them at ~2.6 m/s and never braked.)
-- Episodes end on success, collision, out-of-bounds, or the native horizon (`horizon`, 450 steps). Outcomes are exclusive, with priority success > collision > out-of-bounds > timeout.
+- Success: within 6 m of the target box, speed ≤1 m/s, facing its unoccluded anchor, for the **final 90 consecutive steps (3 s)** of the 450-step (15 s) episode. Earlier arrival does not terminate training. A 15-step (0.5 s) hold is recorded separately as arrival, not success.
+- Reward: progress in box distance, capped below 3 m; −0.01 per step; near-and-facing braking credit `0.1 × clamp(1 − speed/3, 0, 1)`; +10 terminal success or −10 any failure, including timeout. No novelty, action-smoothness, body-rate or yaw-rate reward terms.
+- Episodes end on collision, out-of-bounds, or horizon, never early arrival. Outcomes are exclusive: success > collision > out-of-bounds > timeout. Interactive free flight remains continuous and reports a success pulse after a 3 s hold; no controller forces that hold.
 - Catalog: 65,536 episodes per split (each bucket ≥512); starts 8–30 m from the target box. Each episode fixes a goal reference camera: the (levelled) start view in half of the visible-start episodes — the operator taps the object in the first frame — otherwise a level camera 5–25 m from the box at 1.5–12 m height (drone-like; bird's-eye references made unrecognizable goals) that sees at least half of it. The goal crop is the box's projection grown 15% per side and squared; the object must span ≥8% of the frame and the crop ≤80%, otherwise the view is rejected, so every goal shows one recognizable object. Splits use styles `TRAIN=0`, `VALIDATION=1`, `TEST=2` (disjoint districts), with validation seed 10001 and test seed 20002.
 - Appearance: a post-render CUDA kernel randomizes, per catalog entry, material hue/saturation/value, sky gradient, depth fog, exposure, white balance, contrast, gamma and sensor noise (`--appearance` strength, default 1; 0 is the plain render). An episode and its goal view share one appearance. Sun direction and shadows are fixed.
 
@@ -64,11 +66,11 @@ Optional `--goal-refresh-steps 30`: once per second, crop the current camera vie
 
 Training and validation with refresh use **oracle simulator boxes**, not Gemma. The interval and box source are recorded in checkpoints and evaluation results; catalog replay uses the recorded interval (its thumbnail is the initial goal). Grounded/operator replays keep their supplied goal fixed. Final test reports both refreshed-box and fixed-initial-goal performance; neither measures autonomous language search. Live deployment needs perception-produced boxes for refresh.
 
-Full step-budget run: `nix develop path:sim --command .venv/bin/python sim/python/train.py train --encoder mean --encoder-precision fp16 --num-envs 128 --eval-envs 256 --goal-refresh-steps 30 --total-steps 6000000 --wall-seconds 0 --validation-every 1000000 --out runs/drone6-mean-refresh-seed0`. `--wall-seconds 0` removes the wall cutoff; the step budget is rounded up to complete PPO rollouts. Validation results are saved as each million-step check completes, not only at the end.
+Fresh 2M-step hold trial: `nix develop path:sim --command .venv/bin/python sim/python/train.py train --encoder mean --encoder-precision fp16 --num-envs 128 --eval-envs 256 --goal-refresh-steps 30 --total-steps 2000000 --wall-seconds 0 --validation-every 500000 --out runs/drone8-mean-hold-seed0`. The step budget rounds up to complete PPO rollouts. Validation is persisted after each check. Controls, PPO hyperparameters, 8–30 m training starts and curriculum are unchanged.
 
-Optional `--exploration`: add exactly one training-only intrinsic reward, +0.05 per newly observed surface tile after the first view, capped at +2 per episode (goal success remains +10). A GPU kernel samples an 8×6 grid of rendered camera depth, ignores sky, reconstructs visible world hits, and marks their x/z tiles in a 128×128 city-wide bitset (~3.83 m tiles in this city). Initial/reset views only seed the ledger; revisits, goal-reference renders and terminal transitions earn no novelty. No actions, goal definitions, base reward terms, policy inputs, horizon or curriculum are changed. Checkpoints record the augmentation separately from the unchanged base-task contract; evaluation disables the bonus for every policy. ABI v5 adds field 16 (`float32[n,4]`: current unique tiles, cumulative bonus, last bonus, ended-episode unique tiles); existing fields retain their layouts.
+Surface coverage is diagnostic only. A GPU kernel samples an 8×6 depth grid and marks visible world x/z hits in a 128×128 city bitset; sky, reference renders and revisits do not add tiles. ABI v6 field 16 is `episode_diagnostics`, `float32[n,3]`: current unique tiles, ended-episode unique tiles, and ended-episode consecutive hold steps. Terminal diagnostics survive autoreset. No coverage reward or exploration flag remains.
 
-`train.py eval-cohorts --checkpoint <policy.pt> --checkpoint <baseline.pt> --out <results.json>` evaluates the same seeded test episodes for each policy: hidden-only starts at 8–30 m, far starts at 35–50 m with uniform visibility buckets, and hidden-plus-far starts. Each cohort has 256 episodes per GPS mode by default. Goal refresh defaults to 0 so the primary comparison uses fixed, deployable reference crops; `--goal-refresh-steps 30` explicitly evaluates oracle simulator-box refresh instead. Reports include success/Wilson intervals, crashes, stationary-away-from-goal frame fraction (speed <0.2 m/s and box distance >6 m), and additional unique observed tiles beyond the initial view. Coverage is diagnostic only, not another actor input. The far range is out of the training-start distribution but reachable within the unchanged 15 s horizon.
+`train.py eval-cohorts --checkpoint <v3-policy.pt> --baseline-checkpoint <v2-policy.pt> --out <results.json>` compares identical seeded standard and hidden-only 8–30 m episodes, far 35–50 m episodes, and hidden-plus-far episodes (256 per GPS mode). All policies face the new final-3-second hold objective; old early-arrival scores are not comparable. Baseline transfer is explicit and visual-only, with encoder, sensors, observations and flight dynamics still validated. Fixed reference crops are the default; `--goal-refresh-steps 30` instead uses oracle boxes. Reports distinguish arrival, final success, post-arrival held-frame fraction, and losing a hold after arrival, alongside crashes, stationary-away fraction and coverage. Far starts are outside the training range but reachable within 15 s.
 
 Arms (`--encoder`):
 
@@ -128,7 +130,7 @@ Measured on ABI v4 (designed 1.5–2.5 m shapes, held-out designs; `runs/drone-p
 
 ## Bounded exploration experiment (ABI v5)
 
-`runs/drone7-mean-explore-seed0`: fresh seed-0 camera policy, TensorRT FP16 `mean` encoder, 128 envs, reference-goal refresh every 30 steps, unchanged 8–30 m training starts and adaptive curriculum, with the single capped novelty bonus above. Completed 2,007,040 steps in 1452 s (24.2 min including initialization, validation and standard test). Standard validation GPS success at 0.5M / 1M / 1.5M / 2M was 0.8% / 10.2% / 8.6% / 3.1%; `best.pt` is the 1,007,616-step checkpoint, while the predeclared 2M cohort comparison uses `last.pt`. The standard test of `best.pt` gets 7.4% fixed-goal GPS success.
+`runs/drone7-mean-explore-seed0` (historical ABI v5): fresh seed-0 camera policy, TensorRT FP16 `mean` encoder, 128 envs, reference-goal refresh every 30 steps, unchanged 8–30 m training starts and adaptive curriculum. The removed novelty reward paid +0.05 per newly observed tile after the initial view, capped at +2 per episode. Completed 2,007,040 steps in 1452 s (24.2 min including initialization, validation and standard test). Standard validation GPS success at 0.5M / 1M / 1.5M / 2M was 0.8% / 10.2% / 8.6% / 3.1%; `best.pt` is the 1,007,616-step checkpoint, while the predeclared 2M cohort comparison uses `last.pt`. Standard fixed-goal test success of `best.pt` was 7.4%.
 
 Paired test catalogs (seed 20002), 256 episodes per policy/cohort/GPS mode, fixed goal references and **no oracle refresh or novelty reward at evaluation**. Baseline is the previous 3,006,464-step `runs/drone6-mean-refresh-seed0/best.pt`; training budgets differ, so this is a practical checkpoint comparison, not a matched-budget causal ablation. Wilson 95% intervals:
 
@@ -182,7 +184,7 @@ By class (GPS): buildings 0.086, vegetation 0.096, vehicles 0.059, props 0.033. 
 
 Earlier v5 attempts, kept for the record: the Gaussian entropy bonus drove saturated bang-bang actions (entropy 3.7 → 4.1, success → 0); single-patch anchor labels and bird's-eye, full-frame goal crops kept localization near chance (offline within-one-patch 0.38; box-region labels and drone-like crops reach peak-on-target 0.58 offline, 0.85–0.9 in training); and an all-or-nothing hold bonus left the policy circling found targets at ~2.6 m/s (`runs/drone5-mean-seed0-binaryhold`, partial).
 
-Live play: `nix develop --command nix develop path:sim --command .venv/bin/python sim/python/live.py --checkpoint runs/drone6-mean-refresh-seed0/best.pt [--gemma]` serves http://127.0.0.1:8790/. Drag a box or type an instruction with `--gemma` to supply a goal crop. Free flight ignores district bounds, timeouts and success termination; a crash or leaving the city/100 m ceiling restarts. No automatic goal refresh runs in live play.
+Live play: `nix develop --command nix develop path:sim --command .venv/bin/python sim/python/live.py --checkpoint runs/drone8-mean-hold-seed0/best.pt [--gemma]` serves http://127.0.0.1:8790/. Drag a box or type an instruction with `--gemma` to supply a goal crop. Free flight ignores district bounds, timeouts and success termination; a crash or leaving the city/100 m ceiling restarts. No automatic goal refresh runs in live play.
 
 Live diagnostics: white camera outline = simulator target box (only when its anchor is visible and the selected goal is scored); red patch = the policy's localization guess, drawn when P(in-view) exceeds 0.5; thumbnail = actual goal image. Blue map marker = drone. The panel shows goal source/age, geometric box-match IoU, simulator asset/object ID/class/dimensions, selection/current box distance, anchor visibility, policy P(in-view), patch-in-GT-box agreement and checkpoint. An unmatched selection explicitly labels the old simulator target as unrelated and hides its white camera outline; its distance is not presented as goal progress. IoU and patch-in-box agreement do not establish semantic object identity. Ground truth is diagnostic only, never an added input to the visual actor.
 
@@ -217,7 +219,7 @@ Every Gemma miss confused two designs that share colour and pattern but differ i
 
 ## Checkpoints
 
-Format `sim-drone-ppo-v3`. A checkpoint records task, ABI version, control mode, encoder spec and fingerprint, policy mode, control rate, catalog size, city fingerprint, native library hash (provenance only, not compared, so rebuilds stay valid), seeds, PPO settings, `no_gps_fraction`, `aux_coefficient` and `appearance`. Loading rejects earlier formats and any ABI other than 5.
+Format `sim-drone-ppo-v3`. A checkpoint records task/ABI, controls, encoder fingerprint and preprocessing, native task contract and library hash (provenance only), seeds and PPO settings. Normal loading requires task v3/ABI6. `eval-cohorts --baseline-checkpoint` alone permits explicit visual-actor comparison from task v2/ABI5: reward and success semantics may differ, but flight dynamics, observations and encoder configuration must match. Privileged-state actors cannot transfer because hold-progress normalization changed.
 
 ## Replay and reports
 
@@ -227,7 +229,7 @@ Replay export (`sim_rl.replay`, entry `sim/python/replay.py --checkpoint ... --o
 
 Language goals by grounding (`sim/python/gemma_goal.py`): `frames` renders the first-person start frames of a fresh held-out batch; `ground --instruction TEXT` asks Gemma 4 to box the instructed object in each frame and matches the box to the target-class city object whose projected bounding box overlaps it most (IoU ≥ 0.3; occlusion is not modelled). `replay.py --goal-boxes DIR/boxes.json` then flies those episodes: the goal is the crop of the start frame at Gemma's box (the crop an operator tap would give) and the native `retarget` call makes success score the matched object; unmatched boxes still steer the policy but the episode keeps its catalog target (`grounding.scored = false`).
 
-Typed goals in the replay site: start the server inside the root dev shell (Gemma needs its libraries) with `nix develop --command .venv/bin/python sim/replay/serve.py --data <recording> --live [--checkpoint runs/drone5-mean-seed0/best.pt]`. Each instruction runs frames → ground → record on `--live-envs` (default 32) held-out environments with a fresh random seed and switches the page to the recording; episodes where Gemma boxed nothing are dropped. Each recording is served under its own `/replay/<recording>/` URLs, and the page follows the server's current recording.
+Typed goals in the replay site: start the server inside the root dev shell with `nix develop --command .venv/bin/python sim/replay/serve.py --data <recording> --live [--checkpoint runs/drone8-mean-hold-seed0/best.pt]`. Each instruction runs frames → ground → record on `--live-envs` (default 32) held-out environments with a fresh random seed and switches the page to the recording; episodes where Gemma boxed nothing are dropped. Recordings have their own `/replay/<recording>/` URLs.
 
 ## Resource notes
 

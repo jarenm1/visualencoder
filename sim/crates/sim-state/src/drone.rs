@@ -40,15 +40,15 @@ pub const CAMERA_VFOV_RAD: f32 = 5.0 * core::f32::consts::PI / 12.0;
 pub const CAMERA_OFFSET: [f32; 3] = [0.0, 0.05, -0.1];
 pub const CAMERA_NEAR: f32 = 0.05;
 pub const CAMERA_FAR: f32 = 120.0;
-/// Standoff task: success needs the drone within `STANDOFF_MAX` of the target's bounding
-/// box, facing it (box anchor in frame and unoccluded), slower than `HOLD_SPEED`, for
-/// `HOLD_STEPS` consecutive control steps.
+/// Sustained standoff: remain within the target band, slow and facing it for the final
+/// `HOLD_STEPS` controls at the episode deadline. Earlier arrival never terminates training.
 pub const STANDOFF_MAX: f32 = 6.0;
 /// Progress reward stops below this box distance: closer brings no reward, only risk.
 pub const STANDOFF_NEAR: f32 = 3.0;
 pub const HOLD_SPEED: f32 = 1.0;
-/// 0.5 s at 30 Hz.
-pub const HOLD_STEPS: u32 = 15;
+/// Three seconds at 30 Hz. Arrival diagnostics separately count an initial 0.5 s stop.
+pub const HOLD_STEPS: u32 = 90;
+pub const ARRIVAL_STEPS: u32 = 15;
 /// Maximum downward speed for a landed (not crashed) contact with landable geometry, m/s.
 pub const LANDING_SPEED: f32 = 2.0;
 /// Maximum tilt for a landed contact, radians (30 deg).
@@ -74,6 +74,33 @@ pub const MAX_TILT_TAN: f32 = 0.700_207_5;
 /// as a fraction of g. Keeps the attitude target defined when the vertical command
 /// would otherwise require downward thrust.
 pub const MIN_VERTICAL_ACCEL_FRACTION: f32 = 0.1;
+
+/// Shared CPU/device outcome logic; it never supplies or overrides a flight command.
+#[derive(Clone, Copy, Debug)]
+pub struct HoldOutcome {
+    pub hold: u32,
+    pub success: bool,
+    pub done: bool,
+}
+
+#[inline(always)]
+pub fn hold_outcome(previous_hold: u32, step: u32, holding: bool,
+    crash: bool, oob: bool, free: bool) -> HoldOutcome {
+    let hold = if holding && !crash && !oob {
+        if previous_hold < HOLD_STEPS { previous_hold + 1 } else { HOLD_STEPS }
+    } else { 0 };
+    let deadline = step >= HORIZON;
+    let success = hold >= HOLD_STEPS && !crash && !oob
+        && if free { previous_hold < HOLD_STEPS } else { deadline };
+    HoldOutcome { hold, success, done: crash || oob || (!free && deadline) }
+}
+
+/// Four terms: distance progress, time, graded near-goal braking, and terminal outcome.
+#[inline(always)]
+pub fn goal_reward(progress: f32, speed: f32, near: bool, success: bool, failed: bool) -> f32 {
+    let braking = if near && speed < 3.0 { 0.1 * (1.0 - speed / 3.0) } else { 0.0 };
+    progress - 0.01 + braking + if success { 10.0 } else if failed { -10.0 } else { 0.0 }
+}
 
 /// One candidate episode. Written by host catalog construction; read by the native reset
 /// and the goal-view renderer.
@@ -203,6 +230,44 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 mod tests {
     use super::*;
     use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn early_arrival_does_not_end_and_drift_away_fails_at_deadline() {
+        let mut hold = 0;
+        for step in 1..HORIZON {
+            let out = hold_outcome(hold, step, step < 300, false, false, false);
+            assert!(!out.done && !out.success);
+            hold = out.hold;
+        }
+        let out = hold_outcome(hold, HORIZON, false, false, false, false);
+        assert!(out.done && !out.success);
+        assert_eq!(out.hold, 0);
+        assert!((goal_reward(0.0, 0.0, false, out.success, out.done && !out.success) + 10.01).abs() < 1e-5);
+    }
+
+    #[test]
+    fn only_sustained_final_hold_succeeds_and_every_failure_costs_the_same() {
+        let held = hold_outcome(HOLD_STEPS - 1, HORIZON, true, false, false, false);
+        assert!(held.done && held.success);
+        let too_short = hold_outcome(HOLD_STEPS - 2, HORIZON, true, false, false, false);
+        assert!(too_short.done && !too_short.success);
+        for (crash, oob, step) in [(true, false, 100), (false, true, 100), (false, false, HORIZON)] {
+            let out = hold_outcome(HOLD_STEPS, step, false, crash, oob, false);
+            assert!(out.done && !out.success);
+            assert!((goal_reward(0.0, 0.0, false, false, true) + 10.01).abs() < 1e-5);
+        }
+        assert!(goal_reward(0.0, 0.0, true, false, false) > goal_reward(0.0, 2.5, true, false, false));
+    }
+
+    #[test]
+    fn free_flight_reports_hold_once_without_stopping_the_controller() {
+        let first = hold_outcome(HOLD_STEPS - 1, 200, true, false, false, true);
+        assert!(first.success && !first.done);
+        let next = hold_outcome(first.hold, 201, true, false, false, true);
+        assert!(!next.success && !next.done);
+        let deadline = hold_outcome(next.hold, HORIZON, true, false, false, true);
+        assert!(!deadline.success && !deadline.done);
+    }
 
     fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
         a[0] * b[0] + a[1] * b[1] + a[2] * b[2]

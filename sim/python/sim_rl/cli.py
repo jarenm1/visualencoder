@@ -91,9 +91,7 @@ def training_settings(args):
     return {"curriculum": args.curriculum, "no_gps_fraction": args.no_gps_fraction,
             "aux_coefficient": args.aux_coefficient, "appearance": args.appearance,
             "goal_refresh_steps": args.goal_refresh_steps,
-            "goal_box_source": "simulator" if args.goal_refresh_steps else None,
-            "reward_augmentation": ("observed-surface-tiles/v1: 128x128 city grid, 8x6 depth samples, "
-                                    "+0.05/new tile after seed, cap +2/episode") if args.exploration else None}
+            "goal_box_source": "simulator" if args.goal_refresh_steps else None}
 
 
 def checkpoint(policy, metadata, steps):
@@ -101,21 +99,36 @@ def checkpoint(policy, metadata, steps):
             "model": policy.state_dict()}
 
 
-def load_checkpoint(path):
+def load_checkpoint(path, *, for_task_transfer=False):
     saved = torch.load(path, map_location="cpu", weights_only=True)
     if saved.get("format") != CHECKPOINT_FORMAT:
         raise ValueError(f"{path} is not a {CHECKPOINT_FORMAT} checkpoint; earlier checkpoints "
                          f"cannot be used for {TASK} ABI {ABI_VERSION}")
     metadata = saved["metadata"]
-    if metadata.get("abi_version") != ABI_VERSION or metadata.get("task") != TASK:
+    source = (metadata.get("task"), metadata.get("abi_version"))
+    if source != (TASK, ABI_VERSION) and not (
+            for_task_transfer and source == ("city-drone-goal-v2", 5)):
         raise ValueError(f"checkpoint targets an incompatible native ABI or task; retrain on sim_env ABI v{ABI_VERSION}")
     return saved
 
 
-def validate_checkpoint(saved, env, features):
+def validate_checkpoint(saved, env, features, *, for_task_transfer=False):
     recorded = saved["metadata"]
     expected = native_provenance(env, features)
+    transfer = (recorded.get("task"), recorded.get("abi_version")) != (TASK, ABI_VERSION)
+    if transfer:
+        if not (for_task_transfer and features.visual and
+                (recorded.get("task"), recorded.get("abi_version")) == ("city-drone-goal-v2", 5)):
+            raise ValueError("only explicit visual-policy evaluation may transfer a v2/ABI5 checkpoint")
+        # Visual actors never read privileged hold progress; controls, sensors and encoders must match.
+        changed = {"task", "abi_version", "success", "reward"}
+        source_contract = {k: v for k, v in recorded["native_task_contract"].items() if k not in changed}
+        target_contract = {k: v for k, v in expected["native_task_contract"].items() if k not in changed}
+        if source_contract != target_contract:
+            raise ValueError("task-transfer checkpoint differs in dynamics, sensors or observation contract")
     for key in CHECKED_KEYS:
+        if transfer and key in {"task", "abi_version", "native_task_contract"}:
+            continue
         if recorded.get(key) != expected[key]:
             raise ValueError(f"checkpoint {key} differs from the native/feature configuration: "
                              f"recorded {recorded.get(key)!r}, current {expected[key]!r}")
@@ -129,7 +142,7 @@ def make_config(args):
                   value_coefficient=args.value_coefficient, max_grad_norm=args.max_grad_norm,
                   curriculum=args.curriculum, aux_coefficient=args.aux_coefficient,
                   no_gps_fraction=args.no_gps_fraction, appearance=args.appearance,
-                  goal_refresh_steps=args.goal_refresh_steps, exploration=args.exploration)
+                  goal_refresh_steps=args.goal_refresh_steps)
 
 
 def open_env(args, n, seed, style):
@@ -288,7 +301,6 @@ def train_command(args, started):
         "steps": trainer.steps, "no_gps_fraction": args.no_gps_fraction, "aux_coefficient": args.aux_coefficient,
         "goal_refresh_steps": config.goal_refresh_steps,
         "goal_box_source": metadata["goal_box_source"],
-        "reward_augmentation": metadata["reward_augmentation"],
         "fixed_goal_test_success": ({label: fixed_goal_test[label]["policy"]["success"]
                                      for label in ("gps", "no_gps")} if fixed_goal_test else None),
         "best_validation_selection_success": best_success,
@@ -492,8 +504,6 @@ def add_learner(parser):
     parser.add_argument("--goal-refresh-steps", type=int, default=DEFAULTS.goal_refresh_steps,
                         help="refresh the goal from a visible simulator target box every N control steps "
                              "(0 = fixed reference); no scripted actions")
-    parser.add_argument("--exploration", action="store_true",
-                        help="one bounded observed-area novelty bonus (+0.05/new tile, max +2/episode)")
     parser.add_argument("--total-steps", type=int, default=DEFAULTS.total_steps)
     parser.add_argument("--rollout-steps", type=int, default=DEFAULTS.rollout_steps)
     parser.add_argument("--sequence-length", type=int, default=DEFAULTS.sequence_length)
@@ -509,7 +519,7 @@ def add_learner(parser):
 
 
 def parser():
-    root = argparse.ArgumentParser(description="City drone visual-goal learner (city-drone-goal-v1, ABI v4)")
+    root = argparse.ArgumentParser(description=f"City drone visual-goal learner ({TASK}, ABI v{ABI_VERSION})")
     commands = root.add_subparsers(dest="command", required=True)
 
     train = commands.add_parser("train")
@@ -535,6 +545,9 @@ def parser():
     cohorts = commands.add_parser("eval-cohorts", help="paired fixed-goal hidden and far-target evaluations")
     add_native(cohorts)
     cohorts.add_argument("--checkpoint", type=Path, action="append", required=True)
+    cohorts.add_argument("--baseline-checkpoint", type=Path, action="append", default=[],
+                         help="explicitly evaluate a v2/ABI5 visual policy under the new hold objective; "
+                              "all encoder, observation and flight-control contracts must match")
     cohorts.add_argument("--eval-envs", type=int, default=256)
     cohorts.add_argument("--goal-refresh-steps", type=int, default=0,
                          help="0 measures deployable fixed goals; nonzero uses oracle simulator boxes")

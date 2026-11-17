@@ -18,7 +18,7 @@ from .features import FrozenFeatures, RefreshedGoals, crop_goals, precision_of, 
 from .model import deterministic_action, saliency_targets
 from .native import DEFAULT_CITY, PRIVILEGED_WIDTH, CudaEnv
 
-# Diagnostics indices (ABI v5, width 28) recorded per frame, pre-action: pose, target centre and
+# Diagnostics indices (ABI v6, width 28) recorded per frame, pre-action: pose, target centre and
 # half extents, catalog index, layout class and object, clock, landed.
 STATE_INDEX = (0, 1, 2, 6, 7, 8, 9, 3, 4, 5, 24, 25, 26, 16, 14, 27, 17, 18)
 # Privileged lanes appended per frame as ground-truth labels for saliency diagnosis

@@ -95,13 +95,6 @@ pub unsafe extern "C" fn sim_env_set_free_flight(handle: *mut c_void, enabled: u
     })
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sim_env_set_exploration(handle: *mut c_void, enabled: u32) -> i32 {
-    boundary(-1, || {
-        unsafe { environment(handle)? }.set_exploration(enabled != 0);
-        Ok(0)
-    })
-}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sim_env_buffer(handle: *mut c_void, field: i32) -> u64 {

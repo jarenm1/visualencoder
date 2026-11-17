@@ -67,7 +67,6 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
     n, device = env.n, env.device
     if len(bucket_weights) != 3 or min(bucket_weights) < 0 or sum(bucket_weights) <= 0:
         raise ValueError("bucket_weights must contain three nonnegative weights with positive sum")
-    env.set_exploration(False)  # Compare task success/base return, never intrinsic reward.
     lanes = torch.tensor(tuple(bucket_weights) + (no_gps, appearance), device=device, dtype=torch.float32)
     env.write_curriculum(lanes)
     goals = features.catalog_goals(env, appearance) if policy is not None and features.visual else None
@@ -75,10 +74,17 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
     goal_source = RefreshedGoals(env, features, goals, goal_refresh_steps) if goals is not None else None
     start_landed = env.diagnostics[:, 19].clamp(0, 1).clone()
     start_class = env.diagnostics[:, 14].clone()
-    initial_coverage = env.exploration[:, 0].clone()
+    initial_coverage = env.episode_diagnostics[:, 0].clone()
     initial_distance = env.diagnostics[:, 20].clone()
     observed_tiles = torch.zeros(n, device=device)
     stationary_away = torch.zeros(n, device=device)
+    arrived = torch.zeros(n, device=device)
+    first_arrival_steps = torch.zeros(n, device=device)
+    post_arrival_steps = torch.zeros(n, device=device)
+    post_arrival_holding = torch.zeros(n, device=device)
+    lost_hold = torch.zeros(n, device=device)
+    hold_steps = env.metadata["success"]["hold_steps"]
+    arrival_steps = env.metadata["success"]["arrival_steps"]
     active = torch.ones(n, device=device)
     completed = torch.zeros(n, device=device)
     success = torch.zeros(n, device=device)
@@ -114,12 +120,22 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
             finished = active * env.done
             returns.add_(active * env.reward)
             steps.add_(active)
+            # Terminal hold survives native autoreset; include arrivals on the final action.
+            hold = torch.where(env.done.bool(), env.episode_diagnostics[:, 2],
+                               env.privileged[:, 24] * hold_steps)
+            holding = (hold > 0).float()
+            reached = active * (hold >= arrival_steps - 0.5).float()  # Normalized integer counter.
+            first_arrival_steps.add_(reached * (1 - arrived) * steps)
+            torch.maximum(arrived, reached, out=arrived)
+            post_arrival_steps.add_(active * arrived)
+            post_arrival_holding.add_(active * arrived * holding)
+            torch.maximum(lost_hold, active * arrived * (1 - holding), out=lost_hold)
             completed.add_(finished)
             success.add_(finished * env.success)
             collision.add_(finished * env.collision * (1 - env.success))
             out_of_bounds.add_(finished * env.out_of_bounds * (1 - env.success) * (1 - env.collision))
             bucket.add_(finished * env.ended_bucket)
-            observed_tiles.add_(finished * env.exploration[:, 3])
+            observed_tiles.add_(finished * env.episode_diagnostics[:, 1])
             active.mul_(1 - env.done)
             starts.copy_(env.done)
     timeout = completed - success - collision - out_of_bounds
@@ -151,7 +167,14 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
     result["mean_observed_tiles"] = float(observed_tiles.mean())
     result["mean_new_observed_tiles"] = float((observed_tiles - initial_coverage).mean())
     result["stationary_away_fraction"] = float(stationary_away.sum() / steps.sum().clamp_min(1))
-    result["novelty_reward_enabled"] = False
+    arrival_count = float(arrived.sum())
+    result["arrival_rate"] = arrival_count / n
+    result["mean_first_arrival_seconds"] = (float(first_arrival_steps.sum()) / arrival_count / env.control_hz
+                                            if arrival_count else None)
+    result["post_arrival_hold_fraction"] = (float(post_arrival_holding.sum() / post_arrival_steps.sum())
+                                            if arrival_count else None)
+    result["hold_loss_after_arrival_rate"] = float(lost_hold.sum()) / arrival_count if arrival_count else None
+    result["arrival_to_success_rate"] = float(success.sum()) / arrival_count if arrival_count else None
     result["classes"] = {name: {"episodes": round(count), "success": hits / count if count else None}
                          for name, count, hits in zip(env.target_classes, *class_table.cpu().tolist())}
     return result

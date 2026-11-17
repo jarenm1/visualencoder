@@ -1,4 +1,4 @@
-"""ABI v5 CPU-only checks: rank metrics, box-region auxiliary targets, GPS heuristic, curriculum lanes."""
+"""CPU-only checks: rank metrics, box-region auxiliary targets, GPS heuristic, curriculum lanes."""
 import math
 import unittest
 

@@ -1,4 +1,4 @@
-"""Borrowed CUDA tensors over the sim_env C ABI v5; no observation transport."""
+"""Borrowed CUDA tensors over the sim_env C ABI v6; no observation transport."""
 from __future__ import annotations
 
 import ctypes as ct
@@ -10,8 +10,8 @@ from pathlib import Path
 import torch
 
 DEFAULT_CITY = Path(__file__).resolve().parents[3] / "assets" / "city"
-TASK = "city-drone-goal-v2"
-ABI_VERSION = 5
+TASK = "city-drone-goal-v3"
+ABI_VERSION = 6
 ACTION_DIM = 4
 HORIZON = 450
 CONTROL_HZ = 30
@@ -20,7 +20,7 @@ CONTROL_MODES = {"velocity": 0, "rates": 1}
 HOVER_ACTIONS = {"velocity": (0.0, 0.0, 0.0, 0.0), "rates": (-0.2, 0.0, 0.0, 0.0)}
 # Fields: 0 obs, 1 proprio, 2 reward, 3 done, 4 success, 5 privileged, 6 collision,
 # 7 episodes, 8 diagnostics, 9 catalog index, 10 goal views, 11 curriculum (writable),
-# 12 ended bucket, 13 out_of_bounds, 14 ended gps_available, 15 goal crops, 16 exploration metrics.
+# 12 ended bucket, 13 out_of_bounds, 14 ended gps_available, 15 goal crops, 16 episode diagnostics.
 FIELD_COUNT = 17
 DIAGNOSTICS_WIDTH = 28
 CURRICULUM_WIDTH = 5  # w_visible, w_partial, w_hidden, p_no_gps, appearance strength
@@ -75,7 +75,6 @@ class CudaEnv:
             "sim_env_render_goals": ([ct.c_void_p, ct.c_uint32], ct.c_int32),
             "sim_env_retarget": ([ct.c_void_p, ct.c_void_p], ct.c_int32),
             "sim_env_set_free_flight": ([ct.c_void_p, ct.c_uint32], ct.c_int32),
-            "sim_env_set_exploration": ([ct.c_void_p, ct.c_uint32], ct.c_int32),
             "sim_env_create_with_start_distance": ([ct.c_uint32, ct.c_uint64, ct.c_uint32, ct.c_uint32,
                 ct.c_uint32, ct.c_uint32, ct.c_char_p, ct.c_float, ct.c_float], ct.c_void_p),
             "sim_env_destroy": ([ct.c_void_p], None),
@@ -85,7 +84,7 @@ class CudaEnv:
             try:
                 function = getattr(self.lib, name)
             except AttributeError as error:
-                raise RuntimeError(f"city navigation requires sim_env ABI v5 symbol {name}") from error
+                raise RuntimeError(f"city navigation requires sim_env ABI v6 symbol {name}") from error
             function.argtypes, function.restype = args, result
         create_args = (n, seed, width, height, style, CONTROL_MODES[control_mode], os.fsencode(self.city_path))
         if start_distance is None:
@@ -101,7 +100,7 @@ class CudaEnv:
                 raise RuntimeError(f"native city metadata unavailable: {self.error()}")
             self.metadata = json.loads(raw_metadata.decode("utf-8"))
             if self.metadata.get("abi_version") != ABI_VERSION or self.metadata.get("task") != TASK:
-                raise ValueError("city navigation requires sim_env ABI v5 task city-drone-goal-v2; "
+                raise ValueError("city navigation requires sim_env ABI v6 task city-drone-goal-v3; "
                                  "older libraries are incompatible")
             missing = [key for key in REQUIRED_METADATA if key not in self.metadata]
             if missing:
@@ -117,7 +116,7 @@ class CudaEnv:
             self.action_names = tuple(self.metadata["action_names"])
             self.action_scales = tuple(float(value) for value in self.metadata["action_scales"])
             if (self.action_dim, self.horizon, self.control_hz) != (ACTION_DIM, HORIZON, CONTROL_HZ):
-                raise ValueError("unsupported city-drone-goal-v1 action/horizon/control contract")
+                raise ValueError("unsupported city-drone-goal-v3 action/horizon/control contract")
             if len(self.action_names) != ACTION_DIM or len(self.action_scales) != ACTION_DIM:
                 raise ValueError("native metadata must name and scale exactly four control channels")
             # Location and split-specific content (district, catalog, field shapes) are
@@ -150,7 +149,7 @@ class CudaEnv:
                 ((n,), "<f4"),                         # 13 out_of_bounds
                 ((n,), "<f4"),                         # 14 ended gps_available
                 ((n, 4), "<f4"),                       # 15 goal crops
-                ((n, 4), "<f4"),                       # 16 exploration metrics, never actor input
+                ((n, 3), "<f4"),                       # 16 episode diagnostics, never actor input
             ]
             with self.execution():
                 for field, (shape, typestr) in enumerate(specifications):
@@ -167,7 +166,7 @@ class CudaEnv:
             (self.obs, self.proprio, self.reward, self.done, self.success, self.privileged,
              self.collision, self.episode_counts, self.diagnostics, self.catalog_index, self.goal_views,
              self.curriculum, self.ended_bucket, self.out_of_bounds, self.ended_gps, self.goal_crops,
-             self.exploration) = self.tensors
+             self.episode_diagnostics) = self.tensors
         except BaseException:
             self.close()
             raise
@@ -222,12 +221,6 @@ class CudaEnv:
         """Interactive free flight (never training): only the city edge and a 100 m ceiling end a
         flight, success is reported once without ending the episode, and there is no timeout."""
         if self.lib.sim_env_set_free_flight(self.handle, int(bool(enabled))) != 0:
-            raise RuntimeError(self.error())
-
-    def set_exploration(self, enabled):
-        """Toggle the bounded training reward, without changing policy inputs or base task rules."""
-        self._check_stream()
-        if self.lib.sim_env_set_exploration(self.handle, int(bool(enabled))) != 0:
             raise RuntimeError(self.error())
 
     def write_curriculum(self, lanes):

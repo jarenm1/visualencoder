@@ -157,7 +157,7 @@ async function poll() {
     const checkpoint = state.checkpoint;
     $("checkpoint-detail").textContent = `${(checkpoint.steps / 1e6).toFixed(2)}M checkpoint · ` +
       `fixed live goal (no automatic refresh) · ${checkpoint.path}`;
-    $("checkpoint-detail").textContent += " · success = within 6 m of box, <1 m/s, facing for 0.5 s";
+    $("checkpoint-detail").textContent += " · training success = final 3 s within 6 m, ≤1 m/s, facing";
     drawMap();
   } catch (_) { /* server restarting */ }
   setTimeout(poll, 100);

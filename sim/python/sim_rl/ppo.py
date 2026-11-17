@@ -48,7 +48,6 @@ class Config:
     no_gps_fraction: float = 0.0
     appearance: float = 1.0
     goal_refresh_steps: int = 0
-    exploration: bool = False
 
     def validate(self):
         if min(self.total_steps, self.rollout_steps, self.sequence_length,
@@ -103,7 +102,6 @@ class Trainer:
         self.steps = 0
         self.curriculum = Curriculum(config.curriculum, env.device, config.no_gps_fraction, config.appearance)
         self.curriculum.write(env)
-        env.set_exploration(config.exploration)
         t, n, h = config.rollout_steps, env.n, policy.hidden_size
         allocate = lambda *shape: torch.empty(shape, device=env.device)
         self.proprio = allocate(t, n, PROPRIO_WIDTH)
