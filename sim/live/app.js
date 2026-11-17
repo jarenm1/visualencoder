@@ -65,18 +65,25 @@ function drawOverlay() {
   requestAnimationFrame(drawOverlay);
 }
 
+const MAP_SPAN = 160;   // metres shown around the drone
+
 function drawMap() {
   if (!layout || !state) return;
-  const [minX, minZ, maxX, maxZ] = layout.district;
-  const pad = 20, span = Math.max(maxX - minX, maxZ - minZ) + 2 * pad;
-  const s = map.width / span;
-  const px = (x) => (x - minX + pad) * s, pz = (z) => (z - minZ + pad) * s;
+  const [x, , z] = state.position;
+  const s = map.width / MAP_SPAN;
+  const px = (wx) => (wx - x) * s + map.width / 2, pz = (wz) => (wz - z) * s + map.height / 2;
   mapCtx.clearRect(0, 0, map.width, map.height);
+  const edge = layout.city_half_extent;
+  mapCtx.strokeStyle = "#5a3a3a";
+  mapCtx.strokeRect(px(-edge), pz(-edge), 2 * edge * s, 2 * edge * s);
+  const [minX, minZ, maxX, maxZ] = layout.district;
   mapCtx.strokeStyle = "#333";
   mapCtx.strokeRect(px(minX), pz(minZ), (maxX - minX) * s, (maxZ - minZ) * s);
-  for (const [x, z, hx, hz, cls] of layout.objects) {
+  const reach = MAP_SPAN / 2 + 15;
+  for (const [ox, oz, hx, hz, cls] of layout.objects) {
+    if (Math.abs(ox - x) > reach || Math.abs(oz - z) > reach) continue;
     mapCtx.fillStyle = CLASS_COLOURS[cls] ?? "#444";
-    mapCtx.fillRect(px(x - hx), pz(z - hz), 2 * hx * s, 2 * hz * s);
+    mapCtx.fillRect(px(ox - hx), pz(oz - hz), 2 * hx * s, 2 * hz * s);
   }
   const t = state.target;
   mapCtx.strokeStyle = "#e6e6e6";
@@ -86,7 +93,7 @@ function drawMap() {
   mapCtx.beginPath();
   mapCtx.arc(px(t.center[0]), pz(t.center[2]), (Math.max(t.half[0], t.half[2]) + 6) * s, 0, 2 * Math.PI);
   mapCtx.stroke();
-  const [x, , z] = state.position;
+  // Trail: only the flight since the last teleport (crash restart).
   trail.push([x, z]);
   if (trail.length > 900) trail.shift();
   mapCtx.strokeStyle = "rgba(120,200,255,0.5)";
@@ -110,7 +117,10 @@ async function poll() {
   try {
     const previous = state;
     state = await (await fetch("/state", { cache: "no-store" })).json();
-    if (previous && state.clock_s < previous.clock_s) trail = [];
+    if (previous) {
+      const [ax, , az] = previous.position, [bx, , bz] = state.position;
+      if (Math.hypot(bx - ax, bz - az) > 10) trail = [];
+    }
     $("pause-icon").setAttribute("d", state.paused ? "M4 2.5v11L13 8z" : "M4 2.5h3v11H4zM9 2.5h3v11H9z");
     $("instruct").hidden = !state.gemma;
     const goal = state.goal || {};

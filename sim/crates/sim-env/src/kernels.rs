@@ -24,6 +24,10 @@ pub(crate) struct Config {
     pub district_min: [f32; 2],
     pub district_max: [f32; 2],
     pub landable_height: f32,
+    /// Free flight (interactive use, never training): only the city edge and FREE_CEILING are out
+    /// of bounds, success is reported once without ending the episode, and there is no timeout.
+    pub free_flight: u32,
+    pub city_half_extent: f32,
     pub tan_half_vfov: f32,
     /// Fixed 4:3 visibility/projection aspect.
     pub aspect: f32,
@@ -162,6 +166,8 @@ pub(crate) mod device {
     const SUCCESS_REWARD: f32 = 10.0;
     const CRASH_PENALTY: f32 = 10.0;
     const OOB_PENALTY: f32 = 5.0;
+    /// Free-flight ceiling above the landable plane (metres): above the tallest towers.
+    const FREE_CEILING: f32 = 100.0;
     /// The occlusion test stops this far before the target box (metres).
     const BOX_STANDOFF_EPS: f32 = 0.02;
 
@@ -785,8 +791,15 @@ pub(crate) mod device {
                 }
             }
 
-            if event == 0 && (!unsafe { inside_district(buffers, config, p_next[0], p_next[2]) }
-                || p_next[1] > CEILING) {
+            let inside = if config.free_flight != 0 {
+                p_next[0] > -config.city_half_extent && p_next[0] < config.city_half_extent
+                    && p_next[2] > -config.city_half_extent && p_next[2] < config.city_half_extent
+                    && p_next[1] <= config.landable_height + FREE_CEILING
+            } else {
+                let in_district = unsafe { inside_district(buffers, config, p_next[0], p_next[2]) };
+                in_district && p_next[1] <= CEILING
+            };
+            if event == 0 && !inside {
                 event = EVENT_OOB;
             }
 
@@ -829,8 +842,14 @@ pub(crate) mod device {
         let near = !crash && !oob && d <= STANDOFF_MAX && facing;
         let holding = near && speed <= HOLD_SPEED;
         st.hold = if holding { st.hold + 1 } else { 0 };
-        let success = st.hold >= HOLD_STEPS;
-        let done = crash || oob || success || st.step >= HORIZON;
+        let free = config.free_flight != 0;
+        // Free flight reports success on the step the hold completes and keeps flying.
+        let success = if free { st.hold == HOLD_STEPS } else { st.hold >= HOLD_STEPS };
+        let done = crash || oob || (!free && (success || st.step >= HORIZON));
+        if free && st.step >= HORIZON {
+            // No timeout in free flight; the observed clock wraps within its trained range.
+            st.step = 0;
+        }
 
         let mut da2 = 0.0f32;
         let mut k = 0usize;

@@ -87,6 +87,11 @@ int sim_env_render_goals(void *env, uint32_t first);
  * episode ends (autoreset returns to catalog targets). Observations are refreshed. */
 int sim_env_retarget(void *env, const float *targets);
 
+/* Free flight for interactive use (never training): enabled != 0 bounds flight only by the city
+ * edge and a 100 m ceiling, reports success once without ending the episode, and disables the
+ * timeout. Takes effect on the next step. */
+int sim_env_set_free_flight(void *env, uint32_t enabled);
+
 /* Device pointer to field storage (see enum), or 0 on error. */
 uint64_t sim_env_buffer(void *env, int32_t field);
 

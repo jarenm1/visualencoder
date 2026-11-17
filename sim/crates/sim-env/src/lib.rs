@@ -213,6 +213,8 @@ impl Env {
             district_min: district.min,
             district_max: district.max,
             landable_height: city.landable.height,
+            free_flight: 0,
+            city_half_extent: city.half_extent,
             tan_half_vfov: (dynamics::CAMERA_VFOV_RAD * 0.5).tan(),
             aspect: CAMERA_ASPECT,
             projection_x: projection[0],
@@ -344,6 +346,12 @@ impl Env {
             kernels.launch(&kernels.retarget, stream, buffers, config, Some((&raw mut targets).cast()))
         })?;
         self.render_into(0)
+    }
+
+    /// Free flight for interactive use (never training): only the city edge and a 100 m ceiling are
+    /// out of bounds, success is reported once without ending the episode, and there is no timeout.
+    pub fn set_free_flight(&mut self, enabled: bool) {
+        self.config.free_flight = enabled as u32;
     }
 
     /// Renders every camera slot, then applies the randomized appearance into `field`

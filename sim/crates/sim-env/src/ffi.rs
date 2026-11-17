@@ -76,6 +76,14 @@ pub unsafe extern "C" fn sim_env_retarget(handle: *mut c_void, targets: *const f
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn sim_env_set_free_flight(handle: *mut c_void, enabled: u32) -> i32 {
+    boundary(-1, || {
+        unsafe { environment(handle)? }.set_free_flight(enabled != 0);
+        Ok(0)
+    })
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn sim_env_buffer(handle: *mut c_void, field: i32) -> u64 {
     boundary(0, || unsafe { environment(handle)? }.buffer(field))
 }

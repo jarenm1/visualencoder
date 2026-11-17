@@ -1,9 +1,10 @@
-"""Live drone: the trained policy flies one held-out episode in real time; steer it from a browser.
+"""Live drone: the trained policy flies in real time in free flight; steer it from a browser.
 
 Drag a box around any object in the drone's view (the operator tap) or, with --gemma, type an
 instruction that Gemma 4 grounds to a box in the current frame. The box becomes the goal crop and,
-when it matches a city object, the scored target. Episodes end as in training (success, crash,
-out of bounds, 15 s); a fresh held-out episode with its catalog goal starts next.
+when it matches a city object, the scored target. Free flight: the whole city is open (only its
+edge and a 100 m ceiling end a flight), success is reported without ending the flight and there
+is no timeout; a crash restarts in a fresh held-out episode with its catalog goal.
 
     nix develop path:sim --command .venv/bin/python sim/python/live.py \
         --checkpoint runs/drone5-mean-seed0/best.pt [--gemma]
@@ -41,7 +42,6 @@ from sim_rl.native import CudaEnv  # noqa: E402
 PAGE = ROOT / "sim/live"
 PAGES = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
          "/style.css": ("style.css", "text/css; charset=utf-8")}
-OUTCOMES = ("success", "collision", "out_of_bounds")
 TARGET_CLASSES = ("building", "vehicle", "vegetation", "prop")
 
 
@@ -71,11 +71,11 @@ class Pilot:
                         "class": [layout["objects"][i]["class"] for i in targets],
                         "asset": [layout["objects"][i]["asset"] for i in targets]}
         district = self.env.metadata["district"]
+        # Free flight spans the whole city; the held-out district (where episodes start) is outlined.
         self.map = {"district": [*district["min"], *district["max"]],
+                    "city_half_extent": self.env.metadata["city"]["half_extent_m"],
                     "objects": [[round(c[0], 2), round(c[2], 2), round(h[0], 2), round(h[2], 2), cls]
-                                for c, h, cls in zip(self.objects["center"], self.objects["half"], self.objects["class"])
-                                if district["min"][0] - 30 < c[0] < district["max"][0] + 30
-                                and district["min"][1] - 30 < c[2] < district["max"][1] + 30]}
+                                for c, h, cls in zip(self.objects["center"], self.objects["half"], self.objects["class"])]}
         self.gemma = None
         if args.gemma:
             from transformers import AutoProcessor
@@ -97,6 +97,7 @@ class Pilot:
             self.starts = torch.ones(1, device=self.device)
             self.lanes = torch.tensor(UNIFORM_WEIGHTS + (0.0, args.appearance), device=self.device)
             self.env.write_curriculum(self.lanes)
+            self.env.set_free_flight(True)
             self.new_episode(int.from_bytes(os.urandom(7), "little"))
 
     # --- episode and goal management (simulator thread only) -------------------------------
@@ -184,9 +185,10 @@ class Pilot:
         self.env.step(action)
         self.starts.copy_(self.env.done)
         outcome = None
+        if bool(self.env.success[0] > 0.5):
+            outcome = "success"   # free flight: reported once, the drone keeps holding there
         if bool(self.env.done[0] > 0.5):
-            outcome = next((name for name, flag in zip(OUTCOMES, (self.env.success, self.env.collision,
-                                                                     self.env.out_of_bounds)) if flag[0] > 0.5), "timeout")
+            outcome = "collision" if bool(self.env.collision[0] > 0.5) else "left the city"
             # Native autoreset already started the next held-out episode; adopt its catalog goal.
             self.catalog_goal()
         self.publish(frame, privileged, diagnostics, peak, in_view, outcome, action[0].tolist())

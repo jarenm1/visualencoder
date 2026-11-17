@@ -73,6 +73,7 @@ class CudaEnv:
             "sim_env_stream": ([ct.c_void_p], ct.c_uint64),
             "sim_env_render_goals": ([ct.c_void_p, ct.c_uint32], ct.c_int32),
             "sim_env_retarget": ([ct.c_void_p, ct.c_void_p], ct.c_int32),
+            "sim_env_set_free_flight": ([ct.c_void_p, ct.c_uint32], ct.c_int32),
             "sim_env_destroy": ([ct.c_void_p], None),
             "sim_env_error": ([], ct.c_char_p),
         }
@@ -206,6 +207,12 @@ class CudaEnv:
                 or not targets.is_contiguous()):
             raise ValueError("targets must be contiguous CUDA:0 float32[n, 8]")
         if self.lib.sim_env_retarget(self.handle, ct.c_void_p(targets.data_ptr())) != 0:
+            raise RuntimeError(self.error())
+
+    def set_free_flight(self, enabled):
+        """Interactive free flight (never training): only the city edge and a 100 m ceiling end a
+        flight, success is reported once without ending the episode, and there is no timeout."""
+        if self.lib.sim_env_set_free_flight(self.handle, int(bool(enabled))) != 0:
             raise RuntimeError(self.error())
 
     def write_curriculum(self, lanes):
