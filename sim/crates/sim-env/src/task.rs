@@ -1,17 +1,17 @@
-//! Constants and counter-based hashing for city-drone-goal-v1 (ABI v3).
+//! Constants and counter-based hashing for city-drone-goal-v1 (ABI v4).
 //!
 //! Plain integer and constant definitions shared by the host and the CUDA kernels.
 
 pub const TASK_NAME: &str = "city-drone-goal-v1";
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 pub const ACTION_DIM: usize = 4;
-pub const SENSOR_DIM: usize = 18;
-pub const PRIVILEGED_DIM: usize = 18;
+pub const SENSOR_DIM: usize = 19;
+pub const PRIVILEGED_DIM: usize = 21;
 pub const DIAGNOSTIC_DIM: usize = 24;
 pub const CATALOG_SIZE: usize = 65536;
 /// Floats per camera slot: view (16), view-projection (16), eye (4).
 pub const CAMERA_FLOATS: usize = 36;
-pub const FIELD_COUNT: usize = 14;
+pub const FIELD_COUNT: usize = 15;
 
 /// Keep-in margin applied to the district rectangle (metres).
 pub const DISTRICT_MARGIN: f32 = 2.0;
@@ -26,9 +26,11 @@ pub const COS_LANDING_TILT: f32 = 0.866_025_4;
 /// Landed-body velocity damping rate (1/s) applied while in contact.
 pub const SETTLE_RATE: f32 = 8.0;
 
-pub const GPS_MIN_RADIUS: f32 = 2.0;
-pub const GPS_RADIUS_FRACTION: f32 = 0.25;
-pub const GPS_VERTICAL: f32 = 1.0;
+/// Metre-scale GPS error: horizontal radius is uniform in [min, max] per episode.
+pub const GPS_MIN_RADIUS: f32 = 3.0;
+pub const GPS_MAX_RADIUS: f32 = 15.0;
+/// Vertical GPS error is uniform in [-GPS_VERTICAL, GPS_VERTICAL] per episode, metres.
+pub const GPS_VERTICAL: f32 = 1.5;
 /// Normalisation for metre-scale relative positions.
 pub const GPS_SCALE: f32 = 32.0;
 /// Normalisation for body rates (rad/s).
@@ -51,6 +53,11 @@ pub const LANE_CATALOG: u32 = 17;
 pub const LANE_GPS_RADIUS: u32 = 18;
 pub const LANE_GPS_ANGLE: u32 = 19;
 pub const LANE_GPS_VERTICAL: u32 = 20;
+pub const LANE_GPS_AVAILABLE: u32 = 21;
+
+/// Control modes, as passed to `sim_env_create`.
+pub const CONTROL_VELOCITY: u32 = 0;
+pub const CONTROL_RATES: u32 = 1;
 
 const GOLDEN: u64 = 0x9e37_79b9_7f4a_7c15;
 const LANE_MUL: u64 = 0xd1b5_4a32_d192_ed03;

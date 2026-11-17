@@ -40,7 +40,9 @@ pub const CAMERA_VFOV_RAD: f32 = 5.0 * core::f32::consts::PI / 12.0;
 pub const CAMERA_OFFSET: [f32; 3] = [0.0, 0.05, -0.1];
 pub const CAMERA_NEAR: f32 = 0.05;
 pub const CAMERA_FAR: f32 = 120.0;
-pub const SUCCESS_RADIUS: f32 = 1.5;
+/// Success: within the target's scaled enclosing sphere plus this margin (metres);
+/// the per-episode radius is stored in `EpisodeSpec.stats[2]`.
+pub const SUCCESS_MARGIN: f32 = 1.0;
 pub const SUCCESS_SPEED: f32 = 3.0;
 /// Maximum downward speed for a landed (not crashed) contact with landable geometry, m/s.
 pub const LANDING_SPEED: f32 = 2.0;
@@ -50,11 +52,28 @@ pub const LANDING_TILT_RAD: f32 = core::f32::consts::PI / 6.0;
 pub const CEILING: f32 = 40.0;
 /// Visibility buckets: 0 visible, 1 partial, 2 hidden.
 pub const BUCKETS: usize = 3;
+/// Velocity mode (PX4-style offboard): heading-frame command at full stick, m/s.
+pub const VELOCITY_MAX_HORIZONTAL: f32 = 4.0;
+pub const VELOCITY_MAX_VERTICAL: f32 = 2.0;
+/// Yaw-rate command at full stick, rad/s. Positive is nose left.
+pub const YAW_RATE_MAX: f32 = 1.5;
+/// Outer velocity P gain, 1/s: a_des = VELOCITY_GAIN * (v_cmd - v).
+pub const VELOCITY_GAIN: f32 = 3.0;
+/// Attitude P gain, 1/s: body rate command = ATTITUDE_GAIN * attitude error vector.
+pub const ATTITUDE_GAIN: f32 = 6.0;
+/// Maximum commanded tilt of the thrust vector from world up, radians (35 deg).
+pub const MAX_TILT_RAD: f32 = 35.0 * core::f32::consts::PI / 180.0;
+/// tan(MAX_TILT_RAD).
+pub const MAX_TILT_TAN: f32 = 0.700_207_5;
+/// Floor on the vertical specific force used for the tilt limit and attitude target,
+/// as a fraction of g. Keeps the attitude target defined when the vertical command
+/// would otherwise require downward thrust.
+pub const MIN_VERTICAL_ACCEL_FRACTION: f32 = 0.1;
 
 /// One candidate episode. Written by host catalog construction; read by the native reset.
 ///
 /// `meta = [design (split-local), bucket, landed (0/1), catalog index]`.
-/// `stats = [visible_fraction, initial_distance, 0, 0]`.
+/// `stats = [visible_fraction, initial_distance, success_radius, 0]`.
 /// Start position is the body centre; landed starts sit at landable height + RADIUS.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]

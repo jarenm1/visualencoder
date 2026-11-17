@@ -1,4 +1,4 @@
-//! CUDA kernels for city-drone-goal-v1 (ABI v3).
+//! CUDA kernels for city-drone-goal-v1 (ABI v4).
 //!
 //! Each thread owns one environment `i`. It writes only drone body `i`, target
 //! slots `n + i*K + k`, camera matrices `i`, and row `i` of every per-env field.
@@ -17,6 +17,8 @@ pub(crate) struct Config {
     pub catalog_size: u32,
     pub node_count: u32,
     pub seed: u64,
+    /// 0 velocity (PX4-style offboard), 1 rates. See task::CONTROL_*.
+    pub control_mode: u32,
     pub bucket_first: [u32; 3],
     pub bucket_count: [u32; 3],
     pub exclusion_count: u32,
@@ -38,7 +40,7 @@ pub(crate) struct Config {
 #[derive(Clone, Copy)]
 pub(crate) struct EnvState {
     pub episode: u64,
-    /// Target centre (xyz), w unused.
+    /// Target centre (xyz); w = per-episode success radius (EpisodeSpec.stats[2]).
     pub target: [f32; 4],
     /// Clamped action applied on the last step.
     pub action: [f32; 4],
@@ -46,6 +48,8 @@ pub(crate) struct EnvState {
     pub prev_action: [f32; 4],
     /// Per-episode GPS offset: noisy target = target + gps_offset.
     pub gps_offset: [f32; 4],
+    /// Yaw-only setpoint quaternion (xyzw, rotation about world +y), velocity mode only.
+    pub yaw_setpoint: [f32; 4],
     pub initial_distance: f32,
     pub previous_distance: f32,
     pub visible_start: f32,
@@ -58,6 +62,8 @@ pub(crate) struct EnvState {
     pub landed: u32,
     /// EVENT_* bits set by the control kernel.
     pub event: u32,
+    /// Per-episode GPS availability, sampled at reset (0 or 1).
+    pub gps_available: u32,
 }
 
 #[repr(C)]
@@ -83,25 +89,29 @@ pub(crate) struct Buffers {
     pub bucket: *mut f32,
     pub episodes: *mut u64,
     pub design: *mut i32,
+    pub gps_available: *mut f32,
 }
 
 #[cuda_module]
 pub(crate) mod device {
     use super::{Buffers, Config, EnvState};
     use crate::task::{
-        COS_LANDING_TILT, CAMERA_FLOATS, DIAGNOSTIC_DIM, DISTRICT_MARGIN, EVENT_CRASH, EVENT_OOB,
-        GPS_MIN_RADIUS, GPS_RADIUS_FRACTION, GPS_SCALE, GPS_VERTICAL, HEIGHT_SCALE, LANE_BUCKET,
-        LANE_CATALOG, LANE_GPS_ANGLE, LANE_GPS_RADIUS, LANE_GPS_VERTICAL, LANE_GYRO, LANE_HEIGHT,
-        LANE_VELOCITY, NOISE_GYRO, NOISE_HEIGHT, NOISE_VELOCITY, PRIVILEGED_DIM, RATE_SCALE,
-        SENSOR_DIM, SETTLE_RATE, TARGET_PARK_Y, VELOCITY_SCALE, stream, unit,
+        CAMERA_FLOATS, COS_LANDING_TILT, CONTROL_RATES, DIAGNOSTIC_DIM, DISTRICT_MARGIN, EVENT_CRASH,
+        EVENT_OOB, GPS_MAX_RADIUS, GPS_MIN_RADIUS, GPS_SCALE, GPS_VERTICAL, HEIGHT_SCALE,
+        LANE_BUCKET, LANE_CATALOG, LANE_GPS_ANGLE, LANE_GPS_AVAILABLE, LANE_GPS_RADIUS,
+        LANE_GPS_VERTICAL, LANE_GYRO, LANE_HEIGHT, LANE_VELOCITY, NOISE_GYRO, NOISE_HEIGHT,
+        NOISE_VELOCITY, PRIVILEGED_DIM, RATE_SCALE, SENSOR_DIM, SETTLE_RATE, TARGET_PARK_Y,
+        VELOCITY_SCALE, stream, unit,
     };
     use cuda_device::{float, kernel, thread};
     use sim_state::BodyState;
     use sim_state::collision::{LANDABLE, sweep_hits};
     use sim_state::drone::{
-        CAMERA_FAR, CAMERA_NEAR, CEILING, DRAG, GRAVITY, HORIZON, INERTIA, LANDING_SPEED,
-        MASS, MAX_RATES, MAX_THRUST, MAX_TORQUE, PHYSICS_HZ, RADIUS, RATE_TAU, SUBSTEPS,
-        SUCCESS_RADIUS, SUCCESS_SPEED, THRUST_TAU, camera_basis,
+        ATTITUDE_GAIN, CAMERA_FAR, CAMERA_NEAR, CEILING, DRAG, GRAVITY, HORIZON, INERTIA,
+        LANDING_SPEED, MASS, MAX_RATES, MAX_THRUST, MAX_TILT_TAN, MAX_TORQUE,
+        MIN_VERTICAL_ACCEL_FRACTION, PHYSICS_HZ, RADIUS, RATE_TAU, SUBSTEPS,
+        SUCCESS_SPEED, THRUST_TAU, VELOCITY_GAIN, VELOCITY_MAX_HORIZONTAL, VELOCITY_MAX_VERTICAL,
+        YAW_RATE_MAX, camera_basis,
     };
 
     #[inline(always)]
@@ -280,27 +290,25 @@ pub(crate) mod device {
         }
     }
 
-    // Target visible from the eye: inside the 4:3 frustum and unobstructed by non-landable geometry.
+    // Target projected into the 4:3 frustum: NDC (x right, y up) and whether it lies inside.
+    // NDC is [0, 0] when outside. Occlusion is not considered here.
     #[inline(always)]
-    unsafe fn visible(buffers: Buffers, config: Config, eye: [f32; 3], forward: [f32; 3],
-        up: [f32; 3], target: [f32; 3]) -> bool {
+    fn project(config: Config, eye: [f32; 3], forward: [f32; 3], up: [f32; 3], target: [f32; 3])
+        -> ([f32; 2], bool) {
         let d = sub(target, eye);
         let right = cross(forward, up);
         let z = dot(d, forward);
         let x = dot(d, right);
         let y = dot(d, up);
         if !(z > CAMERA_NEAR && z < CAMERA_FAR) {
-            return false;
+            return ([0.0; 2], false);
         }
         let half_y = z * config.tan_half_vfov;
         let half_x = half_y * config.aspect;
         if x < -half_x || x > half_x || y < -half_y || y > half_y {
-            return false;
+            return ([0.0; 2], false);
         }
-        let blocked = unsafe {
-            sweep_hits(buffers.nodes, config.node_count, buffers.triangles, eye, target, 0.0, LANDABLE)
-        };
-        !blocked
+        ([x / half_x, y / half_y], true)
     }
 
     // Starts an episode for env `i` at `episode`: samples a bucket and catalog entry and writes
@@ -321,6 +329,8 @@ pub(crate) mod device {
             w = [1.0; 3];
             sum = 3.0;
         }
+        let p_raw = unsafe { *buffers.weights.add(3) };
+        let p_no_gps = if p_raw != p_raw { 0.0 } else { clampf(p_raw, 0.0, 1.0) };
         let pick = unit(base, LANE_BUCKET) * sum;
         let bucket = if pick < w[0] { 0usize } else if pick < w[0] + w[1] { 1usize } else { 2usize };
         let count = config.bucket_count[bucket];
@@ -341,7 +351,9 @@ pub(crate) mod device {
         let start_landed = spec.meta[2];
 
         let d0 = spec.stats[1];
-        let radius = maxf(GPS_MIN_RADIUS, unit(base, LANE_GPS_RADIUS) * GPS_RADIUS_FRACTION * d0);
+        // GPS: episode-level availability (no-GPS probability p) and a fixed-metre error radius.
+        let gps_available = unit(base, LANE_GPS_AVAILABLE) >= p_no_gps;
+        let radius = GPS_MIN_RADIUS + (GPS_MAX_RADIUS - GPS_MIN_RADIUS) * unit(base, LANE_GPS_RADIUS);
         let angle = core::f32::consts::TAU * unit(base, LANE_GPS_ANGLE);
         let gps = [
             radius * float::cos_approx_f32(angle),
@@ -352,10 +364,11 @@ pub(crate) mod device {
         let thrust = if start_landed != 0 { 0.0 } else { MASS * GRAVITY };
         let state = EnvState {
             episode,
-            target: spec.target,
+            target: [spec.target[0], spec.target[1], spec.target[2], spec.stats[2]],
             action: [0.0; 4],
             prev_action: [0.0; 4],
             gps_offset: pack(gps),
+            yaw_setpoint: heading_quat(rot),
             initial_distance: d0,
             previous_distance: length(sub(target, position)),
             visible_start: spec.stats[0],
@@ -367,6 +380,7 @@ pub(crate) mod device {
             start_landed,
             landed: start_landed,
             event: 0,
+            gps_available: gps_available as u32,
         };
         let body = BodyState {
             position: pack(position),
@@ -432,15 +446,21 @@ pub(crate) mod device {
         let forward = if length(fwd_h) > 1.0e-6 { normalize(fwd_h) } else { [0.0, 0.0, -1.0] };
         let right = [-forward[2], 0.0, forward[0]];
         unsafe {
-            put3(s, 14, [dot(rel, right) / GPS_SCALE, rel[1] / GPS_SCALE, -dot(rel, forward) / GPS_SCALE]);
+            let gps_on = st.gps_available != 0;
+            let hint = [dot(rel, right) / GPS_SCALE, rel[1] / GPS_SCALE, -dot(rel, forward) / GPS_SCALE];
+            put3(s, 14, if gps_on { hint } else { [0.0; 3] });
             let remaining = if st.step >= HORIZON { 0.0 } else { (HORIZON - st.step) as f32 / HORIZON as f32 };
             put(s, 17, remaining);
+            put(s, 18, if gps_on { 1.0 } else { 0.0 });
         }
 
         // Privileged (critic-only) state.
         let (eye_off, cam_forward, cam_up) = camera_basis(q);
         let eye = add(p, eye_off);
-        let seen = unsafe { visible(buffers, config, eye, cam_forward, cam_up, target) };
+        let (ndc, in_frustum) = project(config, eye, cam_forward, cam_up, target);
+        let seen = in_frustum && !unsafe {
+            sweep_hits(buffers.nodes, config.node_count, buffers.triangles, eye, target, 0.0, LANDABLE)
+        };
         let rel_true = sub(target, p);
         let rel_body = rotate_inverse(q, rel_true);
         let pv = unsafe { buffers.privileged.add(i * PRIVILEGED_DIM) };
@@ -454,6 +474,9 @@ pub(crate) mod device {
             put(pv, 15, if st.bucket == 0 { 1.0 } else { 0.0 });
             put(pv, 16, if st.bucket == 1 { 1.0 } else { 0.0 });
             put(pv, 17, if st.bucket == 2 { 1.0 } else { 0.0 });
+            put(pv, 18, ndc[0]);
+            put(pv, 19, ndc[1]);
+            put(pv, 20, if in_frustum { 1.0 } else { 0.0 });
         }
 
         // Diagnostics.
@@ -473,7 +496,7 @@ pub(crate) mod device {
             put(dg, 20, st.initial_distance);
             put(dg, 21, st.visible_start);
             put(dg, 22, (st.episode & 0xFF_FFFF) as f32);
-            put(dg, 23, 0.0);
+            put(dg, 23, if st.gps_available != 0 { 1.0 } else { 0.0 });
             *buffers.design.add(i) = st.design as i32;
             *buffers.episodes.add(i) = st.episode;
         }
@@ -485,18 +508,98 @@ pub(crate) mod device {
         }
     }
 
+    // Yaw-only quaternion (rotation about world +y) of the horizontal heading of rotation `q`.
+    // A vertical body has no horizontal heading and maps to identity.
+    #[inline(always)]
+    fn heading_quat(q: [f32; 4]) -> [f32; 4] {
+        let fwd = rotate(q, [0.0, 0.0, -1.0]);
+        let l = float::sqrt_rn_f32(fwd[0] * fwd[0] + fwd[2] * fwd[2]);
+        if l < 1.0e-6 {
+            return [0.0, 0.0, 0.0, 1.0];
+        }
+        let y = -fwd[0] / l;
+        let w = 1.0 - fwd[2] / l;
+        let n = float::sqrt_rn_f32(y * y + w * w);
+        if n < 1.0e-6 {
+            return [0.0, 1.0, 0.0, 0.0];
+        }
+        [0.0, y / n, 0.0, w / n]
+    }
+
+    // Minimal-arc quaternion taking world +y to unit vector `u` (requires u[1] > -1).
+    #[inline(always)]
+    fn tilt_quat(u: [f32; 3]) -> [f32; 4] {
+        quat_normalize([u[2], 0.0, -u[0], 1.0 + u[1]])
+    }
+
+    // Velocity-mode outer loop for one physics substep. Actions are forward, right, up and yaw
+    // rate in [-1, 1]. Returns the body-frame rate command and collective thrust that track the
+    // velocity setpoint, and advances the yaw setpoint. Idle (on ground, a[2] <= 0) holds level.
+    #[inline(always)]
+    fn velocity_command(a: [f32; 4], st: &mut EnvState, q: [f32; 4], v: [f32; 3], on_ground: bool,
+        dt: f32) -> ([f32; 3], f32) {
+        if on_ground {
+            st.yaw_setpoint = heading_quat(q);
+        }
+        let idle = on_ground && a[2] <= 0.0;
+        if !idle {
+            let yq = quat_normalize([0.0, 0.5 * YAW_RATE_MAX * a[3] * dt, 0.0, 1.0]);
+            st.yaw_setpoint = quat_normalize(quat_mul(yq, st.yaw_setpoint));
+        }
+
+        let fwd_w = rotate(q, [0.0, 0.0, -1.0]);
+        let fwd_h = [fwd_w[0], 0.0, fwd_w[2]];
+        let forward = if length(fwd_h) > 1.0e-6 { normalize(fwd_h) } else { [0.0, 0.0, -1.0] };
+        let right = [-forward[2], 0.0, forward[0]];
+        let stick = float::sqrt_rn_f32(a[0] * a[0] + a[1] * a[1]);
+        let gain = if stick > 1.0 { 1.0 / stick } else { 1.0 };
+        let h = scale(add(scale(forward, a[0]), scale(right, a[1])), gain * VELOCITY_MAX_HORIZONTAL);
+        let v_cmd = [h[0], a[2] * VELOCITY_MAX_VERTICAL, h[2]];
+
+        let up_body = rotate(q, [0.0, 1.0, 0.0]);
+        let a_tot = if idle {
+            [0.0, GRAVITY, 0.0]
+        } else {
+            // Drag feedforward: the dynamics apply -DRAG * v_body (rotated to world) per unit mass,
+            // so cancelling that at the commanded velocity needs +DRAG * v_cmd_body / MASS in world.
+            let v_cmd_b = rotate_inverse(q, v_cmd);
+            let drag_ff = rotate(q, [DRAG[0] * v_cmd_b[0], DRAG[1] * v_cmd_b[1], DRAG[2] * v_cmd_b[2]]);
+            let a_des = add(scale(sub(v_cmd, v), VELOCITY_GAIN), scale(drag_ff, 1.0 / MASS));
+            let up_acc = maxf(a_des[1] + GRAVITY, MIN_VERTICAL_ACCEL_FRACTION * GRAVITY);
+            let h_lim = MAX_TILT_TAN * up_acc;
+            let h_norm = float::sqrt_rn_f32(a_des[0] * a_des[0] + a_des[2] * a_des[2]);
+            let k = if h_norm > h_lim { h_lim / h_norm } else { 1.0 };
+            [a_des[0] * k, up_acc, a_des[2] * k]
+        };
+        let thrust = if idle { 0.0 } else { clampf(MASS * dot(a_tot, up_body), 0.0, MAX_THRUST) };
+
+        // Attitude: tilt toward the desired specific-force direction, then yaw about the setpoint.
+        let q_d = quat_mul(tilt_quat(normalize(a_tot)), st.yaw_setpoint);
+        let q_e = quat_mul([-q[0], -q[1], -q[2], q[3]], q_d);
+        // Small-angle rotation vector of the body-frame error (2 * vector part, shortest arc).
+        let sign = if q_e[3] < 0.0 { -2.0 } else { 2.0 };
+        let omega = [
+            clampf(ATTITUDE_GAIN * sign * q_e[0], -MAX_RATES[0], MAX_RATES[0]),
+            clampf(ATTITUDE_GAIN * sign * q_e[1], -MAX_RATES[1], MAX_RATES[1]),
+            clampf(ATTITUDE_GAIN * sign * q_e[2], -MAX_RATES[2], MAX_RATES[2]),
+        ];
+        (omega, thrust)
+    }
+
     // Advances env `i` by one control step (SUBSTEPS physics substeps), applying `action`.
     #[inline(always)]
     unsafe fn control_env(buffers: Buffers, config: Config, i: usize, actions: *const f32) {
         let mut st = unsafe { *buffers.states.add(i) };
         let mut body = unsafe { *buffers.bodies.add(i) };
 
+        let rates = config.control_mode == CONTROL_RATES;
         let mut a = [0.0f32; 4];
         let mut k = 0usize;
         while k < 4 {
             let raw = unsafe { *actions.add(i * 4 + k) };
             a[k] = if raw != raw {
-                if k == 0 { -1.0 } else { 0.0 }
+                // NaN: rates mode treats thrust as idle; velocity mode commands zero everywhere.
+                if rates && k == 0 { -1.0 } else { 0.0 }
             } else {
                 clampf(raw, -1.0, 1.0)
             };
@@ -505,18 +608,22 @@ pub(crate) mod device {
         st.prev_action = st.action;
         st.action = a;
 
-        // Body-frame rate commands: x = pitch (a2), y = yaw (a3), z = roll (a1, sign flipped).
-        let omega_cmd = [MAX_RATES[0] * a[2], MAX_RATES[1] * a[3], -MAX_RATES[2] * a[1]];
-        let thrust_cmd = (a[0] + 1.0) * 0.5 * MAX_THRUST;
+        // Rates mode: body-rate and thrust commands are fixed for the whole control step.
+        let rate_cmd = [MAX_RATES[0] * a[2], MAX_RATES[1] * a[3], -MAX_RATES[2] * a[1]];
+        let rate_thrust = (a[0] + 1.0) * 0.5 * MAX_THRUST;
         let dt = 1.0 / PHYSICS_HZ as f32;
 
         let mut event = 0u32;
-        let mut landed = 0u32;
+        let mut on_ground = st.landed != 0;
         let mut s = 0u32;
         while s < SUBSTEPS && event == 0 {
-            st.thrust += (thrust_cmd - st.thrust) * clampf(dt / THRUST_TAU, 0.0, 1.0);
-
             let q = body.rotation;
+            let (omega_cmd, thrust_cmd) = if rates {
+                (rate_cmd, rate_thrust)
+            } else {
+                velocity_command(a, &mut st, q, xyz(body.velocity), on_ground, dt)
+            };
+            st.thrust += (thrust_cmd - st.thrust) * clampf(dt / THRUST_TAU, 0.0, 1.0);
             let w_world = xyz(body.angular_velocity);
             let w_b = rotate_inverse(q, w_world);
             let iw = [INERTIA[0] * w_b[0], INERTIA[1] * w_b[1], INERTIA[2] * w_b[2]];
@@ -578,11 +685,11 @@ pub(crate) mod device {
             body.velocity = pack(v_next);
             body.rotation = q_next;
             body.angular_velocity = pack(w_final);
-            landed = contact;
+            on_ground = contact != 0;
             s += 1;
         }
 
-        st.landed = landed;
+        st.landed = if on_ground { 1 } else { 0 };
         st.event = event;
         st.step += 1;
         unsafe {
@@ -604,7 +711,7 @@ pub(crate) mod device {
 
         let crash = st.event & EVENT_CRASH != 0;
         let oob = st.event & EVENT_OOB != 0;
-        let success = !crash && !oob && d <= SUCCESS_RADIUS && speed <= SUCCESS_SPEED;
+        let success = !crash && !oob && d <= st.target[3] && speed <= SUCCESS_SPEED;
         let done = crash || oob || success || st.step >= HORIZON;
 
         let mut da2 = 0.0f32;
@@ -634,6 +741,7 @@ pub(crate) mod device {
             *buffers.collision.add(i) = if crash { 1.0 } else { 0.0 };
             *buffers.oob.add(i) = if oob { 1.0 } else { 0.0 };
             *buffers.bucket.add(i) = if done { st.bucket as f32 } else { -1.0 };
+            *buffers.gps_available.add(i) = if done { st.gps_available as f32 } else { -1.0 };
         }
         st.previous_distance = d;
         unsafe { *buffers.states.add(i) = st };
@@ -657,6 +765,7 @@ pub(crate) mod device {
             *buffers.collision.add(i) = 0.0;
             *buffers.oob.add(i) = 0.0;
             *buffers.bucket.add(i) = -1.0;
+            *buffers.gps_available.add(i) = -1.0;
             observe_env(buffers, config, i);
         }
     }

@@ -4,6 +4,7 @@ import unittest
 import torch
 
 from sim_rl.model import ActorCritic
+from sim_rl.native import PRIVILEGED_WIDTH, PROPRIO_WIDTH
 from sim_rl.ppo import terminal_gae
 
 
@@ -26,8 +27,8 @@ class TerminalGAETest(unittest.TestCase):
     def test_gru_start_discards_previous_episode_memory(self):
         torch.manual_seed(7)
         policy = ActorCritic("hint", 0, 0, 15, 20, action_dim=4)
-        proprio = torch.randn(3, 18)
-        inputs = policy.actor_inputs(None, None, None, proprio, torch.randn(3, 18))
+        proprio = torch.randn(3, PROPRIO_WIDTH)
+        inputs = policy.actor_inputs(None, None, None, proprio, torch.randn(3, PRIVILEGED_WIDTH))
         old = torch.randn(3, policy.hidden_size)
         mean_a, hidden_a = policy.step(inputs, old, torch.ones(3))
         mean_b, hidden_b = policy.step(inputs, torch.zeros_like(old), torch.zeros(3))

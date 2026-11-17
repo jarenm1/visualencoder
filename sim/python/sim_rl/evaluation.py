@@ -4,30 +4,66 @@ from __future__ import annotations
 import torch
 
 from .curriculum import BUCKETS, UNIFORM_WEIGHTS
-from .ppo import HOVER_ACTION, gpu_range
+from .native import HOVER_ACTIONS
+from .ppo import gpu_range
 from .stats import wilson
 
-HEURISTICS = ("hover", "random")
+GPS_SPEED_GAIN = 0.5             # 1/s, proportional horizontal and vertical gain on GPS error (metres)
+GPS_MAX_HORIZONTAL = 4.0         # m/s
+GPS_MAX_VERTICAL = 2.0           # m/s
+GPS_MAX_YAW_RATE = 1.5           # rad/s
+# proprio lanes 14..16 hold the GPS hint (right, up, -forward) in metres / 32; lane 18 is gps_available.
+GPS_HINT_SCALE = 32.0
+GPS_LANE = 18
 FIELDS = ("completed", "success", "collision", "out_of_bounds", "timeout", "success_steps",
           "return", "return_squared", "steps")
 
 
+def heuristics_for(control_mode):
+    """Blind hover and random baselines in both modes; the GPS pursuit needs velocity commands."""
+    return ("hover", "random", "gps") if control_mode == "velocity" else ("hover", "random")
+
+
+def gps_pursuit(proprio, action_scales):
+    """Velocity-mode GPS pursuit: float32 [n, 4] actions from the proprio GPS hint.
+
+    Commands are proportional to the GPS error and capped; yaw turns toward the target
+    bearing. Environments without GPS receive a zero (hover) command. Commands are divided by
+    the native action scales, so actions are in [-1, 1] before clamping.
+    """
+    right = proprio[:, 14] * GPS_HINT_SCALE
+    up = proprio[:, 15] * GPS_HINT_SCALE
+    forward = -proprio[:, 16] * GPS_HINT_SCALE
+    horizontal = torch.stack((forward, right), dim=-1) * GPS_SPEED_GAIN
+    speed = horizontal.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    horizontal = horizontal * (speed.clamp(max=GPS_MAX_HORIZONTAL) / speed)
+    vertical = (up * GPS_SPEED_GAIN).clamp(-GPS_MAX_VERTICAL, GPS_MAX_VERTICAL)
+    bearing = torch.atan2(right, forward)
+    yaw_rate = (-bearing).clamp(-GPS_MAX_YAW_RATE, GPS_MAX_YAW_RATE)
+    command = torch.stack((horizontal[:, 0], horizontal[:, 1], vertical, yaw_rate), dim=-1)
+    scale = torch.tensor(action_scales, device=proprio.device, dtype=torch.float32)
+    actions = (command / scale).clamp(-1, 1)
+    available = proprio[:, GPS_LANE:GPS_LANE + 1]
+    return actions * available
+
+
 @torch.no_grad()
-def evaluate(env, features, policy=None, heuristic=None, seed=0):
+def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0):
     """Deterministic policy (clamped mean) or blind heuristic over one reset of the native finite horizon.
 
-    Curriculum is uniform over visibility buckets. Outcomes are exclusive
-    (success > collision > out_of_bounds > timeout) and recorded only for each
+    Curriculum is uniform over visibility buckets with p_no_gps = ``no_gps``. Outcomes are
+    exclusive (success > collision > out_of_bounds > timeout) and recorded only for each
     environment's first completed episode.
     """
     if (policy is None) == (heuristic is None):
         raise ValueError("provide exactly one trained policy or blind heuristic")
-    if heuristic is not None and heuristic not in HEURISTICS:
-        raise ValueError(f"unknown blind heuristic {heuristic}")
+    if heuristic is not None and heuristic not in heuristics_for(env.control_mode):
+        raise ValueError(f"blind heuristic {heuristic} is unavailable in {env.control_mode} mode")
     if policy is not None and policy.mode != ("visual" if features.visual else features.spec):
         raise ValueError("policy mode differs from the frozen feature arm")
     n, device = env.n, env.device
-    env.write_curriculum(torch.tensor(UNIFORM_WEIGHTS, device=device, dtype=torch.float32))
+    lanes = torch.tensor(UNIFORM_WEIGHTS + (no_gps,), device=device, dtype=torch.float32)
+    env.write_curriculum(lanes)
     env.reset(seed)
     goals = features.goal_table(env.goal_images) if features.visual else None
     start_landed = env.diagnostics[:, 19].clamp(0, 1).clone()
@@ -42,7 +78,7 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0):
     starts = torch.ones(n, device=device)
     actions = torch.empty((n, env.action_dim), device=device)
     hidden = torch.zeros((n, policy.hidden_size), device=device) if policy is not None else None
-    hover = torch.tensor(HOVER_ACTION, device=device).expand(n, -1)
+    hover = torch.tensor(HOVER_ACTIONS[env.control_mode], device=device).expand(n, -1)
     generator = torch.Generator(device=device).manual_seed(seed)
     if policy is not None:
         policy.eval()
@@ -51,11 +87,13 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0):
             if policy is not None:
                 cls, tokens = features.observe(env) if features.visual else (None, None)
                 goal = goals[env.design.long()] if features.visual else None
-                inputs = policy.actor_inputs(cls, tokens, goal, env.proprio, env.privileged)
+                inputs, _ = policy.actor_inputs_and_features(cls, tokens, goal, env.proprio, env.privileged)
                 mean, hidden = policy.step(inputs, hidden, starts)
                 actions.copy_(mean.clamp(-1, 1))
             elif heuristic == "hover":
                 actions.copy_(hover)
+            elif heuristic == "gps":
+                actions.copy_(gps_pursuit(env.proprio, env.action_scales))
             else:
                 actions.copy_(torch.rand((n, env.action_dim), device=device, generator=generator) * 2 - 1)
             env.step(actions)
@@ -85,7 +123,7 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0):
     if unfinished.item() != 0 or round(values[0]) != n:
         raise RuntimeError(f"native finite horizon violated: {n - round(values[0])} environments unfinished")
     cells = table.cpu().tolist()
-    return summarize(n, cells, policy=heuristic or "checkpoint", horizon=env.horizon)
+    return summarize(n, cells, policy=heuristic or "checkpoint", horizon=env.horizon, no_gps=no_gps)
 
 
 def _aggregate(cells, buckets, landed):
@@ -104,9 +142,9 @@ def _rates(values):
             "mean_success_steps": success_steps / success if success else None}
 
 
-def summarize(n, cells, policy, horizon):
+def summarize(n, cells, policy, horizon, no_gps):
     overall = _aggregate(cells, range(3), range(2))
-    result = {"policy": policy, "horizon_terminal": horizon, **_rates(overall)}
+    result = {"policy": policy, "horizon_terminal": horizon, "no_gps_fraction": no_gps, **_rates(overall)}
     returns, squares = overall[6], overall[7]
     mean_return = returns / n
     result["mean_return"] = mean_return
@@ -115,4 +153,7 @@ def summarize(n, cells, policy, horizon):
                          for b, name in enumerate(BUCKETS)}
     result["start_landed"] = {"flying": _rates(_aggregate(cells, range(3), [0])),
                               "landed": _rates(_aggregate(cells, range(3), [1]))}
+    result["bucket_start"] = {name: {"flying": _rates(_aggregate(cells, [b], [0])),
+                                     "landed": _rates(_aggregate(cells, [b], [1]))}
+                              for b, name in enumerate(BUCKETS)}
     return result

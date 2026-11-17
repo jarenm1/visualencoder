@@ -33,13 +33,13 @@ unsafe fn environment<'a>(handle: *mut c_void) -> Result<&'a mut Env> {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sim_env_create(n: u32, seed: u64, width: u32, height: u32, style: u32,
-    city_path: *const c_char) -> *mut c_void {
+    control_mode: u32, city_path: *const c_char) -> *mut c_void {
     boundary(std::ptr::null_mut(), || {
         ensure!(!city_path.is_null(), "city_path must not be null");
         // SAFETY: caller supplies a readable, NUL-terminated UTF-8 path.
         let path = unsafe { CStr::from_ptr(city_path) }.to_str()?;
         ensure!(!path.is_empty(), "city_path must not be empty");
-        Ok(Box::into_raw(Box::new(Env::new(n, seed, width, height, style, Path::new(path))?)).cast())
+        Ok(Box::into_raw(Box::new(Env::new(n, seed, width, height, style, control_mode, Path::new(path))?)).cast())
     })
 }
 

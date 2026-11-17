@@ -1,4 +1,8 @@
-"""Visibility-bucket curriculum: GPU-resident weights written into native field 11."""
+"""Visibility-bucket curriculum: GPU-resident lanes written into native field 11.
+
+Lanes are [w_visible, w_partial, w_hidden, p_no_gps]. The bucket weights adapt
+(adaptive mode); p_no_gps is a fixed training-time probability of GPS-denied episodes.
+"""
 from __future__ import annotations
 
 import torch
@@ -42,15 +46,22 @@ def update_weights(weights, ema, floors):
 class Curriculum:
     """Tracks per-bucket success EMAs and weights; ``uniform`` keeps weights fixed."""
 
-    def __init__(self, mode, device):
+    def __init__(self, mode, device, no_gps_fraction):
         if mode not in MODES:
             raise ValueError(f"curriculum must be one of {MODES}")
+        if not 0.0 <= no_gps_fraction <= 1.0:
+            raise ValueError("no_gps_fraction must be in [0, 1]")
         self.mode = mode
         start = START_WEIGHTS if mode == "adaptive" else UNIFORM_WEIGHTS
         self.weights = torch.tensor(start, device=device, dtype=torch.float32)
         self.floors = torch.tensor(FLOORS, device=device, dtype=torch.float32)
+        self.no_gps = torch.tensor([no_gps_fraction], device=device, dtype=torch.float32)
         self.ema = torch.zeros(3, device=device, dtype=torch.float32)
         self.seen = torch.zeros(3, device=device, dtype=torch.bool)
+
+    def lanes(self):
+        """float32[4] device tensor: bucket weights then p_no_gps (device cat, no host transfer)."""
+        return torch.cat((self.weights, self.no_gps))
 
     def observe(self, counts, successes):
         """counts, successes: float32 [3] tensors of completed episodes per bucket this rollout."""
@@ -66,4 +77,4 @@ class Curriculum:
             self.weights = update_weights(self.weights, self.ema, self.floors)
 
     def write(self, env):
-        env.write_curriculum(self.weights)
+        env.write_curriculum(self.lanes())

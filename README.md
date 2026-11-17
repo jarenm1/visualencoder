@@ -110,22 +110,21 @@ Each treatment is evaluated independently on the existing simulator split and UA
 
 `python scripts/show_experiments.py --study mixed` generates that study's paper table without requiring geometry results; `--study geometry` selects the other study. The default requires both completed studies. Missing or incomplete-budget results are errors, not silently omitted.
 
-### GPU-owned visual navigation
+### GPU-owned drone visual-goal RL
 
-The separate [`sim/`](sim/) Cargo workspace supplies Vulkan/wgpu-hal rendering, NVIDIA Rust CUDA physics, external-memory/timeline synchronization, and a GPU-resident navigation task. The Python learner borrows CUDA tensor storage and runs the actual frozen visual encoder plus recurrent PPO on the native stream. The superseded host-staged prototype is removed.
+The separate [`sim/`](sim/) Cargo workspace supplies Vulkan/wgpu-hal rendering, NVIDIA Rust CUDA physics, external-memory/timeline synchronization, and a GPU-resident quadrotor task in the real city: find and reach a target object described by an image. The Python learner borrows CUDA tensor storage and runs the actual frozen visual encoder, a goal-conditioned attention actor and a privileged critic on the native stream. Task, controls, sensors and curriculum are documented in [`sim/README.md`](sim/README.md) and [`sim/python/README.md`](sim/python/README.md).
 
 ```sh
 cd sim && nix develop
 cargo oxide build --arch sm_120 --device-codegen-crate sim_physics,sim_env -- -p sim-env --profile training
 cd ..
 nix develop path:sim --command .venv/bin/python sim/python/train.py profile \
-  --encoder mean --width 320 --height 240 --library .sim-target/training/libsim_env.so \
-  --out runs/gpu-profile
+  --encoder mean --out runs/drone-profile
 ```
 
 Actual collection and PPO-update traces pass the zero-host-staging/wait gate. Initialization, checkpoint export and post-rollout logging are explicit boundaries outside that claim. Learning success and wall-clock training time are separate measurements; an engineering oracle or profiler pass is not an RL result.
 
-Completed visual PPO runs and learned blind/privileged controls are recorded in [`sim/verification.json`](sim/verification.json); the generated paper table is `report/navigation.typ`. Timings include initialization, training and evaluation, not compilation. This is a three-action lateral-gap task with stabilized forward speed and altitude, one PPO training seed, and 128 independent held-out episodes per policy—not full aerodynamic flight.
+The earlier fixed-altitude gap and city-block tasks (`report/navigation.typ`, `report/city-navigation.typ`, `sim/verification.json`) are historical results of superseded task versions; their checkpoints are rejected by the current ABI.
 
 
 ## Jetson Orin Nano deployment

@@ -1,4 +1,4 @@
-"""Generate city-drone visual-goal tables from completed ABI-v3 training runs only."""
+"""Generate city-drone visual-goal tables from completed ABI-v4 training runs only."""
 
 import argparse
 import json
@@ -14,8 +14,9 @@ from sim_rl.native import ABI_VERSION, TASK  # noqa: E402
 LABELS = {"pretrained": "Off-the-shelf ViT-S", "baseline": "Standard-distilled ViT-S",
           "mean": "Paired-consistency ViT-S", "state": "Privileged state", "hint": "Proprioception only"}
 BUCKETS = ("visible", "partial", "hidden")
+GPS_MODES = (("gps", "GPS available"), ("no_gps", "GPS denied"))
 ARM_OF = {spec: arm for arm, spec in ARMS.items()}
-SHARED = ("control_hz", "width", "height", "city_fingerprint")
+SHARED = ("control_hz", "width", "height", "city_fingerprint", "control_mode")
 
 
 def load_run(run):
@@ -23,8 +24,9 @@ def load_run(run):
     final = json.loads((run / "final-test.json").read_text())
     if summary.get("task") != TASK or summary.get("abi_version") != ABI_VERSION:
         raise ValueError(f"{run}: not a {TASK} ABI {ABI_VERSION} result")
-    if final["policy"]["episodes"] < MIN_EPISODES:
-        raise ValueError(f"{run}: fewer than {MIN_EPISODES} independent final episodes")
+    for label, _ in GPS_MODES:
+        if final[label]["policy"]["episodes"] < MIN_EPISODES:
+            raise ValueError(f"{run}: fewer than {MIN_EPISODES} independent final {label} episodes")
     return summary, final
 
 
@@ -35,6 +37,11 @@ def typst_table(headers, rows, caption):
     body = "\n".join("  " + ", ".join(f"[{cell}]" for cell in row) + "," for row in rows)
     return (f"#figure(table(\n  columns: ({columns}),\n  align: ({align}),\n  stroke: none, table.hline(),\n"
             f"  {head},\n  table.hline(stroke: 0.5pt),\n{body}\n  table.hline(),\n), caption: [{caption}])\n\n")
+
+
+def interval(result):
+    low, high = result["success_wilson95"]
+    return f"{result['success']:.3f} [{low:.3f}, {high:.3f}]"
 
 
 def main() -> None:
@@ -50,40 +57,44 @@ def main() -> None:
                 raise ValueError(f"{key} differs between compared runs")
     rows, bucket_rows, measurements = [], [], []
     for run, (summary, final) in zip(args.runs, runs):
-        policy = final["policy"]
-        low, high = policy["success_wilson95"]
-        goal_steps = policy["mean_success_steps"]
+        gps, no_gps = final["gps"]["policy"], final["no_gps"]["policy"]
+        goal_steps = gps["mean_success_steps"]
         arm = ARM_OF.get(summary["encoder"], summary["encoder"])
+        label = LABELS.get(arm, arm)
         elapsed = summary["elapsed_seconds_including_initialization_training_evaluation"]
-        rows.append([LABELS.get(arm, arm), f"{summary['steps']:,}", f"{elapsed / 60:.2f}",
-                     f"{policy['success']:.3f} [{low:.3f}, {high:.3f}]", f"{policy['collision']:.3f}",
+        rows.append([label, f"{summary['steps']:,}", f"{elapsed / 60:.2f}", interval(gps),
+                     interval(no_gps), f"{gps['collision']:.3f}",
                      "—" if goal_steps is None else f"{goal_steps / summary['control_hz']:.2f}"])
-        for name in BUCKETS:
-            bucket = policy["buckets"][name]
-            bucket_rows.append([LABELS.get(arm, arm), name, str(bucket["episodes"]),
-                                "—" if bucket.get("success") is None else f"{bucket['success']:.3f}"])
+        for mode, mode_title in GPS_MODES:
+            for name in BUCKETS:
+                bucket = final[mode]["policy"]["buckets"][name]
+                bucket_rows.append([label, mode_title, name, str(bucket["episodes"]),
+                                    "—" if bucket.get("success") is None else f"{bucket['success']:.3f}"])
         measurements.append({"run": str(run), "encoder": summary["encoder"], "seed": summary["seed"],
                              "summary": summary, "final_test": final})
     fingerprint = json.dumps(first["city_fingerprint"])
-    blind = runs[0][1]["heuristics"]
     text = "== City drone visual-goal navigation\n"
-    text += ("A quadrotor in the imported city must reach a goal shown only in an image. "
-             "Frozen encoder tokens feed a goal-attention actor with proprioception; a GRU PPO learner "
-             "trains on the native ABI-v3 CUDA environment. "
-             "Starts are 50% landed and 50% flying; curriculum buckets are visible, partial and hidden. ")
+    text += (f"A quadrotor in the imported city must reach a goal shown only in an image. Frozen encoder "
+             f"tokens feed a goal-attention actor with proprioception; a GRU PPO learner trains on the native "
+             f"ABI-{ABI_VERSION} CUDA environment with {first['control_mode']} control. Starts are 50% landed and "
+             "50% flying; curriculum buckets are visible, partial and hidden. Training includes an auxiliary "
+             "target-visibility and image-localization loss on privileged labels that the actor never sees. "
+             "Some episodes deny GPS; the GPS hint is then zero and reported separately. ")
     text += (f"Control runs at {first['control_hz']} Hz; frames are {first['width']}×{first['height']} RGB. "
              f"City content fingerprint: #raw({fingerprint}).\n\n")
-    text += ("Each policy is tested on the first completed episode of at least "
-             f"{MIN_EPISODES} environments with uniform bucket weights. Intervals are Wilson 95% over test episodes. "
+    text += (f"Each policy is tested on the first completed episode of at least {MIN_EPISODES} environments "
+             "per GPS mode with uniform bucket weights. Intervals are Wilson 95% over test episodes. "
              "Process times include initialization, training and evaluation but exclude compilation.\n\n")
-    text += typst_table(["Actor features", "Transitions", "Minutes", "Success [95% CI] ↑", "Collision ↓",
-                         "Goal (s)"], rows,
+    text += typst_table(["Actor features", "Transitions", "Minutes", "Success, GPS [95% CI] ↑",
+                         "Success, no GPS [95% CI] ↑", "Collision (GPS) ↓", "Goal (s, GPS)"], rows,
                         "Independent visual-goal experiment. Goal time is conditional on success "
                         "(dash: none). No convergence or real-flight transfer claim.")
-    text += typst_table(["Actor features", "Bucket", "Episodes", "Success"], bucket_rows,
+    text += typst_table(["Actor features", "GPS", "Bucket", "Episodes", "Success"], bucket_rows,
                         "Per-visibility-bucket success on the same test episodes.")
-    text += ("Blind controls on the same test episodes: "
-             + ", ".join(f"{name} {blind[name]['success']:.3f}" for name in ("hover", "random")) + ".\n")
+    for mode, mode_title in GPS_MODES:
+        blind = runs[0][1][mode]["heuristics"]
+        text += (f"Blind controls, {mode_title.lower()}, same test episodes: "
+                 + ", ".join(f"{name} {result['success']:.3f}" for name, result in blind.items()) + ".\n")
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(text)
     args.out.with_suffix(".json").write_text(json.dumps(measurements, indent=2) + "\n")

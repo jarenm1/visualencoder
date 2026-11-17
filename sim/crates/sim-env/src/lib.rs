@@ -1,4 +1,4 @@
-//! GPU-resident city drone visual-goal environment (city-drone-goal-v1, ABI v3).
+//! GPU-resident city drone visual-goal environment (city-drone-goal-v1, ABI v4).
 //! See `sim_env.h` for the ABI. Build with cargo oxide and device-codegen-crate sim_physics,sim_env.
 mod ffi;
 mod kernels;
@@ -96,9 +96,12 @@ pub struct Env {
 }
 
 impl Env {
-    pub fn new(n: u32, seed: u64, width: u32, height: u32, style: u32, city_path: &Path) -> Result<Self> {
+    pub fn new(n: u32, seed: u64, width: u32, height: u32, style: u32, control_mode: u32,
+        city_path: &Path) -> Result<Self> {
         ensure!(n > 0, "environment count must be positive");
         ensure!(style <= 2, "style must be 0 (training), 1 (validation), or 2 (final test)");
+        ensure!(control_mode == CONTROL_VELOCITY || control_mode == CONTROL_RATES,
+            "control_mode must be 0 (velocity) or 1 (rates), got {control_mode}");
         ensure!(u64::from(width) * 3 == u64::from(height) * 4,
             "image must be 4:3 (width * 3 == height * 4), got {width}x{height}");
         let shape = ImageShape::new(width, height, n)?;
@@ -211,7 +214,7 @@ impl Env {
             exclusion_rects.push([0.0; 4]);
         }
         let exclusions = DeviceBuffer::from_host(gpu.cuda_stream(), bytemuck::cast_slice(&exclusion_rects))?;
-        let weights_init = [1.0f32 / 3.0; 3];
+        let weights_init = [1.0f32 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 0.0];
         let weights = DeviceBuffer::from_host(gpu.cuda_stream(), bytemuck::cast_slice(&weights_init))?;
 
         let count = n as usize;
@@ -234,6 +237,7 @@ impl Env {
             allocate(count * 4)?,
             allocate(shape_goal.rgb_bytes())?,
             weights,
+            allocate(count * 4)?,
             allocate(count * 4)?,
             allocate(count * 4)?,
         ];
@@ -261,6 +265,7 @@ impl Env {
             catalog_size: CATALOG_SIZE as u32,
             node_count: city.nodes.len() as u32,
             seed,
+            control_mode,
             bucket_first: [catalog.bucket_ranges[0][0], catalog.bucket_ranges[1][0], catalog.bucket_ranges[2][0]],
             bucket_count: [catalog.bucket_ranges[0][1], catalog.bucket_ranges[1][1], catalog.bucket_ranges[2][1]],
             exclusion_count,
@@ -274,7 +279,8 @@ impl Env {
             projection_z: projection[10],
             projection_w: projection[14],
         };
-        let metadata = task_metadata(&city, &catalog, &design_meta, &district, &city_path, style, k_designs)?;
+        let metadata = task_metadata(&city, &catalog, &design_meta, &district, &city_path, style, k_designs,
+            control_mode)?;
         let mut env = Self {
             exchange,
             renderer,
@@ -322,6 +328,7 @@ impl Env {
             bucket: self.outputs[12].cu_deviceptr() as *mut f32,
             episodes: self.outputs[7].cu_deviceptr() as *mut u64,
             design: self.outputs[9].cu_deviceptr() as *mut i32,
+            gps_available: self.outputs[14].cu_deviceptr() as *mut f32,
         }
     }
 
@@ -399,13 +406,23 @@ impl Drop for Env {
 }
 
 fn task_metadata(city: &CityScene, catalog: &drone::Catalog, designs: &[DesignMeta],
-    district: &drone::District, city_path: &Path, style: u32, k_designs: u32) -> Result<CString> {
+    district: &drone::District, city_path: &Path, style: u32, k_designs: u32, control_mode: u32) -> Result<CString> {
     let designs_json: Vec<serde_json::Value> = designs.iter().enumerate()
         .map(|(k, m)| serde_json::json!({"index": k, "name": m.name, "scale_m": m.scale}))
         .collect();
     let exclusions: Vec<serde_json::Value> = district.exclusions.iter()
         .map(|(lo, hi)| serde_json::json!({"min": lo, "max": hi})).collect();
     const SPLIT_NAMES: [&str; 3] = ["train", "validation", "test"];
+    let (control_mode_name, action_names, action_scales, action_map): (&str, Vec<&str>, Vec<f32>, &str) =
+        if control_mode == CONTROL_RATES {
+            ("rates", vec!["thrust", "roll_rate", "pitch_rate", "yaw_rate"],
+                vec![dynamics::MAX_THRUST * 0.5, dynamics::MAX_RATES[2], dynamics::MAX_RATES[0], dynamics::MAX_RATES[1]],
+                "thrust = (a0 + 1) / 2 * max_thrust_N; omega_cmd_body = [3.5*a2 (x, pitch, +: nose up), 2.0*a3 (y, yaw, +: nose left), -3.5*a1 (z, roll, +: right side down)]")
+        } else {
+            ("velocity", vec!["forward", "right", "up", "yaw_rate"],
+                vec![dynamics::VELOCITY_MAX_HORIZONTAL, dynamics::VELOCITY_MAX_HORIZONTAL, dynamics::VELOCITY_MAX_VERTICAL, dynamics::YAW_RATE_MAX],
+                "heading-frame command: horizontal = 4*(a0 forward + a1 right), |(a0,a1)| clamped to 1; up = 2*a2 m/s; yaw_rate = 1.5*a3 rad/s (+: nose left)")
+        };
     let mut json = serde_json::json!({
         "abi_version": ABI_VERSION,
         "task": TASK_NAME,
@@ -416,11 +433,12 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, designs: &[DesignMe
         },
         "action": {
             "dim": ACTION_DIM,
-            "order": ["thrust", "roll_rate", "pitch_rate", "yaw_rate"],
+            "control_mode": control_mode_name,
+            "order": action_names,
+            "scale": action_scales,
             "range": [-1.0, 1.0],
-            "thrust_map": "thrust = (a0 + 1) / 2 * max_thrust_N; a0 = -1 is zero thrust",
-            "rate_map": "omega_cmd_body = [3.5*a2 (pitch, +: nose up), 2.0*a3 (yaw, +: nose left), -3.5*a1 (roll, +: right side down)]",
-            "nan": "NaN a0 -> -1, other NaN -> 0",
+            "map": action_map,
+            "nan": "velocity: NaN -> 0; rates: NaN a0 -> -1, other NaN -> 0",
         },
         "control_hz": dynamics::CONTROL_HZ,
         "physics_hz": dynamics::PHYSICS_HZ,
@@ -448,7 +466,8 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, designs: &[DesignMe
             "near_m": dynamics::CAMERA_NEAR,
             "far_m": dynamics::CAMERA_FAR,
         },
-        "success": {"radius_m": dynamics::SUCCESS_RADIUS, "speed_mps": dynamics::SUCCESS_SPEED},
+        "success": {"radius": "target enclosing-sphere radius + margin, per episode", "margin_m": dynamics::SUCCESS_MARGIN,
+            "speed_mps": dynamics::SUCCESS_SPEED},
         "landing": {"max_speed_mps": dynamics::LANDING_SPEED, "max_tilt_rad": dynamics::LANDING_TILT_RAD},
         "ceiling_m": dynamics::CEILING,
         "reward": {
@@ -463,8 +482,8 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, designs: &[DesignMe
                 "6-8 body velocity (+noise sd 0.1) / 5",
                 "9 height above landable surface (+noise sd 0.03) / 10",
                 "10-13 last applied action",
-                "14-16 noisy target offset in heading frame (x right, y up, z = -forward) / 32",
-                "17 remaining horizon fraction",
+                "14-16 noisy target offset in heading frame (x right, y up, z = -forward) / 32; 0 when GPS unavailable",
+                "17 remaining horizon fraction", "18 gps_available (0/1)",
             ],
         },
         "privileged": {
@@ -472,7 +491,7 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, designs: &[DesignMe
             "layout": [
                 "0-2 target in body frame / 32", "3 distance / 32", "4-6 world velocity / 5",
                 "7-9 body rates / 3.5", "10-13 quaternion xyzw", "14 target visible (0/1)",
-                "15-17 one-hot bucket",
+                "15-17 one-hot bucket", "18-19 target NDC x,y (0 outside frustum)", "20 target in frustum (0/1)",
             ],
         },
         "diagnostics": {
@@ -481,7 +500,7 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, designs: &[DesignMe
                 "0-2 position", "3-5 target", "6-9 quaternion xyzw", "10-12 world velocity",
                 "13 thrust N", "14 design", "15 bucket", "16 catalog index", "17 step",
                 "18 landed", "19 start landed", "20 initial distance", "21 visible fraction at start",
-                "22 episode (low 24 bits)", "23 reserved 0",
+                "22 episode (low 24 bits)", "23 gps_available (0/1)",
             ],
         },
         "designs": designs_json,
@@ -514,9 +533,10 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, designs: &[DesignMe
             {"index": 8, "name": "diagnostics", "dtype": "float32", "shape": ["n", DIAGNOSTIC_DIM]},
             {"index": 9, "name": "design", "dtype": "int32", "shape": ["n"]},
             {"index": 10, "name": "goal", "dtype": "float32", "shape": [k_designs, 3, "H", "W"]},
-            {"index": 11, "name": "bucket_weights", "dtype": "float32", "shape": [3]},
+            {"index": 11, "name": "bucket_weights", "dtype": "float32", "shape": [4]},
             {"index": 12, "name": "bucket", "dtype": "float32", "shape": ["n"]},
             {"index": 13, "name": "oob", "dtype": "float32", "shape": ["n"]},
+            {"index": 14, "name": "gps_available", "dtype": "float32", "shape": ["n"]},
         ],
     });
     // Flat keys consumed by learner/replay checks (inserted after the macro to
@@ -524,6 +544,21 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, designs: &[DesignMe
     json["style"] = style.into();
     json["split"] = SPLIT_NAMES[style as usize].into();
     json["action_dim"] = ACTION_DIM.into();
+    json["control_mode"] = control_mode_name.into();
+    json["action_names"] = action_names.into();
+    json["action_scales"] = action_scales.into();
+    if control_mode != CONTROL_RATES {
+        json["velocity_loop"] = serde_json::json!({
+            "p_gain_per_s": dynamics::VELOCITY_GAIN,
+            "drag_feedforward": "a_des = p_gain * (v_cmd - v) + rotate(q, DRAG * R(q)^T v_cmd) / mass (m/s^2); cancels the body-frame linear drag (force = -DRAG * v_body) at the commanded velocity",
+            "drag_n_s_per_m": dynamics::DRAG,
+            "mass_kg": dynamics::MASS,
+        });
+    }
+    json["gps"] = serde_json::json!({
+        "radius_m": [GPS_MIN_RADIUS, GPS_MAX_RADIUS], "vertical_m": GPS_VERTICAL,
+        "per_episode_available": "unit >= weights[3] (p_no_gps): weights[3]=1 never available, 0 always",
+    });
     json["design_count"] = k_designs.into();
     json["city_fingerprint"] = city.fingerprint.clone().into();
     json["city_path"] = city_path.display().to_string().into();

@@ -26,7 +26,9 @@ const PALETTE: [[f32; 3]; VARIANTS] = [
     [0.95, 0.50, 0.10],
     [0.10, 0.75, 0.80],
 ];
-const SCALE_RANGE: [f32; 2] = [0.7, 1.0];
+/// Edge length of the unit design in metres: at the 20 m maximum start distance a 1.5 m
+/// target spans about one 16 px encoder patch at 320x240 with the 75-degree camera.
+const SCALE_RANGE: [f32; 2] = [1.5, 2.5];
 const _: () = assert!(SPLIT_SIZES[0] + SPLIT_SIZES[1] + SPLIT_SIZES[2] == SHAPES.len() * VARIANTS);
 
 const SURFACE_SAMPLES: usize = 64;
@@ -39,15 +41,17 @@ const MAX_ATTEMPTS: u32 = 256;
 const DISTRICT_HALF: f32 = 48.0;
 const EXCLUSION_MARGIN: f32 = 16.0;
 const DISTRICT_MARGIN: f32 = 2.0;
-const TARGET_HEIGHT: [f32; 2] = [1.0, 6.0];
+const TARGET_HEIGHT: [f32; 2] = [2.0, 7.0];
 const TARGET_CLEARANCE: f32 = 1.0;
+/// Bottom of the target's enclosing sphere stays this far above the landable plane.
+const TARGET_GROUND_CLEARANCE: f32 = 0.5;
 const FLYING_HEIGHT: [f32; 2] = [1.5, 12.0];
 const FLYING_CLEARANCE: f32 = 1.0;
 /// 15 degrees.
 const START_TILT_RAD: f32 = core::f32::consts::PI / 12.0;
 const START_SPEED: f32 = 2.0;
 const START_RATE: f32 = 0.5;
-const START_TARGET_DISTANCE: [f32; 2] = [6.0, 40.0];
+const START_TARGET_DISTANCE: [f32; 2] = [4.0, 20.0];
 /// Aspect ratio used by the visibility frustum. Catalogue construction takes no image
 /// size, so this is fixed here; renders must use the same aspect for the buckets to match.
 const CATALOG_ASPECT: f32 = 4.0 / 3.0;
@@ -245,7 +249,8 @@ fn attempt(ctx: &Ctx, slot: &Slot, rng: &mut Rng) -> Option<Candidate> {
     let target_y = plane + rng.range(TARGET_HEIGHT[0], TARGET_HEIGHT[1]);
     let target = Vec3::new(target_xz[0], target_y, target_xz[1]);
     let enclosing = slot.scale * slot.radius;
-    if scene.sweep_hits(target.to_array(), target.to_array(), TARGET_CLEARANCE + enclosing, LANDABLE) {
+    if target_y - enclosing < plane + TARGET_GROUND_CLEARANCE
+        || scene.sweep_hits(target.to_array(), target.to_array(), TARGET_CLEARANCE + enclosing, LANDABLE) {
         return None;
     }
 
@@ -254,7 +259,7 @@ fn attempt(ctx: &Ctx, slot: &Slot, rng: &mut Rng) -> Option<Candidate> {
     let start_y = if landed { plane + drone::RADIUS } else { plane + rng.range(FLYING_HEIGHT[0], FLYING_HEIGHT[1]) };
     let distance = rng.range(START_TARGET_DISTANCE[0], START_TARGET_DISTANCE[1]);
     let dy = start_y - target_y;
-    if dy.abs() >= distance {
+    if dy.abs() >= distance || distance <= enclosing + drone::SUCCESS_MARGIN + drone::RADIUS {
         return None;
     }
     let horizontal = (distance * distance - dy * dy).sqrt();
@@ -313,7 +318,7 @@ fn attempt(ctx: &Ctx, slot: &Slot, rng: &mut Rng) -> Option<Candidate> {
             start_rates: rates.extend(0.0).to_array(),
             target: target.extend(0.0).to_array(),
             meta: [slot.index, bucket as u32, landed as u32, 0],
-            stats: [fraction, start.distance(target), 0.0, 0.0],
+            stats: [fraction, start.distance(target), enclosing + drone::SUCCESS_MARGIN, 0.0],
         },
     })
 }
@@ -381,6 +386,9 @@ fn rules(scene: &CityScene, ctx: &Ctx, size: usize, counts: [usize; BUCKETS]) ->
         "target": {
             "height_above_landable_m": TARGET_HEIGHT,
             "clearance_m": TARGET_CLEARANCE,
+            "ground_clearance_m": TARGET_GROUND_CLEARANCE,
+            "size_m": SCALE_RANGE,
+            "success_radius": "enclosing sphere radius of the scaled design + 1.0 m, per episode (EpisodeSpec.stats[2])",
             "clearance_radius": "enclosing sphere of scaled design",
             "district_margin_m": DISTRICT_MARGIN,
         },

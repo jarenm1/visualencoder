@@ -1,4 +1,4 @@
-/* city-drone-goal-v1, C ABI v3.
+/* city-drone-goal-v1, C ABI v4.
  *
  * All tensor storage is CUDA device memory on the stream returned by
  * sim_env_stream(). Buffers are valid until sim_env_destroy(). Calls must be
@@ -14,13 +14,13 @@
 extern "C" {
 #endif
 
-#define SIM_ENV_ABI_VERSION 3
+#define SIM_ENV_ABI_VERSION 4
 
 /* Field identifiers for sim_env_buffer(). */
 enum sim_env_field {
     /* float32 [n, 3, H, W]: RGB observation, values in [0, 1]. */
     SIM_ENV_FIELD_RGB = 0,
-    /* float32 [n, 18]: proprioceptive sensors (see metadata "sensors"). */
+    /* float32 [n, 19]: proprioceptive sensors (see metadata "sensors"). */
     SIM_ENV_FIELD_SENSORS = 1,
     /* float32 [n]: reward of the transition just taken. */
     SIM_ENV_FIELD_REWARD = 2,
@@ -28,7 +28,7 @@ enum sim_env_field {
     SIM_ENV_FIELD_DONE = 3,
     /* float32 [n]: 1 if the episode succeeded on this transition, else 0. */
     SIM_ENV_FIELD_SUCCESS = 4,
-    /* float32 [n, 18]: privileged state, for critics only (see metadata). */
+    /* float32 [n, 21]: privileged state, for critics only (see metadata). */
     SIM_ENV_FIELD_PRIVILEGED = 5,
     /* float32 [n]: 1 if the drone crashed (collision or hard landing), else 0. */
     SIM_ENV_FIELD_COLLISION = 6,
@@ -40,21 +40,25 @@ enum sim_env_field {
     SIM_ENV_FIELD_DESIGN = 9,
     /* float32 [K, 3, H, W]: rendered goal image per target design (static). */
     SIM_ENV_FIELD_GOAL = 10,
-    /* float32 [3]: bucket sampling weights; writable by the caller. */
+    /* float32 [4]: [w_visible, w_partial, w_hidden, p_no_gps] sampling weights and
+     * per-episode GPS-outage probability; writable by the caller. */
     SIM_ENV_FIELD_BUCKET_WEIGHTS = 11,
     /* float32 [n]: bucket of the episode ended on this transition (-1 if not done). */
     SIM_ENV_FIELD_BUCKET = 12,
     /* float32 [n]: 1 if the drone left the district or ceiling, else 0. */
     SIM_ENV_FIELD_OOB = 13,
-    SIM_ENV_FIELD_COUNT = 14
+    /* float32 [n]: 1 if GPS was available for the episode ended on this transition, else 0; -1 if not done. */
+    SIM_ENV_FIELD_GPS_AVAILABLE = 14,
+    SIM_ENV_FIELD_COUNT = 15
 };
 
 /* Creates an environment batch of n drones.
  * width * 3 must equal height * 4 (fixed 4:3 visibility and camera projection).
  * style: 0 training, 1 validation, 2 test.
+ * control_mode: 0 velocity (PX4-style offboard), 1 body rates (v3 inner loop).
  * Returns NULL on failure. */
 void *sim_env_create(uint32_t n, uint64_t seed, uint32_t width, uint32_t height,
-                     uint32_t style, const char *city_path);
+                     uint32_t style, uint32_t control_mode, const char *city_path);
 
 /* Null-terminated UTF-8 JSON describing layouts, dynamics and sign conventions.
  * Owned by the environment; valid until sim_env_destroy(). */
@@ -64,8 +68,9 @@ const char *sim_env_metadata(void *env);
 int sim_env_reset(void *env, uint64_t seed);
 
 /* Steps all environments. actions: float32 [n, 4] on the environment stream,
- * each component clamped to [-1, 1]. Layout per env: (thrust, roll-like, pitch-like, yaw-like).
- * Caller must order producers before sim_env_stream(). */
+ * each component clamped to [-1, 1]. Layout per env is given by metadata
+ * "action" (velocity: forward, right, up, yaw_rate; rates: thrust, roll_rate,
+ * pitch_rate, yaw_rate). Caller must order producers before sim_env_stream(). */
 int sim_env_step(void *env, const float *actions);
 
 /* Device pointer to field storage (see enum), or 0 on error. */

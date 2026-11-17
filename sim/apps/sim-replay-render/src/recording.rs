@@ -4,7 +4,9 @@ use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
 pub const FORMAT: &str = "sim-city-replay-v2";
-const TRANSITION_FIELDS: [&str; 9] = ["throttle", "roll", "pitch", "yaw", "reward", "done", "success", "collision", "out_of_bounds"];
+/// Four control channels (named by `action_names`) followed by these outcome fields.
+const OUTCOME_FIELDS: [&str; 5] = ["reward", "done", "success", "collision", "out_of_bounds"];
+const TRANSITION_WIDTH: usize = 4 + OUTCOME_FIELDS.len();
 const STATE_FIELDS: [&str; 13] = ["world_x", "world_y", "world_z", "quat_x", "quat_y", "quat_z", "quat_w",
     "target_x", "target_y", "target_z", "design", "clock", "landed"];
 
@@ -21,6 +23,7 @@ pub struct Recording {
     pub city_path: PathBuf,
     pub city_fingerprint: String,
     pub state_fields: Vec<String>,
+    pub action_names: Vec<String>,
     pub transition_fields: Vec<String>,
     pub environments: Vec<Environment>,
 }
@@ -106,8 +109,11 @@ impl Recording {
         ensure!(self.views.first_person == [0, 0, self.frame_width, self.frame_height]
             && self.views.third_person == [self.frame_width, 0, self.frame_width, self.frame_height],
             "manifest view rectangles do not match side-by-side video layout");
-        ensure!(self.transition_fields.iter().map(String::as_str).eq(TRANSITION_FIELDS),
-            "transition_fields must be exactly {TRANSITION_FIELDS:?}");
+        ensure!(self.action_names.len() == 4, "action_names must name exactly four control channels");
+        ensure!(self.transition_fields.len() == TRANSITION_WIDTH
+            && self.transition_fields[..4] == self.action_names[..]
+            && self.transition_fields[4..].iter().map(String::as_str).eq(OUTCOME_FIELDS),
+            "transition_fields must be action_names followed by {OUTCOME_FIELDS:?}");
         ensure!(STATE_FIELDS.iter().all(|name| self.state_fields.iter().any(|field| field == name)),
             "state_fields must include {STATE_FIELDS:?}");
         let columns = StateColumns::new(&self.state_fields)?;
@@ -146,7 +152,7 @@ impl Environment {
         ensure!(matches!(self.outcome.as_str(), "success" | "collision" | "out_of_bounds" | "timeout"), "unknown terminal outcome");
         let first_target = columns.target.map(|i| self.states[0][i]);
         for (index, (state, transition)) in self.states.iter().zip(&self.transitions).enumerate() {
-            ensure!(state.len() == recording.state_fields.len() && transition.len() == TRANSITION_FIELDS.len(),
+            ensure!(state.len() == recording.state_fields.len() && transition.len() == TRANSITION_WIDTH,
                 "row width mismatch at frame {index}");
             ensure!(state.iter().all(|value| value.is_finite()) && transition.iter().all(|value| value.is_finite()),
                 "non-finite value at frame {index}");

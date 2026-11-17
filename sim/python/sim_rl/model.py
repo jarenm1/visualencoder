@@ -7,16 +7,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .native import PRIVILEGED_WIDTH, PROPRIO_WIDTH
+
 LOG_TWO_PI = math.log(2 * math.pi)
 MODES = ("visual", "state", "hint")
-HEADS, HEAD_DIM = 4, 64
-ATTENTION = HEADS * HEAD_DIM      # 256 attended features
+SALIENCY_RANK = 64               # low-rank goal x token interaction
+VALUE = 64                       # saliency-pooled token projection
 GLOBAL_POOL = (2, 3)
-GLOBAL = 128                      # projected CLS + 2x3 pooled patch tokens
+GLOBAL = 128                     # projected CLS + 2x3 pooled patch tokens
 HIDDEN = 256
 INITIAL_LOG_STD = -0.5
-PROPRIO_WIDTH, PRIVILEGED_WIDTH = 18, 18
-VISUAL_WIDTH = ATTENTION + 2 * HEADS + HEADS + GLOBAL   # 396
+# expected NDC (2), peak patch logit (1), P(in view) (1), pooled value, global projection
+VISUAL_WIDTH = 2 + 1 + 1 + VALUE + GLOBAL   # 196
+# Privileged lanes used by the auxiliary localization target.
+VISIBLE_LANE, NDC_LANES = 14, slice(18, 20)
 
 
 def _orthogonal(layer, gain):
@@ -25,56 +29,82 @@ def _orthogonal(layer, gain):
     return layer
 
 
-class GoalAttention(nn.Module):
-    """Goal-query attention over frozen patch tokens with learned 2D positions.
+class TargetSaliency(nn.Module):
+    """Per-patch target saliency over frozen patch tokens.
 
-    Output per sample: attended values (256), expected patch coordinates per
-    head (8), max logit per head (4), and projected CLS + 2x3 pooled global
-    tokens (128); total 396 features.
+    Patch logit = goal-free linear score + low-rank (token x goal) bilinear score; a
+    "not in view" logit from CLS and goal completes a softmax over P+1 classes. This
+    low-capacity form is what the offline per-patch diagnostic showed to generalize to
+    held-out districts and designs (~84% of visible targets within one patch); the
+    earlier learned-position query attention fit training frames but was near chance on
+    held-out ones.
+
+    forward -> (features [n, 196], logits [n, P+1]). Features: saliency-expected target
+    NDC (2), peak patch logit (1), P(in view) (1), saliency-pooled tokens (64) and the
+    projected CLS + 2x3 pooled global context (128).
     """
 
     def __init__(self, token_dim, goal_dim, grid_h, grid_w):
         super().__init__()
         self.grid_h, self.grid_w = grid_h, grid_w
-        self.query = nn.Sequential(
-            _orthogonal(nn.Linear(goal_dim, HIDDEN), math.sqrt(2)), nn.Tanh(),
-            _orthogonal(nn.Linear(HIDDEN, ATTENTION), 0.01))
-        self.key = _orthogonal(nn.Linear(token_dim, ATTENTION), math.sqrt(2))
-        self.value = _orthogonal(nn.Linear(token_dim, ATTENTION), math.sqrt(2))
+        self.saliency = nn.Linear(token_dim, 1)
+        nn.init.zeros_(self.saliency.weight)
+        nn.init.zeros_(self.saliency.bias)
+        self.token_rank = nn.Linear(token_dim, SALIENCY_RANK, bias=False)
+        self.goal_rank = nn.Linear(goal_dim, SALIENCY_RANK, bias=False)
+        nn.init.normal_(self.token_rank.weight, std=0.02)
+        nn.init.normal_(self.goal_rank.weight, std=0.02)
+        self.absent = nn.Sequential(_orthogonal(nn.Linear(token_dim + goal_dim, HIDDEN), math.sqrt(2)), nn.Tanh(),
+                                    _orthogonal(nn.Linear(HIDDEN, 1), 0.01))
+        self.value = _orthogonal(nn.Linear(token_dim, VALUE), math.sqrt(2))
         self.global_projection = _orthogonal(nn.Linear(7 * token_dim, GLOBAL), math.sqrt(2))
-        self.row_embedding = nn.Parameter(torch.randn(grid_h, token_dim) * 0.02)
-        self.column_embedding = nn.Parameter(torch.randn(grid_w, token_dim) * 0.02)
         rows, columns = torch.meshgrid(torch.arange(grid_h), torch.arange(grid_w), indexing="ij")
-        rows, columns = rows.reshape(-1), columns.reshape(-1)  # row-major, matches patch order
-        coords = torch.stack(((columns + 0.5) / grid_w, (rows + 0.5) / grid_h), dim=-1)
-        self.register_buffer("row_index", rows, persistent=False)
-        self.register_buffer("column_index", columns, persistent=False)
-        self.register_buffer("coords", coords.float(), persistent=False)
+        # Row-major patch order; NDC x right, y up (matches privileged lanes 18-19).
+        ndc = torch.stack(((columns.reshape(-1) + 0.5) / grid_w * 2 - 1,
+                           1 - (rows.reshape(-1) + 0.5) / grid_h * 2), dim=-1)
+        self.register_buffer("ndc", ndc.float(), persistent=False)
 
     def forward(self, goal, cls, tokens):
-        """goal [n, G], cls [n, D], tokens [n, P, D] -> [n, 396]."""
+        """goal [n, G], cls [n, D], tokens [n, P, D] -> (features [n, 196], logits [n, P+1])."""
         tokens = tokens.float()
-        n, patches, dim = tokens.shape
-        position = self.row_embedding[self.row_index] + self.column_embedding[self.column_index]
-        query = self.query(goal).view(n, HEADS, HEAD_DIM)
-        positioned = tokens + position
-        keys = self.key(positioned).view(n, patches, HEADS, HEAD_DIM)
-        values = self.value(positioned).view(n, patches, HEADS, HEAD_DIM)
-        logits = torch.einsum("nhd,nphd->nhp", query, keys) / math.sqrt(HEAD_DIM)
-        attention = logits.softmax(-1)
-        attended = torch.einsum("nhp,nphd->nhd", attention, values).reshape(n, ATTENTION)
-        expected = torch.einsum("nhp,pc->nhc", attention, self.coords).reshape(n, 2 * HEADS)
-        peak = logits.amax(-1)
+        n, _, dim = tokens.shape
+        patch = self.saliency(tokens).squeeze(-1) + (self.token_rank(tokens) * self.goal_rank(goal).unsqueeze(1)).sum(-1)
+        absent = self.absent(torch.cat((cls.float(), goal), dim=-1))
+        logits = torch.cat((patch, absent), dim=-1)
+        in_view = 1 - logits.softmax(-1)[:, -1:]
+        where = patch.softmax(-1)
+        expected = where @ self.ndc
+        pooled_value = torch.einsum("np,npv->nv", where, self.value(tokens))
         grid = tokens.transpose(1, 2).reshape(n, dim, self.grid_h, self.grid_w)
         pooled = F.adaptive_avg_pool2d(grid, GLOBAL_POOL).flatten(2).transpose(1, 2)
-        global_tokens = torch.cat((cls.float().unsqueeze(1), pooled), dim=1).flatten(1)
-        return torch.cat((attended, expected, peak, self.global_projection(global_tokens)), dim=-1)
+        context = self.global_projection(torch.cat((cls.float().unsqueeze(1), pooled), dim=1).flatten(1))
+        features = torch.cat((expected, patch.amax(-1, keepdim=True), in_view, pooled_value, context), dim=-1)
+        return features, logits
+
+
+def saliency_targets(privileged, grid_h, grid_w):
+    """Class per frame: the patch containing the visible target centre, else P (not in view)."""
+    visible = privileged[..., VISIBLE_LANE] > 0.5
+    column = ((privileged[..., 18] + 1) / 2 * grid_w).floor().clamp(0, grid_w - 1)
+    row = ((1 - privileged[..., 19]) / 2 * grid_h).floor().clamp(0, grid_h - 1)
+    patch = (row * grid_w + column).long()
+    return torch.where(visible, patch, torch.full_like(patch, grid_h * grid_w)), visible
+
+
+def saliency_loss(logits, privileged, grid_h, grid_w):
+    """Cross-entropy over P+1 classes, and exact-patch accuracy on visible frames (detached)."""
+    target, visible = saliency_targets(privileged, grid_h, grid_w)
+    loss = F.cross_entropy(logits, target)
+    with torch.no_grad():
+        hits = (logits[:, :-1].argmax(-1) == target).float() * visible.float()
+        accuracy = hits.sum() / visible.float().sum().clamp_min(1.0)
+    return loss, accuracy
 
 
 class ActorCritic(nn.Module):
     """Gaussian actor (GRU) over one of three information modes, plus a privileged critic.
 
-    visual: goal attention over frozen tokens + proprioception.
+    visual: target saliency over frozen tokens + proprioception (+ saliency auxiliary loss).
     state:  privileged + proprioception (no vision).
     hint:   proprioception only.
     The critic always sees privileged + proprioception (asymmetric training).
@@ -85,7 +115,7 @@ class ActorCritic(nn.Module):
         if mode not in MODES:
             raise ValueError(f"unknown policy mode {mode}")
         self.mode, self.action_dim, self.hidden_size = mode, action_dim, HIDDEN
-        self.attention = GoalAttention(token_dim, goal_dim, grid_h, grid_w) if mode == "visual" else None
+        self.attention = TargetSaliency(token_dim, goal_dim, grid_h, grid_w) if mode == "visual" else None
         width = {"visual": VISUAL_WIDTH + PROPRIO_WIDTH, "state": PRIVILEGED_WIDTH + PROPRIO_WIDTH,
                  "hint": PROPRIO_WIDTH}[mode]
         self.trunk = nn.Sequential(_orthogonal(nn.Linear(width, HIDDEN), math.sqrt(2)),
@@ -99,11 +129,16 @@ class ActorCritic(nn.Module):
             _orthogonal(nn.Linear(HIDDEN, 1), 1.0))
 
     def actor_inputs(self, cls, tokens, goal, proprio, privileged):
+        return self.actor_inputs_and_features(cls, tokens, goal, proprio, privileged)[0]
+
+    def actor_inputs_and_features(self, cls, tokens, goal, proprio, privileged):
+        """Returns (actor inputs, saliency logits or None) so training reuses one saliency pass."""
         if self.mode == "visual":
-            return torch.cat((self.attention(goal, cls, tokens), proprio), dim=-1)
+            features, logits = self.attention(goal, cls, tokens)
+            return torch.cat((features, proprio), dim=-1), logits
         if self.mode == "state":
-            return torch.cat((privileged, proprio), dim=-1)
-        return proprio
+            return torch.cat((privileged, proprio), dim=-1), None
+        return proprio, None
 
     def value(self, privileged, proprio):
         return self.critic(torch.cat((privileged, proprio), dim=-1)).squeeze(-1)

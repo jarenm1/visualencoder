@@ -12,16 +12,18 @@ import torch
 
 from .cli import (DEFAULT_LIBRARY, ROOT, TEST_SEED, TEST_STYLE, TRAIN_STYLE, VALIDATION_SEED,
                   VALIDATION_STYLE, build_policy, load_checkpoint, sha256, validate_checkpoint)
-from .evaluation import UNIFORM_WEIGHTS
+from .curriculum import UNIFORM_WEIGHTS
 from .features import FrozenFeatures
 from .native import DEFAULT_CITY, CudaEnv
 
-# Diagnostics indices (ABI v3, width 24) recorded per frame, pre-action.
+# Diagnostics indices (ABI v4, width 24) recorded per frame, pre-action.
 STATE_INDEX = (0, 1, 2, 6, 7, 8, 9, 3, 4, 5, 14, 17, 18)
 STATE_FIELDS = ["world_x", "world_y", "world_z", "quat_x", "quat_y", "quat_z", "quat_w",
                 "target_x", "target_y", "target_z", "design", "clock", "landed"]
-TRANSITION_FIELDS = ["throttle", "roll", "pitch", "yaw", "reward", "done", "success", "collision", "out_of_bounds"]
+# Transition columns: action_names (4), then the outcome fields below.
+OUTCOME_FIELDS = ["reward", "done", "success", "collision", "out_of_bounds"]
 START_LANDED_INDEX = 19
+GPS_AVAILABLE_INDEX = 23
 PCA_SAMPLE = 65536
 TORQUE_NOTE = "Goal-facing visualization proxy; the task has no rotor/aerodynamic attitude state."
 
@@ -51,11 +53,15 @@ def encoder_maps(tokens, valid):
 
 
 @torch.no_grad()
-def capture(args, saved, features, seed, style):
-    """Roll out the deterministic policy (clamped mean) over the full horizon with uniform curriculum."""
+def capture(args, saved, features, seed, style, no_gps_fraction):
+    """Roll out the deterministic policy (clamped mean) over the full horizon.
+
+    Buckets are uniform; episodes run without GPS with probability ``no_gps_fraction``.
+    """
     metadata = saved["metadata"]
     n = args.num_envs
-    with CudaEnv(args.library, n, seed, metadata["width"], metadata["height"], style, args.city) as env:
+    with CudaEnv(args.library, n, seed, metadata["width"], metadata["height"], style,
+                 metadata["control_mode"], args.city) as env:
         with env.execution():
             validate_checkpoint(saved, env, features)
             policy = build_policy(env, features)
@@ -65,13 +71,17 @@ def capture(args, saved, features, seed, style):
             h, w = env.height, env.width
             patch_h, patch_w = h // 16, w // 16
             goals = features.goal_table(env.goal_images) if features.visual else None
-            env.write_curriculum(torch.tensor(UNIFORM_WEIGHTS, device=device, dtype=torch.float32))
+            lanes = torch.tensor(UNIFORM_WEIGHTS + (no_gps_fraction,), device=device, dtype=torch.float32)
+            env.write_curriculum(lanes)
             env.reset(seed)
             start_landed = env.diagnostics[:, START_LANDED_INDEX].clone()
+            gps_available = env.diagnostics[:, GPS_AVAILABLE_INDEX].clone()
             index = torch.tensor(STATE_INDEX, device=device)
+            outcome_width = len(OUTCOME_FIELDS)
+            action_width = env.action_dim
             images = torch.empty((horizon, n, h, w, 3), dtype=torch.uint8, device=device)
             states = torch.empty((horizon, n, len(STATE_INDEX)), device=device)
-            transitions = torch.empty((horizon, n, len(TRANSITION_FIELDS)), device=device)
+            transitions = torch.empty((horizon, n, action_width + outcome_width), device=device)
             ended = torch.empty((horizon, n), device=device)
             tokens = (torch.empty((horizon, n, patch_h * patch_w, features.dim), dtype=torch.bfloat16, device=device)
                       if features.visual else None)
@@ -86,11 +96,11 @@ def capture(args, saved, features, seed, style):
                     goal = goals[env.design.long()]
                 else:
                     cls, patch_tokens, goal = None, None, None
-                inputs = policy.actor_inputs(cls, patch_tokens, goal, env.proprio, env.privileged)
+                inputs, _ = policy.actor_inputs_and_features(cls, patch_tokens, goal, env.proprio, env.privileged)
                 mean, hidden = policy.step(inputs, hidden, starts)
                 applied = mean.clamp(-1, 1).contiguous()
                 env.step(applied)
-                transitions[t, :, :4].copy_(applied)
+                transitions[t, :, :action_width].copy_(applied)
                 transitions[t, :, 4].copy_(env.reward)
                 transitions[t, :, 5].copy_(env.done)
                 transitions[t, :, 6].copy_(env.success)
@@ -105,14 +115,18 @@ def capture(args, saved, features, seed, style):
             env.stream.synchronize()  # Explicit export boundary: one readback of the recording.
             return {"images": images.cpu().numpy(), "states": states.cpu().numpy(),
                     "transitions": transitions.cpu().numpy(), "ended": ended.cpu().numpy(),
-                    "start_landed": start_landed.cpu().numpy(), "maps": None if maps is None else maps.numpy(),
-                    "native": {"control_hz": env.control_hz, "city_path": str(env.city_path),
+                    "start_landed": start_landed.cpu().numpy(), "gps_available": gps_available.cpu().numpy(),
+                    "maps": None if maps is None else maps.numpy(),
+                    "native": {"control_hz": env.control_hz, "control_mode": env.control_mode,
+                               "action_names": list(env.action_names), "city_path": str(env.city_path),
                                "city_fingerprint": env.metadata["city_fingerprint"]}}
 
 
 def record(args):
     if args.num_envs < 1:
         raise ValueError("--num-envs must be positive")
+    if not 0.0 <= args.no_gps_fraction <= 1.0:
+        raise ValueError("--no-gps-fraction must be in [0, 1]")
     renderer = args.renderer.resolve(strict=True)
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is required; use the sim Nix development shell")
@@ -126,11 +140,13 @@ def record(args):
     seed = seeds[args.split] if args.seed is None else args.seed
     if not 0 <= seed < 2**64:
         raise ValueError("seed must fit unsigned 64 bits")
-    recording = capture(args, saved, features, seed, styles[args.split])
+    recording = capture(args, saved, features, seed, styles[args.split], args.no_gps_fraction)
     torch.cuda.empty_cache()  # Release this exporter's unused memory before the renderer process.
     states, transitions = recording["states"], recording["transitions"]
     if not np.isfinite(states).all() or not np.isfinite(transitions).all():
         raise RuntimeError("native recording contains non-finite state or transitions")
+    action_names = recording["native"]["action_names"]
+    transition_fields = action_names + OUTCOME_FIELDS
     args.out.mkdir(parents=True)
     environments = []
     for index in range(args.num_envs):
@@ -151,7 +167,9 @@ def record(args):
         entry = {
             "id": index, "frame_count": length, "duration_seconds": length / recording["native"]["control_hz"],
             "outcome": outcome, "bucket": int(recording["ended"][length - 1, index]),
-            "start_landed": bool(recording["start_landed"][index] > 0.5), "design": int(episode[0, 10]),
+            "start_landed": bool(recording["start_landed"][index] > 0.5),
+            "gps_available": bool(recording["gps_available"][index] > 0.5),
+            "design": int(episode[0, 10]),
             "video": f"{basename}.mp4", "states": episode.tolist(),
             "transitions": transitions[:length, index].tolist(),
         }
@@ -164,6 +182,8 @@ def record(args):
     manifest = {
         "format": "sim-city-replay-v2", "title": "City drone goal replay", "style": styles[args.split],
         "split": args.split, "control_hz": recording["native"]["control_hz"],
+        "control_mode": recording["native"]["control_mode"], "action_names": action_names,
+        "no_gps_fraction": args.no_gps_fraction,
         "frame_width": width, "frame_height": height, "video_width": width * 2, "video_height": height,
         "views": {"first_person": [0, 0, width, height], "third_person": [width, 0, width, height]},
         "encoder_map": None if recording["maps"] is None else {
@@ -175,7 +195,7 @@ def record(args):
         "actor_inputs": metadata["actor_inputs"], "selected_steps": metadata["steps"],
         "seed": seed, "city_fingerprint": recording["native"]["city_fingerprint"],
         "city_path": recording["native"]["city_path"],
-        "state_fields": STATE_FIELDS, "transition_fields": TRANSITION_FIELDS,
+        "state_fields": STATE_FIELDS, "transition_fields": transition_fields,
         "state_semantics": "Pre-action poses and diagnostics. Terminal flag belongs to the action applied in the same "
                            "record; no autoreset pose is appended.",
         "third_person_attitude": TORQUE_NOTE,
@@ -206,4 +226,6 @@ def main():
     parser.add_argument("--num-envs", type=int, default=16)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--split", choices=("train", "validation", "test"), default="test")
+    parser.add_argument("--no-gps-fraction", type=float, default=0.0,
+                        help="probability that the replayed episodes run without GPS")
     record(parser.parse_args())

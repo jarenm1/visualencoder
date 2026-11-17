@@ -1,4 +1,4 @@
-"""Command-line entry points: train, eval, benchmark, profile, memory-check, verify-trace."""
+"""Command-line entry points: train, eval, probe, benchmark, profile, memory-check, verify-trace."""
 from __future__ import annotations
 
 import argparse
@@ -11,30 +11,38 @@ from pathlib import Path
 import torch
 
 from .curriculum import MODES as CURRICULUM_MODES
-from .evaluation import HEURISTICS, evaluate
+from .evaluation import evaluate, heuristics_for
 from .features import ARMS, PREPROCESSING, FrozenFeatures
 from .model import ActorCritic
-from .native import ABI_VERSION, DEFAULT_CITY, TASK, CudaEnv
-from .ppo import Config, Trainer
+from .native import ABI_VERSION, CONTROL_MODES, DEFAULT_CITY, HOVER_ACTIONS, TASK, CudaEnv
+from .ppo import BUCKET_WIDTH, LOSS_NAMES, LOSS_WIDTH, RESULT_WIDTH, ROLLOUT_WIDTH, Config, Trainer
+from .probe import collect_frames, protocol_of, run_encoder, write_markdown
 from .profiling import capture, verify_trace
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_LIBRARY = ROOT / ".sim-target/training/libsim_env.so"
-CHECKPOINT_FORMAT = "sim-drone-ppo-v1"
+CHECKPOINT_FORMAT = "sim-drone-ppo-v2"
 TRAIN_STYLE, VALIDATION_STYLE, TEST_STYLE = 0, 1, 2
 VALIDATION_SEED, TEST_SEED = 10_001, 20_002
-MIN_EPISODES = 384
+PROBE_TRAIN_SEED = 30_003
+MIN_EPISODES = 256
 DEFAULTS = Config()
+DEFAULT_ENCODERS = "pretrained,baseline,mean"
 ACTOR_INPUTS = {
-    "visual": "goal-attention(frozen CLS + patch tokens, goal table) + proprio(18)",
-    "state": "privileged(18) + proprio(18)",
-    "hint": "proprio(18)",
+    "visual": "goal-attention(frozen CLS + patch tokens, goal table) + proprio(19)",
+    "state": "privileged(21) + proprio(19)",
+    "hint": "proprio(19)",
 }
-CRITIC_INPUTS = "privileged(18) + proprio(18)"
+CRITIC_INPUTS = "privileged(21) + proprio(19)"
 # Recorded and compared on load; the library hash is provenance only (rebuilds keep the contract).
-CHECKED_KEYS = ("task", "abi_version", "action_dim", "horizon", "control_hz",
+CHECKED_KEYS = ("task", "abi_version", "action_dim", "horizon", "control_hz", "control_mode",
                 "width", "height", "policy_mode", "encoder", "feature_dim", "encoder_fingerprint",
                 "preprocessing", "native_task_contract")
+LOSS_AT = ROLLOUT_WIDTH
+BUCKET_AT = LOSS_AT + LOSS_WIDTH
+USED_AT = BUCKET_AT + BUCKET_WIDTH
+NEXT_AT = USED_AT + 3
+EMA_AT = NEXT_AT + 3
 
 
 def seed_all(seed):
@@ -61,18 +69,27 @@ def build_policy(env, features):
                        env.height // 16, env.width // 16, env.action_dim).to(env.device)
 
 
-def provenance(env, features, curriculum):
+def native_provenance(env, features):
     mode = mode_of(features)
     return {
         "format": CHECKPOINT_FORMAT, "task": TASK, "abi_version": ABI_VERSION,
         "action_dim": env.action_dim, "horizon": env.horizon, "control_hz": env.control_hz,
-        "design_count": env.design_count, "width": env.width, "height": env.height,
+        "control_mode": env.control_mode, "design_count": env.design_count,
+        "width": env.width, "height": env.height,
         "policy_mode": mode, "encoder": features.spec, "feature_dim": features.dim,
         "encoder_fingerprint": features.fingerprint, "preprocessing": PREPROCESSING,
         "actor_inputs": ACTOR_INPUTS[mode], "critic_inputs": CRITIC_INPUTS,
-        "curriculum": curriculum, "native_task_contract": env.task_contract,
-        "native_library_sha256": sha256(env.library),
+        "native_task_contract": env.task_contract, "native_library_sha256": sha256(env.library),
     }
+
+
+def provenance(env, features, training):
+    return {**native_provenance(env, features), **training}
+
+
+def training_settings(args):
+    return {"curriculum": args.curriculum, "no_gps_fraction": args.no_gps_fraction,
+            "aux_coefficient": args.aux_coefficient}
 
 
 def checkpoint(policy, metadata, steps):
@@ -83,17 +100,17 @@ def checkpoint(policy, metadata, steps):
 def load_checkpoint(path):
     saved = torch.load(path, map_location="cpu", weights_only=True)
     if saved.get("format") != CHECKPOINT_FORMAT:
-        raise ValueError(f"{path} is not a {CHECKPOINT_FORMAT} checkpoint; v1/v2 city and historical "
-                         "gap checkpoints cannot be used for city-drone-goal-v1")
+        raise ValueError(f"{path} is not a {CHECKPOINT_FORMAT} checkpoint; v1/v2/v3 checkpoints "
+                         "cannot be used for city-drone-goal-v1 ABI 4")
     metadata = saved["metadata"]
     if metadata.get("abi_version") != ABI_VERSION or metadata.get("task") != TASK:
-        raise ValueError("checkpoint targets an incompatible native ABI or task; retrain on sim_env ABI v3")
+        raise ValueError("checkpoint targets an incompatible native ABI or task; retrain on sim_env ABI v4")
     return saved
 
 
 def validate_checkpoint(saved, env, features):
     recorded = saved["metadata"]
-    expected = provenance(env, features, recorded.get("curriculum"))
+    expected = native_provenance(env, features)
     for key in CHECKED_KEYS:
         if recorded.get(key) != expected[key]:
             raise ValueError(f"checkpoint {key} differs from the native/feature configuration: "
@@ -106,17 +123,42 @@ def make_config(args):
                   minibatch_sequences=args.minibatch_sequences, learning_rate=args.learning_rate,
                   gamma=args.gamma, gae_lambda=args.gae_lambda, clip=args.clip, entropy=args.entropy,
                   value_coefficient=args.value_coefficient, max_grad_norm=args.max_grad_norm,
-                  curriculum=args.curriculum)
+                  curriculum=args.curriculum, aux_coefficient=args.aux_coefficient,
+                  no_gps_fraction=args.no_gps_fraction)
 
 
 def open_env(args, n, seed, style):
-    return CudaEnv(args.library, n, seed, args.width, args.height, style, args.city)
+    return CudaEnv(args.library, n, seed, args.width, args.height, style, args.control, args.city)
+
+
+def open_env_checkpoint(args, metadata, seed, style):
+    return CudaEnv(args.library, args.eval_envs, seed, metadata["width"], metadata["height"], style,
+                   metadata["control_mode"], args.city)
 
 
 def check_episodes(result):
     if result["episodes"] < MIN_EPISODES:
         raise RuntimeError(f"evaluation produced {result['episodes']} episodes; at least {MIN_EPISODES} required")
     return result
+
+
+def gps_modes(env, features, policy, seed, heuristics=True):
+    """Policy (and optionally blind heuristics) in both GPS modes: GPS available (p_no_gps=0) and GPS denied (p_no_gps=1)."""
+    results = {}
+    for label, no_gps in (("gps", 0.0), ("no_gps", 1.0)):
+        results[label] = {"policy": check_episodes(evaluate(env, features, policy=policy, seed=seed, no_gps=no_gps))}
+        if heuristics:
+            results[label]["heuristics"] = {
+                name: check_episodes(evaluate(env, features, heuristic=name, seed=seed, no_gps=no_gps))
+                for name in heuristics_for(env.control_mode)}
+    return results
+
+
+def selection_success(result, config):
+    """Checkpoint selection: GPS success alone when no GPS episodes are trained, else the mean of both modes."""
+    if config.no_gps_fraction == 0:
+        return result["gps"]["policy"]["success"]
+    return (result["gps"]["policy"]["success"] + result["no_gps"]["policy"]["success"]) / 2
 
 
 def emit(payload, path=None):
@@ -140,8 +182,22 @@ def timed(fn, iterations):
     return start.elapsed_time(end) / 1000 / iterations
 
 
-def _rounded(value):
-    return None if value is None else round(value, 6)
+def training_record(steps, elapsed, values):
+    """Decodes the fixed finish_rollout layout (see ppo.RESULT_WIDTH)."""
+    completed = values[1]
+    return {
+        "steps": steps, "elapsed_seconds": elapsed,
+        "reward_mean": values[0], "completed_episodes": completed,
+        "success": values[2], "collision": values[3],
+        "episode_return": values[4] / completed if completed else None,
+        **dict(zip(LOSS_NAMES, values[LOSS_AT:BUCKET_AT])),
+        "bucket_completed": values[BUCKET_AT:BUCKET_AT + 3],
+        "bucket_success": values[BUCKET_AT + 3:BUCKET_AT + 6],
+        "bucket_collision": values[BUCKET_AT + 6:BUCKET_AT + 9],
+        "bucket_out_of_bounds": values[BUCKET_AT + 9:BUCKET_AT + 12],
+        "weights_used": values[USED_AT:NEXT_AT], "weights_next": values[NEXT_AT:EMA_AT],
+        "success_ema": values[EMA_AT:],
+    }
 
 
 def train_command(args, started):
@@ -161,13 +217,14 @@ def train_command(args, started):
             policy = build_policy(env, features)
             trainer = Trainer(env, features, policy, config)
             trainer.warmup(args.seed)
-            metadata = provenance(env, features, args.curriculum)
+            metadata = provenance(env, features, training_settings(args))
 
         def validate():
             with validation_env.execution():
                 policy.eval()
-                result = check_episodes(evaluate(validation_env, features, policy=policy, seed=VALIDATION_SEED))
+                result = gps_modes(validation_env, features, policy, VALIDATION_SEED, heuristics=False)
                 policy.train()
+            result["selection_success"] = selection_success(result, config)
             return result
 
         started_eval = time.monotonic()
@@ -180,33 +237,23 @@ def train_command(args, started):
                 length = trainer.collect(config.rollout_steps)
                 losses = trainer.update(length)
                 values = trainer.finish_rollout(length, losses).cpu().tolist()
-            completed = values[1]
-            record = {
-                "steps": trainer.steps, "elapsed_seconds": time.monotonic() - started,
-                "reward_mean": values[0], "completed_episodes": completed,
-                "success": values[2], "collision": values[3],
-                "episode_return": values[4] / completed if completed else None,
-                "policy_loss": values[5], "value_loss": values[6], "entropy": values[7],
-                "approx_kl": values[8], "clip_fraction": values[9], "grad_norm": values[10],
-                "bucket_completed": values[11:14], "bucket_success": values[14:17],
-                "bucket_collision": values[17:20], "bucket_out_of_bounds": values[20:23],
-                "weights_used": values[23:26], "weights_next": values[26:29], "success_ema": values[29:32],
-            }
-            curves.write(json.dumps(record) + "\n")
+            if len(values) != RESULT_WIDTH:
+                raise RuntimeError(f"finish_rollout returned {len(values)} values; expected {RESULT_WIDTH}")
+            curves.write(json.dumps(training_record(trainer.steps, time.monotonic() - started, values)) + "\n")
             curves.flush()
             if trainer.steps >= next_validation:
                 next_validation += args.validation_every
                 result = validate()
                 validations.append({"steps": trainer.steps, "result": result})
-                if result["success"] > best_success:
-                    best_success = result["success"]
+                if result["selection_success"] > best_success:
+                    best_success = result["selection_success"]
                     torch.save(checkpoint(policy, metadata, trainer.steps), best_path)
                 torch.save(checkpoint(policy, metadata, trainer.steps), last_path)
         curves.close()
         final = validate()
         validations.append({"steps": trainer.steps, "result": final, "final": True})
-        if final["success"] > best_success:
-            best_success = final["success"]
+        if final["selection_success"] > best_success:
+            best_success = final["selection_success"]
             torch.save(checkpoint(policy, metadata, trainer.steps), best_path)
         torch.save(checkpoint(policy, metadata, trainer.steps), last_path)
     emit({"validations": validations}, run / "validation.json")
@@ -216,29 +263,30 @@ def train_command(args, started):
         with test_env.execution():
             policy = build_policy(test_env, features)
             policy.load_state_dict(saved["model"])
-            test = check_episodes(evaluate(test_env, features, policy=policy, seed=TEST_SEED))
-            heuristics = {name: check_episodes(evaluate(test_env, features, heuristic=name, seed=TEST_SEED))
-                          for name in HEURISTICS}
+            test = gps_modes(test_env, features, policy, TEST_SEED)
     elapsed = time.monotonic() - started
     final_test = {"checkpoint": "best.pt", "checkpoint_sha256": sha256(best_path),
-                  "policy": test, "heuristics": heuristics}
+                  "control_mode": metadata["control_mode"], **test}
     emit(final_test, run / "final-test.json")
     summary = {
-        "task": TASK, "abi_version": ABI_VERSION, "policy_mode": metadata["policy_mode"],
-        "encoder": metadata["encoder"], "seed": args.seed, "width": metadata["width"], "height": metadata["height"],
-        "control_hz": metadata["control_hz"], "city_fingerprint": metadata["native_task_contract"]["city_fingerprint"],
-        "steps": trainer.steps, "best_validation_success": best_success,
-        "test_success": test["success"], "test_success_wilson95": test["success_wilson95"],
+        "task": TASK, "abi_version": ABI_VERSION, "control_mode": metadata["control_mode"],
+        "policy_mode": metadata["policy_mode"], "encoder": metadata["encoder"], "seed": args.seed,
+        "width": metadata["width"], "height": metadata["height"], "control_hz": metadata["control_hz"],
+        "city_fingerprint": metadata["native_task_contract"]["city_fingerprint"],
+        "steps": trainer.steps, "no_gps_fraction": args.no_gps_fraction, "aux_coefficient": args.aux_coefficient,
+        "best_validation_selection_success": best_success,
+        "test_success": {label: test[label]["policy"]["success"] for label in ("gps", "no_gps")},
+        "test_success_wilson95": {label: test[label]["policy"]["success_wilson95"] for label in ("gps", "no_gps")},
         "elapsed_seconds_including_initialization_training_evaluation": elapsed,
         "wall_budget_seconds": args.wall_seconds, "within_wall_budget": elapsed <= args.wall_seconds,
         "compile_excluded": True, "convergence_claim": False,
     }
     emit(summary, run / "summary.json")
-    write_report(run, summary, test, heuristics)
+    write_report(run, summary, test)
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 
-def write_report(run, summary, test, heuristics):
+def write_report(run, summary, test):
     def row(name, result):
         low, high = result["success_wilson95"] or (None, None)
         return (f"| {name} | {result['episodes']} | {result['success']:.3f} "
@@ -246,16 +294,20 @@ def write_report(run, summary, test, heuristics):
                 f"{result['out_of_bounds']:.3f} | {result['timeout']:.3f} |")
 
     lines = ["# City drone goal test", "", f"Task: `{summary['task']}`, ABI {summary['abi_version']}, "
-             f"policy mode `{summary['policy_mode']}`, steps {summary['steps']}.", "",
-             "| arm | episodes | success [Wilson 95%] | collision | out of bounds | timeout |",
-             "|---|---|---|---|---|---|", row(summary["policy_mode"], test)]
-    lines += [row(name, result) for name, result in heuristics.items()]
-    lines += ["", "Per visibility bucket (policy):", ""]
-    lines += [f"- {name}: episodes {result['episodes']}, success {result.get('success')}"
-              for name, result in test["buckets"].items()]
-    lines += ["", "Per start (policy):", ""]
-    lines += [f"- {name}: episodes {result['episodes']}, success {result.get('success')}"
-              for name, result in test["start_landed"].items()]
+             f"control `{summary['control_mode']}`, policy mode `{summary['policy_mode']}`, "
+             f"steps {summary['steps']}, no-GPS fraction {summary['no_gps_fraction']}."]
+    for label, title in (("gps", "GPS available"), ("no_gps", "GPS denied")):
+        section = test[label]
+        lines += ["", f"## {title}", "",
+                  "| arm | episodes | success [Wilson 95%] | collision | out of bounds | timeout |",
+                  "|---|---|---|---|---|---|", row(summary["policy_mode"], section["policy"])]
+        lines += [row(name, result) for name, result in section["heuristics"].items()]
+        lines += ["", "Per visibility bucket (policy):", ""]
+        lines += [f"- {name}: episodes {result['episodes']}, success {result.get('success')}"
+                  for name, result in section["policy"]["buckets"].items()]
+        lines += ["", "Per start (policy):", ""]
+        lines += [f"- {name}: episodes {result['episodes']}, success {result.get('success')}"
+                  for name, result in section["policy"]["start_landed"].items()]
     (run / "report.md").write_text("\n".join(lines) + "\n")
 
 
@@ -270,16 +322,40 @@ def eval_command(args, started):
             validate_checkpoint(saved, env, features)
             policy = build_policy(env, features)
             policy.load_state_dict(saved["model"])
-            payload = {"checkpoint": str(args.checkpoint), "checkpoint_sha256": sha256(args.checkpoint),
-                       "split": args.split,
-                       "policy": check_episodes(evaluate(env, features, policy=policy, seed=seed)),
-                       "heuristics": {name: check_episodes(evaluate(env, features, heuristic=name, seed=seed))
-                                      for name in HEURISTICS}}
+            results = gps_modes(env, features, policy, seed)
+    payload = {"checkpoint": str(args.checkpoint), "checkpoint_sha256": sha256(args.checkpoint),
+               "split": args.split, "control_mode": metadata["control_mode"], **results}
     emit(payload, args.out)
 
 
-def open_env_checkpoint(args, metadata, seed, style):
-    return CudaEnv(args.library, args.eval_envs, seed, metadata["width"], metadata["height"], style, args.city)
+def probe_command(args, started):
+    if not args.encoders:
+        raise SystemExit("--encoders must name at least one visual arm")
+    device = torch.device("cuda:0")
+    with open_env(args, args.probe_envs, PROBE_TRAIN_SEED, TRAIN_STYLE) as env:
+        with env.execution():
+            train_frames = collect_frames(env, args.train_frames, PROBE_TRAIN_SEED, args.seed)
+    with open_env(args, args.probe_envs, TEST_SEED, TEST_STYLE) as env:
+        with env.execution():
+            test_frames = collect_frames(env, args.test_frames, TEST_SEED, args.seed + 1)
+    config = {"epochs": args.epochs, "batch_size": args.batch_size, "learning_rate": args.learning_rate}
+    encoders = {}
+    for spec in args.encoders:
+        features = FrozenFeatures(spec, device)
+        if not features.visual:
+            raise SystemExit(f"probe needs a visual encoder; {spec} has none")
+        seed_all(args.seed)
+        encoders[spec] = run_encoder(features, train_frames, test_frames, args.height // 16, args.width // 16,
+                                     config, args.seed)
+        del features
+    train_count, test_count = train_frames.images.shape[0], test_frames.images.shape[0]
+    payload = {"protocol": protocol_of(train_count, test_count), "train_frames": train_count,
+               "test_frames": test_count, "train_seed": PROBE_TRAIN_SEED, "test_seed": TEST_SEED,
+               "control_mode": args.control, "width": args.width, "height": args.height,
+               "seed": args.seed, "config": config, "encoders": encoders}
+    args.out.mkdir(parents=True, exist_ok=True)
+    emit(payload, args.out / "probe.json")
+    (args.out / "probe.md").write_text(write_markdown(payload))
 
 
 def benchmark_command(args, started):
@@ -288,13 +364,12 @@ def benchmark_command(args, started):
         seed_all(args.seed)
         features = FrozenFeatures(args.encoder, torch.device("cuda:0"))
         config = make_config(args)
-        with CudaEnv(args.library, n, args.seed, args.width, args.height, TRAIN_STYLE, args.city) as env:
+        with open_env(args, n, args.seed, TRAIN_STYLE) as env:
             with env.execution():
                 policy = build_policy(env, features)
                 trainer = Trainer(env, features, policy, config)
                 trainer.warmup(args.seed)
-                hover = torch.zeros((n, env.action_dim), device=env.device)
-                hover[:, 0] = -0.2
+                hover = torch.tensor(HOVER_ACTIONS[env.control_mode], device=env.device).expand(n, -1).contiguous()
                 native_step = timed(lambda: env.step(hover), args.iterations)
                 encoder = timed(lambda: features.observe(env), args.iterations) if features.visual else None
                 collect = timed(lambda: trainer.collect(config.rollout_steps), 1)
@@ -303,7 +378,8 @@ def benchmark_command(args, started):
         rows.append({"num_envs": n, "native_step_seconds": native_step, "encoder_seconds": encoder,
                      "collect_seconds": collect, "update_seconds": update,
                      "transitions_per_second": transitions / (collect + update)})
-    emit({"arm": args.encoder, "policy_mode": mode_of(features), "rows": rows}, args.out)
+    emit({"arm": args.encoder, "policy_mode": mode_of(features), "control_mode": args.control,
+          "rows": rows}, args.out)
 
 
 def profile_command(args, started):
@@ -354,10 +430,19 @@ def add_native(parser):
     parser.add_argument("--seed", type=int, default=0)
 
 
+def add_control(parser):
+    parser.add_argument("--control", choices=tuple(CONTROL_MODES), default="velocity",
+                        help="action interface: velocity (default, PX4 offboard style) or rates")
+
+
 def add_learner(parser):
     parser.add_argument("--encoder", default="mean", help=f"arm: {', '.join(ARMS)} or run:<dir>")
     parser.add_argument("--curriculum", choices=CURRICULUM_MODES, default="adaptive")
-    parser.add_argument("--num-envs", type=int, default=64)
+    parser.add_argument("--num-envs", type=int, default=128)
+    parser.add_argument("--no-gps-fraction", type=float, default=DEFAULTS.no_gps_fraction,
+                        help="probability that a training episode runs without GPS")
+    parser.add_argument("--aux-coefficient", type=float, default=DEFAULTS.aux_coefficient,
+                        help="weight of the visibility + localization auxiliary loss (visual arms)")
     parser.add_argument("--total-steps", type=int, default=DEFAULTS.total_steps)
     parser.add_argument("--rollout-steps", type=int, default=DEFAULTS.rollout_steps)
     parser.add_argument("--sequence-length", type=int, default=DEFAULTS.sequence_length)
@@ -373,11 +458,12 @@ def add_learner(parser):
 
 
 def parser():
-    root = argparse.ArgumentParser(description="City drone visual-goal learner (city-drone-goal-v1, ABI v3)")
+    root = argparse.ArgumentParser(description="City drone visual-goal learner (city-drone-goal-v1, ABI v4)")
     commands = root.add_subparsers(dest="command", required=True)
 
     train = commands.add_parser("train")
     add_native(train)
+    add_control(train)
     add_learner(train)
     train.add_argument("--out", type=Path, required=True)
     train.add_argument("--eval-envs", type=int, default=384)
@@ -394,8 +480,24 @@ def parser():
     evaluation.add_argument("--out", type=Path)
     evaluation.set_defaults(func=eval_command)
 
+    probe = commands.add_parser("probe", help="offline goal-localization probe on frozen encoder features")
+    add_native(probe)
+    add_control(probe)
+    probe.add_argument("--encoders", type=lambda text: [item.strip() for item in text.split(",") if item.strip()],
+                       default=DEFAULT_ENCODERS.split(","),
+                       help="comma-separated visual arms (default: pretrained,baseline,mean)")
+    probe.add_argument("--probe-envs", type=int, default=128)
+    probe.add_argument("--train-frames", type=int, default=8192, help="protocol minimum 8192")
+    probe.add_argument("--test-frames", type=int, default=4096, help="protocol minimum 4096")
+    probe.add_argument("--epochs", type=int, default=20)
+    probe.add_argument("--batch-size", type=int, default=128)
+    probe.add_argument("--learning-rate", type=float, default=1e-3)
+    probe.add_argument("--out", type=Path, required=True, help="output directory for probe.json and probe.md")
+    probe.set_defaults(func=probe_command)
+
     benchmark = commands.add_parser("benchmark")
     add_native(benchmark)
+    add_control(benchmark)
     add_learner(benchmark)
     benchmark.add_argument("--batch-sizes", type=lambda text: [int(item) for item in text.split(",")],
                            default=[64, 128])
@@ -405,6 +507,7 @@ def parser():
 
     profile = commands.add_parser("profile")
     add_native(profile)
+    add_control(profile)
     add_learner(profile)
     profile.add_argument("--iterations", type=int, default=1)
     profile.add_argument("--out", type=Path, required=True)
@@ -412,6 +515,7 @@ def parser():
 
     memory = commands.add_parser("memory-check")
     add_native(memory)
+    add_control(memory)
     add_learner(memory)
     memory.add_argument("--repeats", type=int, default=3)
     memory.add_argument("--growth-tolerance-bytes", type=int, default=1 << 20)
@@ -427,6 +531,6 @@ def parser():
 def main(process_started=None):
     started = time.monotonic() if process_started is None else process_started
     args = parser().parse_args()
-    if getattr(args, "eval_envs", 384) < MIN_EPISODES:
+    if getattr(args, "eval_envs", MIN_EPISODES) < MIN_EPISODES:
         raise SystemExit(f"--eval-envs must be at least {MIN_EPISODES} (one first episode per environment)")
     args.func(args, started)

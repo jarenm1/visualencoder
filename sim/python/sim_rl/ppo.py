@@ -8,10 +8,14 @@ import torch
 from torch.profiler import record_function
 
 from .curriculum import MODES as CURRICULUM_MODES, Curriculum
-from .model import gaussian_entropy, gaussian_log_prob
+from .model import gaussian_entropy, gaussian_log_prob, saliency_loss
+from .native import HOVER_ACTIONS, PRIVILEGED_WIDTH, PROPRIO_WIDTH
 
-HOVER_ACTION = (-0.2, 0.0, 0.0, 0.0)  # Blind hover-thrust command used by warmup and the hover baseline.
-PROPRIO_WIDTH = 18
+# finish_rollout layout: rollout totals, PPO losses, bucket totals, used/next weights, EMAs.
+ROLLOUT_WIDTH, LOSS_WIDTH, BUCKET_WIDTH = 5, 8, 12
+RESULT_WIDTH = ROLLOUT_WIDTH + LOSS_WIDTH + BUCKET_WIDTH + 3 + 3 + 3
+LOSS_NAMES = ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction", "grad_norm",
+              "aux_saliency_loss", "aux_patch_accuracy")
 
 
 @contextmanager
@@ -39,6 +43,8 @@ class Config:
     value_coefficient: float = 0.5
     max_grad_norm: float = 0.5
     curriculum: str = "adaptive"
+    aux_coefficient: float = 0.5
+    no_gps_fraction: float = 0.0
 
     def validate(self):
         if min(self.total_steps, self.rollout_steps, self.sequence_length,
@@ -50,6 +56,10 @@ class Config:
             raise ValueError("learning rate must be positive")
         if self.curriculum not in CURRICULUM_MODES:
             raise ValueError(f"curriculum must be one of {CURRICULUM_MODES}")
+        if self.aux_coefficient < 0:
+            raise ValueError("aux_coefficient must be non-negative")
+        if not 0.0 <= self.no_gps_fraction <= 1.0:
+            raise ValueError("no_gps_fraction must be in [0, 1]")
 
 
 def terminal_gae(rewards, values, done, gamma, lam, out=None):
@@ -80,14 +90,15 @@ class Trainer:
         if policy.mode != "visual" and features.visual:
             raise ValueError("non-visual policy must not own a visual encoder")
         self.env, self.features, self.policy, self.config = env, features, policy, config
+        self.hover = torch.tensor(HOVER_ACTIONS[env.control_mode], device=env.device)
         self.optimizer = torch.optim.Adam(policy.parameters(), lr=config.learning_rate, fused=True, capturable=True)
         self.steps = 0
-        self.curriculum = Curriculum(config.curriculum, env.device)
+        self.curriculum = Curriculum(config.curriculum, env.device, config.no_gps_fraction)
         self.curriculum.write(env)
         t, n, h = config.rollout_steps, env.n, policy.hidden_size
         allocate = lambda *shape: torch.empty(shape, device=env.device)
         self.proprio = allocate(t, n, PROPRIO_WIDTH)
-        self.privileged = allocate(t, n, PROPRIO_WIDTH)
+        self.privileged = allocate(t, n, PRIVILEGED_WIDTH)
         self.designs = torch.zeros((t, n), device=env.device, dtype=torch.long)
         self.starts = allocate(t, n)
         self.hidden = allocate(t, n, h)
@@ -117,16 +128,17 @@ class Trainer:
             self.current_cls, self.current_tokens = self.features.observe(self.env)
 
     def _inputs(self, cls, tokens, design, proprio, privileged):
+        """Returns (actor inputs, GoalAttention output or None)."""
         goal = self.goals[design] if self.features.visual else None
-        return self.policy.actor_inputs(cls, tokens, goal, proprio, privileged)
+        return self.policy.actor_inputs_and_features(cls, tokens, goal, proprio, privileged)
 
     @torch.no_grad()
     def warmup(self, seed, iterations=3):
         """Initialize kernels/allocator, then discard warmup physics episodes."""
-        hover = torch.tensor(HOVER_ACTION, device=self.env.device).expand(self.env.n, -1).contiguous()
+        hover = self.hover.expand(self.env.n, -1).contiguous()
         for _ in range(iterations):
-            inputs = self._inputs(self.current_cls, self.current_tokens, self.env.design.long(),
-                                  self.env.proprio, self.env.privileged)
+            inputs, _ = self._inputs(self.current_cls, self.current_tokens, self.env.design.long(),
+                                     self.env.proprio, self.env.privileged)
             self.policy.step(inputs, self.memory, self.next_start)
             self.env.step(hover)
             self._observe()
@@ -153,9 +165,9 @@ class Trainer:
                 if self.features.visual:
                     self.cls[t].copy_(self.current_cls)
                     self.tokens[t].copy_(self.current_tokens)
-                inputs = self._inputs(self.cls[t] if self.features.visual else None,
-                                      self.tokens[t] if self.features.visual else None,
-                                      self.designs[t], self.proprio[t], self.privileged[t])
+                inputs, _ = self._inputs(self.cls[t] if self.features.visual else None,
+                                         self.tokens[t] if self.features.visual else None,
+                                         self.designs[t], self.proprio[t], self.privileged[t])
                 mean, memory = self.policy.step(inputs, self.memory, self.next_start)
                 sample = mean + log_std.exp() * torch.randn_like(mean)
                 self.actions[t].copy_(sample)
@@ -193,7 +205,7 @@ class Trainer:
                 self.returns[:length].copy_(advantage + self.values[:length])
                 advantage.sub_(advantage.mean()).div_(advantage.std(unbiased=False) + 1e-8)
             sequences = length // cfg.sequence_length * n
-            losses = torch.zeros(6, device=self.env.device)
+            losses = torch.zeros(LOSS_WIDTH, device=self.env.device)
             batches = 0
             for _ in range(cfg.epochs):
                 permutation = torch.randperm(sequences, device=self.env.device)
@@ -206,12 +218,13 @@ class Trainer:
                     privileged = self.privileged[times, env_ids]
                     length_b, batch = times.shape
                     if self.features.visual:
-                        inputs = self._inputs(self.cls[times, env_ids].flatten(0, 1),
-                                              self.tokens[times, env_ids].flatten(0, 1),
-                                              self.designs[times, env_ids].flatten(),
-                                              proprio.flatten(0, 1), privileged.flatten(0, 1))
+                        inputs, attended = self._inputs(self.cls[times, env_ids].flatten(0, 1),
+                                                        self.tokens[times, env_ids].flatten(0, 1),
+                                                        self.designs[times, env_ids].flatten(),
+                                                        proprio.flatten(0, 1), privileged.flatten(0, 1))
                     else:
-                        inputs = self._inputs(None, None, None, proprio.flatten(0, 1), privileged.flatten(0, 1))
+                        inputs, attended = self._inputs(None, None, None, proprio.flatten(0, 1),
+                                                        privileged.flatten(0, 1))
                     means = self.policy.sequence(inputs.view(length_b, batch, -1),
                                                  self.hidden[first, env_ids], self.starts[times, env_ids])
                     logprobs = gaussian_log_prob(means, self.policy.log_std, self.actions[times, env_ids])
@@ -225,7 +238,14 @@ class Trainer:
                     clipped_value = old_value + (values - old_value).clamp(-cfg.clip, cfg.clip)
                     target = self.returns[times, env_ids]
                     value_loss = 0.5 * torch.maximum((values - target).square(), (clipped_value - target).square()).mean()
-                    loss = policy_loss + cfg.value_coefficient * value_loss - cfg.entropy * entropy
+                    if attended is not None:
+                        aux_saliency, aux_accuracy = saliency_loss(
+                            attended, privileged.flatten(0, 1), self.policy.attention.grid_h,
+                            self.policy.attention.grid_w)
+                    else:
+                        aux_saliency = aux_accuracy = torch.zeros((), device=self.env.device)
+                    loss = (policy_loss + cfg.value_coefficient * value_loss - cfg.entropy * entropy
+                            + cfg.aux_coefficient * aux_saliency)
                     self.optimizer.zero_grad(set_to_none=True)
                     loss.backward()
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.max_grad_norm, foreach=True)
@@ -233,7 +253,8 @@ class Trainer:
                     with torch.no_grad():
                         losses.add_(torch.stack((policy_loss, value_loss, entropy,
                                                  ((ratio - 1) - logratio).mean(),
-                                                 ((ratio - 1).abs() > cfg.clip).float().mean(), grad_norm)))
+                                                 ((ratio - 1).abs() > cfg.clip).float().mean(), grad_norm,
+                                                 aux_saliency.detach(), aux_accuracy)))
                     batches += 1
             losses.div_(batches)
         return losses
@@ -252,9 +273,9 @@ class Trainer:
     def finish_rollout(self, length, losses):
         """GPU-only end-of-rollout bookkeeping: curriculum update for the next rollout and metrics.
 
-        Returns float32 [32]: rollout totals (5), PPO losses (6), bucket totals (12,
-        row-major [4,3]), weights used this rollout (3), weights for the next rollout (3),
-        success EMAs (3).
+        Returns float32 [RESULT_WIDTH] (34): rollout totals (5), PPO losses (8, see LOSS_NAMES),
+        bucket totals (12, row-major [4,3]), weights used this rollout (3), weights for the
+        next rollout (3), success EMAs (3).
         """
         totals = self.bucket_totals(length)
         used = self.curriculum.weights.clone()
