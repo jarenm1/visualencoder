@@ -30,15 +30,18 @@ def recording(data):
         raise ValueError("manifest.json must stay inside the selected data directory")
     manifest_bytes = manifest_path.read_bytes()
     manifest = json.loads(manifest_bytes)
-    if manifest.get("format") != "sim-city-replay-v1":
-        raise ValueError("expected a sim-city-replay-v1 manifest")
+    if manifest.get("format") != "sim-city-replay-v2":
+        raise ValueError("expected a sim-city-replay-v2 manifest")
     environments = manifest.get("environments")
     if not isinstance(environments, list) or not environments:
         raise ValueError("manifest contains no recorded environments")
     files = {}
+    # Non-visual policies (privileged state, hint-only) have no encoder output.
+    kinds = [("video", VIDEO_NAME, "video/mp4")]
+    if manifest.get("encoder_map") is not None:
+        kinds.append(("encoder_map", MAP_NAME, "application/octet-stream"))
     for environment in environments:
-        for key, pattern, content_type in (("video", VIDEO_NAME, "video/mp4"),
-                                           ("encoder_map", MAP_NAME, "application/octet-stream")):
+        for key, pattern, content_type in kinds:
             name = environment.get(key)
             if not isinstance(name, str) or not pattern.fullmatch(name):
                 raise ValueError(f"invalid replay {key} filename: {name!r}")

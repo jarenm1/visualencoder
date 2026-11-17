@@ -111,9 +111,9 @@ struct SensorOutput {
 fn fs_main(input: VertexOutput, @builtin(front_facing) front: bool) -> SensorOutput {
     let instance = instances[input.instance_index];
     let camera = cameras[globals.camera_index.x];
-    if !front && instance.metadata.w == 0u { discard; }
+    if !front && instance.pbr.w == 0.0 { discard; }
     let n = normalize(input.world_normal) * select(-1.0, 1.0, front);
-    let albedo = instance.color * base_color(instance.metadata.z, input.uv);
+    let albedo = instance.color * base_color(instance.metadata.w, input.uv);
     let l = normalize(globals.light_direction.xyz);
     let v = normalize(camera.eye.xyz - input.world_position);
     let h = normalize(l + v);

@@ -1,4 +1,4 @@
-"""Borrowed CUDA tensors over the sim_env C ABI; no observation transport."""
+"""Borrowed CUDA tensors over the sim_env C ABI v3; no observation transport."""
 from __future__ import annotations
 
 import ctypes as ct
@@ -10,7 +10,22 @@ from pathlib import Path
 import torch
 
 DEFAULT_CITY = Path(__file__).resolve().parents[3] / "assets" / "city"
-TASK = "city-block-navigation-v1"
+TASK = "city-drone-goal-v1"
+ABI_VERSION = 3
+ACTION_DIM = 4
+HORIZON = 450
+CONTROL_HZ = 30
+# Fields: 0 obs, 1 proprio, 2 reward, 3 done, 4 success, 5 privileged, 6 collision,
+# 7 episodes, 8 diagnostics, 9 design, 10 goal images, 11 curriculum (writable),
+# 12 ended bucket, 13 out_of_bounds.
+FIELD_COUNT = 14
+DIAGNOSTICS_WIDTH = 24
+PROPRIO_WIDTH = 18
+PRIVILEGED_WIDTH = 18
+REQUIRED_METADATA = ("abi_version", "task", "action_dim", "control_hz", "physics_hz", "horizon",
+                     "design_count", "city_fingerprint", "city_path")
+SPLIT_SPECIFIC_METADATA = ("city_path", "city", "style", "split", "design_count", "designs",
+                           "target_designs", "district", "catalog", "fields")
 
 
 class _CudaAllocation:
@@ -29,7 +44,7 @@ class CudaEnv:
     used after close; the environment retains their owners until its final wait.
     Vulkan shared buffers are internal: every exposed pointer is CUDA-only.
     """
-    def __init__(self, library, n=64, seed=0, width=192, height=128, style=0, city_path=DEFAULT_CITY):
+    def __init__(self, library, n=64, seed=0, width=320, height=240, style=0, city_path=DEFAULT_CITY):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required; no CPU environment fallback")
         if n < 1 or width < 48 or height < 32 or width % 16 or height % 16:
@@ -55,7 +70,7 @@ class CudaEnv:
             try:
                 function = getattr(self.lib, name)
             except AttributeError as error:
-                raise RuntimeError(f"city navigation requires sim_env ABI v2 symbol {name}") from error
+                raise RuntimeError(f"city navigation requires sim_env ABI v3 symbol {name}") from error
             function.argtypes, function.restype = args, result
         self.handle = self.lib.sim_env_create(n, seed, width, height, style, os.fsencode(self.city_path))
         if not self.handle:
@@ -66,24 +81,25 @@ class CudaEnv:
             if not raw_metadata:
                 raise RuntimeError(f"native city metadata unavailable: {self.error()}")
             self.metadata = json.loads(raw_metadata.decode("utf-8"))
-            if self.metadata.get("abi_version") != 2 or self.metadata.get("task") != TASK:
-                raise ValueError("city navigation requires sim_env ABI v2; historical gap libraries are incompatible")
-            required = ("action_count", "neutral_action", "horizon", "control_hz", "physics_hz",
-                        "city_fingerprint", "city_path", "altitude_m", "speed_m_s", "route_counts",
-                        "route_split_definition", "collision_radius_m", "goal_radius_m",
-                        "triangle_count", "bvh_node_count", "reward")
-            missing = [key for key in required if key not in self.metadata]
+            if self.metadata.get("abi_version") != ABI_VERSION or self.metadata.get("task") != TASK:
+                raise ValueError("city navigation requires sim_env ABI v3 task city-drone-goal-v1; "
+                                 "older libraries are incompatible")
+            missing = [key for key in REQUIRED_METADATA if key not in self.metadata]
             if missing:
                 raise ValueError(f"incomplete native city metadata: {missing}")
-            self.action_count = int(self.metadata["action_count"])
-            self.neutral_action = int(self.metadata["neutral_action"])
+            self.action_dim = int(self.metadata["action_dim"])
             self.horizon = int(self.metadata["horizon"])
-            if (self.action_count, self.neutral_action, self.horizon) != (9, 0, 320):
-                raise ValueError("unsupported city-block-navigation-v1 action/horizon contract")
-            # Location is relocatable; all scene content, controls, reward and
-            # route-catalog provenance must otherwise match checkpoints exactly.
+            self.control_hz = int(self.metadata["control_hz"])
+            self.design_count = int(self.metadata["design_count"])
+            if (self.action_dim, self.horizon, self.control_hz) != (ACTION_DIM, HORIZON, CONTROL_HZ):
+                raise ValueError("unsupported city-drone-goal-v1 action/horizon/control contract")
+            if self.design_count < 1:
+                raise ValueError("native split has no goal designs")
+            # Location and split-specific content (district, catalog, held-out designs,
+            # goal-image field shape) are excluded; dynamics, sensors, reward, camera,
+            # city content and every other rule must match checkpoints exactly.
             self.task_contract = {key: value for key, value in self.metadata.items()
-                                  if key not in ("city_path", "style", "split")}
+                                  if key not in SPLIT_SPECIFIC_METADATA}
             pointer = self.lib.sim_env_stream(self.handle)
             if not pointer:
                 raise RuntimeError(self.error())
@@ -91,10 +107,23 @@ class CudaEnv:
             # Native creation/reset and torch module transfers are initialization,
             # never part of the collection range or its zero-staging claim.
             self.stream.synchronize()
-            specifications = [((n, 3, height, width), "<f4"), ((n, 8), "<f4"),
-                              ((n,), "<f4"), ((n,), "<f4"), ((n,), "<f4"),
-                              ((n, 4), "<f4"), ((n,), "<f4"), ((n,), "<u8"),
-                              ((n, 8), "<f4")]
+            goal_shape = (self.design_count, 3, height, width)
+            specifications = [
+                ((n, 3, height, width), "<f4"),        # 0 obs
+                ((n, PROPRIO_WIDTH), "<f4"),           # 1 proprio
+                ((n,), "<f4"),                         # 2 reward
+                ((n,), "<f4"),                         # 3 done
+                ((n,), "<f4"),                         # 4 success
+                ((n, PRIVILEGED_WIDTH), "<f4"),        # 5 privileged
+                ((n,), "<f4"),                         # 6 collision
+                ((n,), "<u8"),                         # 7 episode counters
+                ((n, DIAGNOSTICS_WIDTH), "<f4"),       # 8 diagnostics
+                ((n,), "<i4"),                         # 9 design ids
+                (goal_shape, "<f4"),                   # 10 goal images
+                ((3,), "<f4"),                         # 11 curriculum weights (writable)
+                ((n,), "<f4"),                         # 12 ended bucket, -1 if not done
+                ((n,), "<f4"),                         # 13 out_of_bounds
+            ]
             with self.execution():
                 for field, (shape, typestr) in enumerate(specifications):
                     address = self.lib.sim_env_buffer(self.handle, field)
@@ -107,8 +136,9 @@ class CudaEnv:
                     view._sim_env_owner = owner
                     self._owners.append(owner)
                     self.tensors.append(view)
-            (self.obs, self.proprio, self.reward, self.done, self.success,
-             self.privileged, self.collision, self.episode_counts, self.diagnostics) = self.tensors
+            (self.obs, self.proprio, self.reward, self.done, self.success, self.privileged,
+             self.collision, self.episode_counts, self.diagnostics, self.design, self.goal_images,
+             self.curriculum, self.ended_bucket, self.out_of_bounds) = self.tensors
         except BaseException:
             self.close()
             raise
@@ -135,13 +165,20 @@ class CudaEnv:
 
     def step(self, actions):
         self._check_stream()
-        if (actions.device != self.device or actions.dtype != torch.int64
-                or actions.shape != (self.n,) or not actions.is_contiguous()):
-            raise ValueError("actions must be contiguous CUDA:0 int64[n]")
-        # The caller retains actions in its preallocated rollout for the entire
+        if (actions.device != self.device or actions.dtype != torch.float32
+                or actions.shape != (self.n, self.action_dim) or not actions.is_contiguous()):
+            raise ValueError("actions must be contiguous CUDA:0 float32[n, 4]")
+        # The caller retains actions in its preallocated buffer for the entire
         # asynchronous native read. No .to(), host scalar, or hidden staging.
         if self.lib.sim_env_step(self.handle, ct.c_void_p(actions.data_ptr())) != 0:
             raise RuntimeError(self.error())
+
+    def write_curriculum(self, weights):
+        """Enqueue an in-place device copy of the three bucket weights."""
+        self._check_stream()
+        if weights.device != self.device or weights.shape != (3,) or weights.dtype != torch.float32:
+            raise ValueError("curriculum weights must be CUDA:0 float32[3]")
+        self.curriculum.copy_(weights)
 
     def dlpack(self, field, stream=None):
         """Export a borrowed tensor through the standard stream-aware protocol."""

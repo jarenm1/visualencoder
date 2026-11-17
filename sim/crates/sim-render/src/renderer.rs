@@ -7,6 +7,9 @@ use wgpu::util::DeviceExt;
 
 use crate::{BaseColorImage, Camera, CameraGpu, Instance, MeshData, MeshVertex, OutputLayout, RenderConfig, WrapMode};
 
+/// GPU instance ABI, shared with cull.wgsl and render.wgsl. `metadata`: body index
+/// (u32::MAX = static), object ID, camera filter (0 = all cameras, else camera + 1),
+/// base-color texture index. `pbr`: metallic, roughness, imported flag, double-sided flag.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GpuInstance {
@@ -28,7 +31,8 @@ impl From<&Instance> for GpuInstance {
             color: instance.material.color,
             surface: [instance.material.shininess, instance.material.specular,
                 instance.material.checker_scale, instance.material.checker_contrast],
-            metadata: [instance.body_index.unwrap_or(u32::MAX), instance.object_id, 0, 0],
+            metadata: [instance.body_index.unwrap_or(u32::MAX), instance.object_id,
+                instance.camera.map_or(0, |camera| camera + 1), 0],
             pbr: [0.0, 0.5, 0.0, 0.0],
         }
     }
@@ -184,6 +188,8 @@ impl Renderer {
             ensure!(instance.body_index != Some(u32::MAX), "body index u32::MAX is reserved for static instances");
             ensure!(instance.scale.iter().all(|v| v.is_finite() && *v > 0.0), "instance scale must be finite and positive");
             ensure!(instance.object_id != 0, "object ID zero is reserved for background");
+            ensure!(instance.camera.is_none_or(|camera| camera < camera_count),
+                "instance camera is outside the camera batch");
         }
         let body_count = instances.iter().filter_map(|instance| instance.body_index)
             .max().map_or(1, |index| u64::from(index) + 1);
@@ -239,11 +245,11 @@ impl Renderer {
             for instance in instances.iter().filter(|instance| instance.mesh == mesh_index) {
                 let instance_index = u32::try_from(grouped_instances.len())?;
                 let mut gpu = GpuInstance::from(instance);
-                gpu.metadata[2] = texture_index;
+                gpu.metadata[3] = texture_index;
                 if let Some(material) = &mesh.material {
                     for channel in 0..4 { gpu.color[channel] *= material.base_color_factor[channel]; }
-                    gpu.pbr = [material.metallic_factor, material.roughness_factor, 1.0, 0.0];
-                    gpu.metadata[3] = u32::from(material.double_sided);
+                    let double_sided = if material.double_sided { 1.0 } else { 0.0 };
+                    gpu.pbr = [material.metallic_factor, material.roughness_factor, 1.0, double_sided];
                 }
                 grouped_instances.push(gpu);
                 draws.push(DrawInfo { bounds_min: [min.x, min.y, min.z, 0.0],

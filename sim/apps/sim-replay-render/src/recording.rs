@@ -3,6 +3,11 @@ use std::{collections::HashSet, fs, path::{Component, Path, PathBuf}};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
+pub const FORMAT: &str = "sim-city-replay-v2";
+const TRANSITION_FIELDS: [&str; 9] = ["throttle", "roll", "pitch", "yaw", "reward", "done", "success", "collision", "out_of_bounds"];
+const STATE_FIELDS: [&str; 13] = ["world_x", "world_y", "world_z", "quat_x", "quat_y", "quat_z", "quat_w",
+    "target_x", "target_y", "target_z", "design", "clock", "landed"];
+
 #[derive(Deserialize)]
 pub struct Recording {
     pub format: String,
@@ -12,8 +17,11 @@ pub struct Recording {
     pub video_width: u32,
     pub video_height: u32,
     pub views: Views,
+    pub style: u32,
     pub city_path: PathBuf,
     pub city_fingerprint: String,
+    pub state_fields: Vec<String>,
+    pub transition_fields: Vec<String>,
     pub environments: Vec<Environment>,
 }
 
@@ -26,31 +34,70 @@ pub struct Views {
 #[derive(Deserialize)]
 pub struct Environment {
     pub id: u32,
-    pub route_id: u32,
     pub frame_count: usize,
     pub duration_seconds: f64,
     pub outcome: String,
+    pub design: u32,
     pub video: PathBuf,
-    pub states: Vec<[f32; 8]>,
-    pub transitions: Vec<[f64; 5]>,
+    pub states: Vec<Vec<f32>>,
+    pub transitions: Vec<Vec<f64>>,
+}
+
+/// Recorded pose needed for one third-person frame.
+#[derive(Clone, Copy)]
+pub struct Pose {
+    pub position: [f32; 3],
+    /// xyzw, actual simulated attitude.
+    pub rotation: [f32; 4],
+    pub target: [f32; 3],
+}
+
+/// Column indices of the named state fields used by the renderer.
+#[derive(Clone, Copy)]
+pub struct StateColumns {
+    position: [usize; 3],
+    rotation: [usize; 4],
+    target: [usize; 3],
+    design: usize,
+    clock: usize,
+}
+
+impl StateColumns {
+    fn new(fields: &[String]) -> Result<Self> {
+        let column = |name: &str| fields.iter().position(|field| field == name)
+            .with_context(|| format!("manifest state_fields lacks {name}"));
+        Ok(Self {
+            position: [column("world_x")?, column("world_y")?, column("world_z")?],
+            rotation: [column("quat_x")?, column("quat_y")?, column("quat_z")?, column("quat_w")?],
+            target: [column("target_x")?, column("target_y")?, column("target_z")?],
+            design: column("design")?,
+            clock: column("clock")?,
+        })
+    }
+
+    pub fn pose(&self, state: &[f32]) -> Pose {
+        Pose { position: self.position.map(|i| state[i]), rotation: self.rotation.map(|i| state[i]),
+            target: self.target.map(|i| state[i]) }
+    }
 }
 
 impl Recording {
-    pub fn load(path: &Path) -> Result<(Self, PathBuf)> {
+    pub fn load(path: &Path) -> Result<(Self, PathBuf, StateColumns)> {
         let path = path.canonicalize().context("locating recording manifest")?;
         let directory = path.parent().context("manifest has no parent directory")?.to_path_buf();
         let mut recording: Self = serde_json::from_slice(
             &fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
         ).context("decoding replay manifest")?;
-        recording.validate(&directory)?;
+        let columns = recording.validate(&directory)?;
         if recording.city_path.is_relative() {
             recording.city_path = directory.join(&recording.city_path);
         }
-        Ok((recording, directory))
+        Ok((recording, directory, columns))
     }
 
-    fn validate(&self, directory: &Path) -> Result<()> {
-        ensure!(self.format == "sim-city-replay-v1", "unsupported replay format {}", self.format);
+    fn validate(&self, directory: &Path) -> Result<StateColumns> {
+        ensure!(self.format == FORMAT, "unsupported replay format {} (expected {FORMAT})", self.format);
+        ensure!(self.style <= 2, "style must be 0, 1 or 2");
         ensure!(self.control_hz.is_finite() && self.control_hz > 0.0, "control_hz must be positive and finite");
         ensure!(self.frame_width > 0 && self.frame_height > 0 && self.frame_height % 2 == 0,
             "frame dimensions must be positive, with even height for yuv420p");
@@ -59,13 +106,18 @@ impl Recording {
         ensure!(self.views.first_person == [0, 0, self.frame_width, self.frame_height]
             && self.views.third_person == [self.frame_width, 0, self.frame_width, self.frame_height],
             "manifest view rectangles do not match side-by-side video layout");
+        ensure!(self.transition_fields.iter().map(String::as_str).eq(TRANSITION_FIELDS),
+            "transition_fields must be exactly {TRANSITION_FIELDS:?}");
+        ensure!(STATE_FIELDS.iter().all(|name| self.state_fields.iter().any(|field| field == name)),
+            "state_fields must include {STATE_FIELDS:?}");
+        let columns = StateColumns::new(&self.state_fields)?;
         ensure!(!self.environments.is_empty(), "recording contains no environments");
         let mut ids = HashSet::new();
         let mut videos = HashSet::new();
         for environment in &self.environments {
             ensure!(ids.insert(environment.id), "duplicate environment ID {}", environment.id);
             ensure!(videos.insert(&environment.video), "duplicate video filename {}", environment.video.display());
-            environment.validate(self.control_hz)
+            environment.validate(self, &columns)
                 .with_context(|| format!("invalid environment {}", environment.id))?;
             let frame_bytes = u64::from(self.frame_width).checked_mul(u64::from(self.frame_height))
                 .and_then(|pixels| pixels.checked_mul(3)).context("raw RGB frame size overflows u64")?;
@@ -76,42 +128,51 @@ impl Recording {
             ensure!(metadata.is_file() && metadata.len() == expected,
                 "{} must contain exactly {} RGB24 bytes (found {})", raw.display(), expected, metadata.len());
         }
-        Ok(())
+        Ok(columns)
     }
 }
 
 impl Environment {
-    fn validate(&self, control_hz: f64) -> Result<()> {
+    fn validate(&self, recording: &Recording, columns: &StateColumns) -> Result<()> {
         let mut components = self.video.components();
         ensure!(matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
             && self.video.extension().is_some_and(|extension| extension == "mp4"),
             "video must be a basename ending in .mp4");
         ensure!(self.frame_count > 0 && self.states.len() == self.frame_count
             && self.transitions.len() == self.frame_count, "frame_count must equal nonempty state and transition lengths");
-        let duration = self.frame_count as f64 / control_hz;
+        let duration = self.frame_count as f64 / recording.control_hz;
         ensure!(self.duration_seconds.is_finite() && (self.duration_seconds - duration).abs() <= 1e-6 * duration.max(1.0),
             "duration_seconds must equal frame_count / control_hz");
-        ensure!(matches!(self.outcome.as_str(), "success" | "collision" | "timeout"), "unknown terminal outcome");
+        ensure!(matches!(self.outcome.as_str(), "success" | "collision" | "out_of_bounds" | "timeout"), "unknown terminal outcome");
+        let first_target = columns.target.map(|i| self.states[0][i]);
         for (index, (state, transition)) in self.states.iter().zip(&self.transitions).enumerate() {
+            ensure!(state.len() == recording.state_fields.len() && transition.len() == TRANSITION_FIELDS.len(),
+                "row width mismatch at frame {index}");
             ensure!(state.iter().all(|value| value.is_finite()) && transition.iter().all(|value| value.is_finite()),
                 "non-finite value at frame {index}");
-            ensure!(state[6] as f64 == f64::from(self.route_id) && state[7] as f64 == index as f64,
-                "route/clock discontinuity at frame {index}; autoreset states must not be appended");
-            ensure!(state[3..6] == self.states[0][3..6], "goal changes at frame {index}");
-            ensure!(transition[0].fract() == 0.0 && (0.0..=8.0).contains(&transition[0]), "invalid action at frame {index}");
-            ensure!(transition[2..].iter().all(|&value| value == 0.0 || value == 1.0),
+            ensure!(state[columns.clock] as f64 == index as f64,
+                "clock discontinuity at frame {index}; autoreset states must not be appended");
+            ensure!(state[columns.design] as f64 == f64::from(self.design), "design changes at frame {index}");
+            ensure!(columns.target.map(|i| state[i]) == first_target, "target moves at frame {index}");
+            let rotation = columns.rotation.map(|i| state[i]);
+            let norm = rotation.iter().map(|v| v * v).sum::<f32>().sqrt();
+            ensure!((norm - 1.0).abs() < 1e-3, "attitude quaternion is not unit at frame {index}");
+            ensure!(transition[..4].iter().all(|value| (-1.0..=1.0).contains(value)), "action outside [-1,1] at frame {index}");
+            ensure!(transition[5..].iter().all(|&value| value == 0.0 || value == 1.0),
                 "terminal flags must be zero or one at frame {index}");
             let last = index + 1 == self.frame_count;
-            ensure!((transition[2] == 1.0) == last, "only the last transition may be terminal");
+            ensure!((transition[5] == 1.0) == last, "only the last transition may be terminal");
+            let outcome = [transition[6], transition[7], transition[8]];
             if !last {
-                ensure!(transition[3] == 0.0 && transition[4] == 0.0, "early terminal outcome at frame {index}");
+                ensure!(outcome == [0.0; 3], "early terminal outcome at frame {index}");
             } else {
                 let expected = match self.outcome.as_str() {
-                    "success" => [1.0, 0.0],
-                    "collision" => [0.0, 1.0],
-                    _ => [0.0, 0.0],
+                    "success" => [1.0, 0.0, 0.0],
+                    "collision" => [0.0, 1.0, 0.0],
+                    "out_of_bounds" => [0.0, 0.0, 1.0],
+                    _ => [0.0; 3],
                 };
-                ensure!(transition[3..] == expected, "outcome disagrees with terminal transition");
+                ensure!(outcome == expected, "outcome disagrees with terminal transition");
             }
         }
         Ok(())

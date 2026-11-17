@@ -3,7 +3,7 @@ use std::{fs::{self, OpenOptions}, path::{Path, PathBuf}, process::{Child, Child
 use anyhow::{Context, Result, ensure};
 use sim_scene::CityScene;
 
-use crate::{capture::Capture, recording::{Environment, Recording}};
+use crate::{capture::Capture, proxy::Proxy, recording::{Environment, Recording, StateColumns}};
 
 // A failed encode never replaces a completed clip. Closing/killing/reaping the
 // child and removing only this export's partial file is guaranteed on all paths.
@@ -73,15 +73,18 @@ impl Drop for Encoder {
     }
 }
 
-pub fn export(capture: &Capture, scene: &CityScene, recording: &Recording, directory: &Path) -> Result<()> {
+pub fn export(capture: &Capture, scene: &CityScene, proxy: &Proxy, columns: &StateColumns,
+    recording: &Recording, directory: &Path) -> Result<()> {
     let mut completed_frames = 0usize;
     for environment in &recording.environments {
+        ensure!(proxy.validate_design(environment.design),
+            "environment {} design {} is not a target design of split {}", environment.id, environment.design, recording.style);
         let destination = directory.join(&environment.video);
         let mut encoder = Encoder::start(recording, environment, directory)
             .with_context(|| format!("starting environment {} export", environment.id))?;
         for (frame, state) in environment.states.iter().enumerate() {
             let input = encoder.input.as_mut().context("ffmpeg input already closed")?;
-            if let Err(error) = capture.write_frame(scene, state, input) {
+            if let Err(error) = capture.write_frame(scene, proxy, &columns.pose(state), environment.design, input) {
                 // Probe only this child, so an encoder that exited early gets
                 // reported alongside the frame/transfer error. Drop reaps it.
                 let status = encoder.child.try_wait().ok().flatten();

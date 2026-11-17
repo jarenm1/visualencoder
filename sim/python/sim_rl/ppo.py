@@ -1,12 +1,17 @@
-"""GPU-resident recurrent PPO with finite-horizon terminal (not truncation) GAE."""
+"""GPU-resident recurrent PPO (continuous Gaussian actions) with finite-horizon terminal GAE."""
 from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
-from torch import nn
 from torch.profiler import record_function
+
+from .curriculum import MODES as CURRICULUM_MODES, Curriculum
+from .model import gaussian_entropy, gaussian_log_prob
+
+HOVER_ACTION = (-0.2, 0.0, 0.0, 0.0)  # Blind hover-thrust command used by warmup and the hover baseline.
+PROPRIO_WIDTH = 18
 
 
 @contextmanager
@@ -26,7 +31,6 @@ class Config:
     sequence_length: int = 16
     epochs: int = 4
     minibatch_sequences: int = 32
-    hidden_size: int = 128
     learning_rate: float = 3e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -34,60 +38,18 @@ class Config:
     entropy: float = 0.01
     value_coefficient: float = 0.5
     max_grad_norm: float = 0.5
+    curriculum: str = "adaptive"
 
     def validate(self):
         if min(self.total_steps, self.rollout_steps, self.sequence_length,
-               self.epochs, self.minibatch_sequences, self.hidden_size) < 1:
+               self.epochs, self.minibatch_sequences) < 1:
             raise ValueError("PPO sizes and budget must be positive")
         if self.rollout_steps % self.sequence_length:
             raise ValueError("rollout_steps must be divisible by sequence_length")
         if self.learning_rate <= 0:
             raise ValueError("learning rate must be positive")
-
-
-PROPRIO_SCALE = (32.0, 6.0, 32.0, 3.0, 3.0, 3.0, 1.0, 1.0)
-
-
-class Policy(nn.Module):
-    def __init__(self, feature_dim, action_count, hidden_size=128):
-        super().__init__()
-        self.feature_dim, self.action_count, self.hidden_size = feature_dim, action_count, hidden_size
-        self.register_buffer("proprio_scale", torch.tensor(PROPRIO_SCALE))
-        self.input = nn.Sequential(nn.Linear(feature_dim + 8, hidden_size),
-                                   nn.LayerNorm(hidden_size), nn.Tanh())
-        self.gru = nn.GRUCell(hidden_size, hidden_size)
-        self.actor = nn.Linear(hidden_size, action_count)
-        self.critic = nn.Linear(hidden_size, 1)
-        for layer in self.modules():
-            if isinstance(layer, nn.Linear):
-                nn.init.orthogonal_(layer.weight, 2 ** 0.5)
-                nn.init.zeros_(layer.bias)
-        nn.init.orthogonal_(self.actor.weight, 0.01)
-        nn.init.orthogonal_(self.critic.weight, 1.0)
-
-    def forward(self, features, proprio, hidden, starts):
-        hidden = hidden * (1 - starts).unsqueeze(-1)
-        hidden = self.gru(self.input(torch.cat((features, proprio / self.proprio_scale), -1)), hidden)
-        return self.actor(hidden), self.critic(hidden).squeeze(-1), hidden
-
-    def sequence(self, features, proprio, hidden, starts):
-        logits, values = [], []
-        for t in range(features.shape[0]):
-            logit, value, hidden = self(features[t], proprio[t], hidden, starts[t])
-            logits.append(logit)
-            values.append(value)
-        return torch.stack(logits), torch.stack(values)
-
-
-def categorical(logits, actions=None):
-    """Gumbel-max sampling avoids Categorical validation and multinomial syncs."""
-    log_probs = logits.log_softmax(-1)
-    if actions is None:
-        uniform = torch.rand_like(logits).clamp_(1e-7, 1 - 1e-7)
-        actions = (logits - (-uniform.log()).log()).argmax(-1)
-    selected = log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
-    entropy = -(log_probs.exp() * log_probs).sum(-1)
-    return actions, selected, entropy
+        if self.curriculum not in CURRICULUM_MODES:
+            raise ValueError(f"curriculum must be one of {CURRICULUM_MODES}")
 
 
 def terminal_gae(rewards, values, done, gamma, lam, out=None):
@@ -107,40 +69,69 @@ def terminal_gae(rewards, values, done, gamma, lam, out=None):
 
 
 class Trainer:
+    """Rollout storage is preallocated; collection and update never read values back to the host."""
+
     def __init__(self, env, features, policy, config):
         config.validate()
-        if policy.action_count != env.action_count:
-            raise ValueError("policy action dimension differs from native city task")
+        if policy.action_dim != env.action_dim:
+            raise ValueError("policy action dimension differs from native city-drone task")
+        if policy.mode == "visual" and not features.visual:
+            raise ValueError("visual policy requires a visual encoder")
+        if policy.mode != "visual" and features.visual:
+            raise ValueError("non-visual policy must not own a visual encoder")
         self.env, self.features, self.policy, self.config = env, features, policy, config
         self.optimizer = torch.optim.Adam(policy.parameters(), lr=config.learning_rate, fused=True, capturable=True)
         self.steps = 0
-        t, n, d, h = config.rollout_steps, env.n, features.dim, config.hidden_size
+        self.curriculum = Curriculum(config.curriculum, env.device)
+        self.curriculum.write(env)
+        t, n, h = config.rollout_steps, env.n, policy.hidden_size
         allocate = lambda *shape: torch.empty(shape, device=env.device)
-        self.visual = allocate(t + 1, n, d)
-        self.proprio = allocate(t + 1, n, 8)
-        self.starts = allocate(t + 1, n)
+        self.proprio = allocate(t, n, PROPRIO_WIDTH)
+        self.privileged = allocate(t, n, PROPRIO_WIDTH)
+        self.designs = torch.zeros((t, n), device=env.device, dtype=torch.long)
+        self.starts = allocate(t, n)
         self.hidden = allocate(t, n, h)
-        self.actions = torch.empty((t, n), device=env.device, dtype=torch.int64)
-        self.logprobs, self.rewards, self.done = (allocate(t, n) for _ in range(3))
-        self.success, self.collision = allocate(t, n), allocate(t, n)
+        self.actions = allocate(t, n, env.action_dim)
+        self.logprobs, self.rewards, self.done = allocate(t, n), allocate(t, n), allocate(t, n)
+        self.success, self.collision, self.out_of_bounds, self.ended = (allocate(t, n) for _ in range(4))
         self.values, self.advantages, self.returns = allocate(t + 1, n), allocate(t, n), allocate(t, n)
-        self.current = allocate(n, d)
+        self.completed_returns = allocate(t, n)
+        self.applied = allocate(n, env.action_dim)
+        self.bucket_ids = torch.arange(3, device=env.device, dtype=torch.float32)
         self.memory = torch.zeros((n, h), device=env.device)
         self.next_start = torch.ones(n, device=env.device)
         self.episode_return = torch.zeros(n, device=env.device)
-        self.completed_returns = allocate(t, n)
-        self.current.copy_(features(env))
+        if features.visual:
+            patches = env.height // 16 * (env.width // 16)
+            self.goals = features.goal_table(env.goal_images)
+            self.cls = allocate(t, n, features.dim)
+            self.tokens = torch.empty((t, n, patches, features.dim), device=env.device, dtype=torch.bfloat16)
+        else:
+            self.goals = self.cls = self.tokens = None
+        self.current_cls = self.current_tokens = None
         self._sequence_offsets = torch.arange(config.sequence_length, device=env.device).unsqueeze(1)
+        self._observe()
+
+    def _observe(self):
+        if self.features.visual:
+            self.current_cls, self.current_tokens = self.features.observe(self.env)
+
+    def _inputs(self, cls, tokens, design, proprio, privileged):
+        goal = self.goals[design] if self.features.visual else None
+        return self.policy.actor_inputs(cls, tokens, goal, proprio, privileged)
 
     @torch.no_grad()
     def warmup(self, seed, iterations=3):
         """Initialize kernels/allocator, then discard warmup physics episodes."""
-        action = torch.full((self.env.n,), self.env.neutral_action, dtype=torch.int64, device=self.env.device)
+        hover = torch.tensor(HOVER_ACTION, device=self.env.device).expand(self.env.n, -1).contiguous()
         for _ in range(iterations):
-            self.policy(self.features(self.env), self.env.proprio, self.memory, self.next_start)
-            self.env.step(action)
+            inputs = self._inputs(self.current_cls, self.current_tokens, self.env.design.long(),
+                                  self.env.proprio, self.env.privileged)
+            self.policy.step(inputs, self.memory, self.next_start)
+            self.env.step(hover)
+            self._observe()
         self.env.reset(seed)
-        self.current.copy_(self.features(self.env))
+        self._observe()
         self.memory.zero_()
         self.next_start.fill_(1)
         self.episode_return.zero_()
@@ -151,42 +142,49 @@ class Trainer:
         length = self.config.rollout_steps if length is None else length
         if length < 1 or length > self.config.rollout_steps or length % self.config.sequence_length:
             raise ValueError("rollout must fit preallocation and contain complete recurrent sequences")
-        self.policy.eval()
+        log_std = self.policy.log_std
         with gpu_range("sim.collect"):
             for t in range(length):
-                self.visual[t].copy_(self.current)
                 self.proprio[t].copy_(self.env.proprio)
+                self.privileged[t].copy_(self.env.privileged)
+                self.designs[t].copy_(self.env.design)
                 self.starts[t].copy_(self.next_start)
                 self.hidden[t].copy_(self.memory)
-                logits, value, memory = self.policy(self.visual[t], self.proprio[t], self.memory, self.next_start)
-                action, logprob, _ = categorical(logits)
-                self.actions[t].copy_(action)
-                self.logprobs[t].copy_(logprob)
-                self.values[t].copy_(value)
+                if self.features.visual:
+                    self.cls[t].copy_(self.current_cls)
+                    self.tokens[t].copy_(self.current_tokens)
+                inputs = self._inputs(self.cls[t] if self.features.visual else None,
+                                      self.tokens[t] if self.features.visual else None,
+                                      self.designs[t], self.proprio[t], self.privileged[t])
+                mean, memory = self.policy.step(inputs, self.memory, self.next_start)
+                sample = mean + log_std.exp() * torch.randn_like(mean)
+                self.actions[t].copy_(sample)
+                self.logprobs[t].copy_(gaussian_log_prob(mean, log_std, sample))
+                self.values[t].copy_(self.policy.value(self.privileged[t], self.proprio[t]))
                 self.memory.copy_(memory)
-                self.env.step(self.actions[t])
+                # Only the clamped command reaches the simulator; the unclipped
+                # sample remains the log-probability's action.
+                torch.clamp(sample, -1, 1, out=self.applied)
+                self.env.step(self.applied)
                 self.rewards[t].copy_(self.env.reward)
                 self.done[t].copy_(self.env.done)
                 self.success[t].copy_(self.env.success)
                 self.collision[t].copy_(self.env.collision)
+                self.out_of_bounds[t].copy_(self.env.out_of_bounds)
+                self.ended[t].copy_(self.env.ended_bucket)
                 self.episode_return.add_(self.env.reward)
                 self.completed_returns[t].copy_(self.episode_return * self.env.done)
                 self.episode_return.mul_(1 - self.env.done)
                 self.next_start.copy_(self.env.done)
-                # Native returns the reset observation on completion. The next
-                # action sees it with a reset GRU; completion flags remain old.
-                self.current.copy_(self.features(self.env))
-            self.visual[length].copy_(self.current)
-            self.proprio[length].copy_(self.env.proprio)
-            self.starts[length].copy_(self.next_start)
-            _, bootstrap, _ = self.policy(self.current, self.env.proprio, self.memory, self.next_start)
-            self.values[length].copy_(bootstrap)
+                # Native returns the reset observation on completion; the next
+                # tick sees it with a reset GRU while completion flags remain old.
+                self._observe()
+            self.values[length].copy_(self.policy.value(self.env.privileged, self.env.proprio))
         self.steps += length * self.env.n
         return length
 
     def update(self, length):
         cfg, n = self.config, self.env.n
-        self.policy.train()
         with gpu_range("sim.ppo_update"):
             with torch.no_grad():
                 advantage = terminal_gae(self.rewards[:length], self.values[:length + 1],
@@ -204,10 +202,21 @@ class Trainer:
                     env_ids = ids.remainder(n)
                     first = ids.div(n, rounding_mode="floor") * cfg.sequence_length
                     times = first.unsqueeze(0) + self._sequence_offsets
-                    logits, values = self.policy.sequence(
-                        self.visual[times, env_ids], self.proprio[times, env_ids],
-                        self.hidden[first, env_ids], self.starts[times, env_ids])
-                    _, logprobs, entropy = categorical(logits, self.actions[times, env_ids])
+                    proprio = self.proprio[times, env_ids]
+                    privileged = self.privileged[times, env_ids]
+                    length_b, batch = times.shape
+                    if self.features.visual:
+                        inputs = self._inputs(self.cls[times, env_ids].flatten(0, 1),
+                                              self.tokens[times, env_ids].flatten(0, 1),
+                                              self.designs[times, env_ids].flatten(),
+                                              proprio.flatten(0, 1), privileged.flatten(0, 1))
+                    else:
+                        inputs = self._inputs(None, None, None, proprio.flatten(0, 1), privileged.flatten(0, 1))
+                    means = self.policy.sequence(inputs.view(length_b, batch, -1),
+                                                 self.hidden[first, env_ids], self.starts[times, env_ids])
+                    logprobs = gaussian_log_prob(means, self.policy.log_std, self.actions[times, env_ids])
+                    entropy = gaussian_entropy(self.policy.log_std)
+                    values = self.policy.value(privileged, proprio)
                     logratio = logprobs - self.logprobs[times, env_ids]
                     ratio = logratio.exp()
                     adv = self.advantages[times, env_ids]
@@ -216,79 +225,44 @@ class Trainer:
                     clipped_value = old_value + (values - old_value).clamp(-cfg.clip, cfg.clip)
                     target = self.returns[times, env_ids]
                     value_loss = 0.5 * torch.maximum((values - target).square(), (clipped_value - target).square()).mean()
-                    mean_entropy = entropy.mean()
-                    loss = policy_loss + cfg.value_coefficient * value_loss - cfg.entropy * mean_entropy
+                    loss = policy_loss + cfg.value_coefficient * value_loss - cfg.entropy * entropy
                     self.optimizer.zero_grad(set_to_none=True)
                     loss.backward()
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.max_grad_norm, foreach=True)
                     self.optimizer.step()
                     with torch.no_grad():
-                        losses.add_(torch.stack((policy_loss, value_loss, mean_entropy,
+                        losses.add_(torch.stack((policy_loss, value_loss, entropy,
                                                  ((ratio - 1) - logratio).mean(),
                                                  ((ratio - 1).abs() > cfg.clip).float().mean(), grad_norm)))
                     batches += 1
             losses.div_(batches)
         return losses
 
-    def metrics(self, length, losses):
-        """Return GPU aggregates; the CLI reads them only outside hot ranges."""
-        totals = torch.stack((self.rewards[:length].mean(), self.done[:length].sum(),
-                              self.success[:length].sum(), self.collision[:length].sum(),
-                              self.completed_returns[:length].sum()))
-        return torch.cat((totals, losses))
+    @torch.no_grad()
+    def bucket_totals(self, length):
+        """float32 [4, 3]: completed episodes, successes, collisions, out-of-bounds per visibility bucket."""
+        done = self.done[:length].reshape(-1)
+        onehot = (self.ended[:length].reshape(-1, 1) == self.bucket_ids).float()
+        flags = torch.stack((done, done * self.success[:length].reshape(-1),
+                             done * self.collision[:length].reshape(-1),
+                             done * self.out_of_bounds[:length].reshape(-1)))
+        return flags @ onehot
 
+    @torch.no_grad()
+    def finish_rollout(self, length, losses):
+        """GPU-only end-of-rollout bookkeeping: curriculum update for the next rollout and metrics.
 
-@torch.no_grad()
-def evaluate(env, features, policy=None, heuristic=None, seed=0):
-    """One first completed episode per environment over the native finite horizon."""
-    if (policy is None) == (heuristic is None):
-        raise ValueError("provide exactly one trained policy or blind heuristic")
-    n = env.n
-    active = torch.ones(n, device=env.device)
-    totals = torch.zeros((5, n), device=env.device)  # return, success, collision, length, completions
-    hidden_size = policy.hidden_size if policy is not None else 1
-    memory = torch.zeros((n, hidden_size), device=env.device)
-    starts = torch.ones(n, device=env.device)
-    actions = torch.empty(n, dtype=torch.int64, device=env.device)
-    generator = torch.Generator(device=env.device).manual_seed(seed)
-    if policy is not None:
-        policy.eval()
-    with gpu_range("sim.evaluate"):
-        for _ in range(env.horizon):
-            if policy is not None:
-                logits, _, memory = policy(features(env), env.proprio, memory, starts)
-                actions.copy_(logits.argmax(-1))
-            elif heuristic == "hover":
-                actions.fill_(env.neutral_action)
-            elif heuristic == "random":
-                torch.randint(env.action_count, (n,), device=env.device, generator=generator, out=actions)
-            elif heuristic == "goal_centering":
-                # The city camera auto-yaws at the final goal: forward is the
-                # honest blind goal-centering control, not a waypoint oracle.
-                actions.fill_(1)
-            else:
-                raise ValueError(f"unknown blind heuristic {heuristic}")
-            env.step(actions)
-            totals[0].add_(active * env.reward)
-            totals[1].add_(active * env.success)
-            totals[2].add_(active * env.collision)
-            totals[3].add_(active)
-            totals[4].add_(active * env.done)
-            active.mul_(1 - env.done)
-            starts.copy_(env.done)
-    # A single aggregate transfer after the finite horizon, never a scalar read in
-    # the loop. Include squares for return standard errors and successful
-    # lengths separately: collision duration is not time-to-goal.
-    aggregate = torch.cat((totals.sum(1), totals[0].square().sum().reshape(1),
-                           active.sum().reshape(1), (totals[3] * totals[1]).sum().reshape(1)))
-    env.stream.synchronize()  # Explicit evaluation end-batch boundary.
-    values = aggregate.cpu().tolist()
-    if values[6] != 0 or values[4] != n:
-        raise RuntimeError(f"native finite horizon violated: {values[6]} unfinished of {n}")
-    mean_return = values[0] / n
-    mean_success_steps = values[7] / values[1] if values[1] else None
-    return {"episodes": n, "success": values[1] / n, "collision": values[2] / n,
-            "mean_return": mean_return, "mean_steps": values[3] / n,
-            "mean_success_steps": mean_success_steps,
-            "return_standard_error": (max(0, values[5] / n - mean_return ** 2) / n) ** 0.5,
-            "policy": heuristic or "checkpoint", "horizon_terminal": env.horizon}
+        Returns float32 [32]: rollout totals (5), PPO losses (6), bucket totals (12,
+        row-major [4,3]), weights used this rollout (3), weights for the next rollout (3),
+        success EMAs (3).
+        """
+        totals = self.bucket_totals(length)
+        used = self.curriculum.weights.clone()
+        self.curriculum.observe(totals[0], totals[1])
+        self.curriculum.advance()
+        self.curriculum.write(self.env)
+        rollout = torch.stack((self.rewards[:length].mean(), self.done[:length].sum(),
+                               self.success[:length].sum(), self.collision[:length].sum(),
+                               self.completed_returns[:length].sum()))
+        return torch.cat((rollout, losses, totals.flatten(), used,
+                          self.curriculum.weights, self.curriculum.ema))

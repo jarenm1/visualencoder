@@ -1,4 +1,4 @@
-use std::{io::Write, sync::{Arc, mpsc}};
+use std::{cell::RefCell, io::Write, sync::{Arc, mpsc}};
 
 use anyhow::{Context, Result, ensure};
 use glam::Vec3;
@@ -7,7 +7,7 @@ use sim_render::{Camera, CameraGpu, RenderBindings, RenderConfig, Renderer};
 use sim_scene::CityScene;
 use sim_state::BodyState;
 
-use crate::{proxy, recording::Recording};
+use crate::{proxy::{self, Proxy}, recording::{Pose, Recording, StateColumns}};
 
 pub struct Capture {
     gpu: Arc<Gpu>,
@@ -21,12 +21,13 @@ pub struct Capture {
     aspect: f32,
     send: mpsc::SyncSender<Result<(), wgpu::BufferAsyncError>>,
     receive: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    staging: RefCell<Vec<BodyState>>,
 }
 
 impl Capture {
-    pub fn new(scene: &CityScene, recording: &Recording) -> Result<Self> {
+    pub fn new(scene: &CityScene, recording: &Recording, columns: &StateColumns, proxy: &Proxy) -> Result<Self> {
         let gpu = Gpu::new(0).context("creating offline Vulkan device")?;
-        let camera = chase_camera(scene, &recording.environments[0].states[0])?;
+        let camera = chase_camera(scene, &columns.pose(&recording.environments[0].states[0]))?;
         let config = RenderConfig { width: recording.frame_width, height: recording.frame_height, ..Default::default() };
         // SAFETY: startup texture uploads only; the queue is not retained or
         // reentered, and no exchange or shared CUDA allocations are involved.
@@ -37,7 +38,7 @@ impl Capture {
         let buffer = |label, size, usage| gpu.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some(label), size, usage, mapped_at_creation: false,
         });
-        let bodies = buffer("replay proxy body states", (size_of::<BodyState>() * 2) as u64,
+        let bodies = buffer("replay proxy body states", (size_of::<BodyState>() * proxy.body_count()) as u64,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
         let camera = buffer("replay chase camera", size_of::<CameraGpu>() as u64,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
@@ -49,12 +50,15 @@ impl Capture {
         let bindings = renderer.bind(gpu.device(), &bodies, &output, Some(&camera))?;
         let (send, receive) = mpsc::sync_channel(1);
         Ok(Self { gpu, renderer, bindings, bodies, camera, output, readback, frame_bytes,
-            aspect: recording.frame_width as f32 / recording.frame_height as f32, send, receive })
+            aspect: recording.frame_width as f32 / recording.frame_height as f32, send, receive,
+            staging: RefCell::new(Vec::with_capacity(proxy.body_count())) })
     }
 
-    pub fn write_frame(&self, scene: &CityScene, state: &[f32; 8], destination: &mut impl Write) -> Result<()> {
-        let bodies = proxy::bodies(state);
-        let camera = chase_camera(scene, state)?.gpu(self.aspect);
+    pub fn write_frame(&self, scene: &CityScene, proxy: &Proxy, pose: &Pose, design: u32,
+        destination: &mut impl Write) -> Result<()> {
+        let mut bodies = self.staging.borrow_mut();
+        proxy.bodies(pose, design, &mut bodies);
+        let camera = chase_camera(scene, pose)?.gpu(self.aspect);
         self.gpu.write_buffer(&self.bodies, 0, bytemuck::cast_slice(&bodies));
         self.gpu.write_buffer(&self.camera, 0, bytemuck::bytes_of(&camera));
         let mut encoder = self.gpu.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -83,13 +87,13 @@ impl Capture {
     }
 }
 
-fn chase_camera(scene: &CityScene, state: &[f32; 8]) -> Result<Camera> {
-    let target = Vec3::new(state[0], state[1], state[2]);
-    let goal = Vec3::new(state[3], state[4], state[5]);
-    let forward = proxy::forward(target, goal);
+fn chase_camera(scene: &CityScene, pose: &Pose) -> Result<Camera> {
+    let target = Vec3::from_array(pose.position);
+    // Follow the recorded body heading, i.e. where the policy camera points.
+    let forward = proxy::heading(pose.rotation);
     let right = forward.cross(Vec3::Y);
     let radius = 0.12;
-    ensure!(!scene.sweep_hits(target.to_array(), target.to_array(), radius),
+    ensure!(!scene.sweep_hits(target.to_array(), target.to_array(), radius, 0),
         "recorded drone pose is inside city geometry; no collision-safe chase camera origin");
     let desired = -forward * 4.6 + Vec3::Y * 2.5;
     let mut offset = clip(scene, target, desired, radius);
@@ -117,7 +121,7 @@ fn chase_camera(scene: &CityScene, state: &[f32; 8]) -> Result<Camera> {
 }
 
 fn clip(scene: &CityScene, origin: Vec3, offset: Vec3, radius: f32) -> Vec3 {
-    let hits = |fraction: f32| scene.sweep_hits(origin.to_array(), (origin + offset * fraction).to_array(), radius);
+    let hits = |fraction: f32| scene.sweep_hits(origin.to_array(), (origin + offset * fraction).to_array(), radius, 0);
     if !hits(1.0) {
         return offset;
     }

@@ -3,7 +3,8 @@ import unittest
 
 import torch
 
-from sim_rl.ppo import Policy, terminal_gae
+from sim_rl.model import ActorCritic
+from sim_rl.ppo import terminal_gae
 
 
 class TerminalGAETest(unittest.TestCase):
@@ -24,14 +25,15 @@ class TerminalGAETest(unittest.TestCase):
 
     def test_gru_start_discards_previous_episode_memory(self):
         torch.manual_seed(7)
-        policy = Policy(4, action_count=9, hidden_size=8)
-        self.assertEqual(policy.actor.out_features, 9)
-        features, proprio = torch.randn(3, 4), torch.randn(3, 8)
-        old = torch.randn(3, 8)
-        a = policy(features, proprio, old, torch.ones(3))
-        b = policy(features, proprio, torch.zeros_like(old), torch.zeros(3))
-        for actual, expected in zip(a, b):
-            torch.testing.assert_close(actual, expected)
+        policy = ActorCritic("hint", 0, 0, 15, 20, action_dim=4)
+        proprio = torch.randn(3, 18)
+        inputs = policy.actor_inputs(None, None, None, proprio, torch.randn(3, 18))
+        old = torch.randn(3, policy.hidden_size)
+        mean_a, hidden_a = policy.step(inputs, old, torch.ones(3))
+        mean_b, hidden_b = policy.step(inputs, torch.zeros_like(old), torch.zeros(3))
+        self.assertEqual(tuple(mean_a.shape), (3, 4))
+        torch.testing.assert_close(mean_a, mean_b)
+        torch.testing.assert_close(hidden_a, hidden_b)
 
 
 if __name__ == "__main__":

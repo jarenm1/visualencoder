@@ -1,81 +1,80 @@
-//! Shared, allocation-free city task constants and route layouts.
-use bytemuck::{Pod, Zeroable};
+//! Constants and counter-based hashing for city-drone-goal-v1 (ABI v3).
+//!
+//! Plain integer and constant definitions shared by the host and the CUDA kernels.
 
-pub const ALTITUDE: f32 = 6.0;
-pub const SPEED: f32 = 3.0;
-pub const DRONE_RADIUS: f32 = 0.35;
-pub const PLANNING_RADIUS: f32 = 0.85;
-pub const GOAL_RADIUS: f32 = 1.0;
-pub const WAYPOINT_RADIUS: f32 = 0.25;
-pub const HORIZON: u32 = 320;
-pub const PHYSICS_HZ: u32 = 120;
-pub const SUBSTEPS: u32 = 6;
-pub const ROUTES_PER_SPLIT: usize = 128;
-pub const GRID_SPACING: f32 = 2.0;
-pub const DISTRICT_HALF_SIZE: f32 = 32.0;
-pub const MIN_ROUTE_LENGTH: f32 = 12.0;
-pub const MAX_ROUTE_LENGTH: f32 = 38.0;
-pub const CATALOG_SEEDS: [u64; 3] = [
-    0x65a4_947b_3a2d_7811, 0xb8d0_c5e4_109a_3267, 0x2f61_39ac_75e8_d403,
-];
+pub const TASK_NAME: &str = "city-drone-goal-v1";
+pub const ABI_VERSION: u32 = 3;
+pub const ACTION_DIM: usize = 4;
+pub const SENSOR_DIM: usize = 18;
+pub const PRIVILEGED_DIM: usize = 18;
+pub const DIAGNOSTIC_DIM: usize = 24;
+pub const CATALOG_SIZE: usize = 65536;
+/// Floats per camera slot: view (16), view-projection (16), eye (4).
+pub const CAMERA_FLOATS: usize = 36;
+pub const FIELD_COUNT: usize = 14;
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub(crate) struct Route {
-    pub first: u32,
-    pub count: u32,
-    pub length: f32,
-    pub reserved: u32,
+/// Keep-in margin applied to the district rectangle (metres).
+pub const DISTRICT_MARGIN: f32 = 2.0;
+/// Y coordinate of target slots not used by the active episode design.
+pub const TARGET_PARK_Y: f32 = -1000.0;
+
+pub const EVENT_CRASH: u32 = 1;
+pub const EVENT_OOB: u32 = 2;
+
+/// cos(pi/6): minimum upright component of body up for a landing.
+pub const COS_LANDING_TILT: f32 = 0.866_025_4;
+/// Landed-body velocity damping rate (1/s) applied while in contact.
+pub const SETTLE_RATE: f32 = 8.0;
+
+pub const GPS_MIN_RADIUS: f32 = 2.0;
+pub const GPS_RADIUS_FRACTION: f32 = 0.25;
+pub const GPS_VERTICAL: f32 = 1.0;
+/// Normalisation for metre-scale relative positions.
+pub const GPS_SCALE: f32 = 32.0;
+/// Normalisation for body rates (rad/s).
+pub const RATE_SCALE: f32 = 3.5;
+/// Normalisation for velocities (m/s).
+pub const VELOCITY_SCALE: f32 = 5.0;
+/// Normalisation for height above the landable surface (m).
+pub const HEIGHT_SCALE: f32 = 10.0;
+
+pub const NOISE_GYRO: f32 = 0.02;
+pub const NOISE_VELOCITY: f32 = 0.1;
+pub const NOISE_HEIGHT: f32 = 0.03;
+
+// Gaussian lanes consume unit lanes 2*lane and 2*lane+1. Uniform lanes start at 16.
+pub const LANE_GYRO: u32 = 0;
+pub const LANE_VELOCITY: u32 = 3;
+pub const LANE_HEIGHT: u32 = 6;
+pub const LANE_BUCKET: u32 = 16;
+pub const LANE_CATALOG: u32 = 17;
+pub const LANE_GPS_RADIUS: u32 = 18;
+pub const LANE_GPS_ANGLE: u32 = 19;
+pub const LANE_GPS_VERTICAL: u32 = 20;
+
+const GOLDEN: u64 = 0x9e37_79b9_7f4a_7c15;
+const LANE_MUL: u64 = 0xd1b5_4a32_d192_ed03;
+
+/// splitmix64 finaliser.
+#[inline(always)]
+pub fn mix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
-/// xyz position and exact suffix polyline distance to final goal in metres.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub(crate) struct Waypoint {
-    pub position: [f32; 3],
-    pub remaining: f32,
+/// Base hash for one (seed, env, episode, step) stream.
+#[inline(always)]
+pub fn stream(seed: u64, env: u32, episode: u64, step: u32) -> u64 {
+    let h = mix(seed ^ GOLDEN);
+    let h = mix(h ^ env as u64);
+    let h = mix(h ^ episode);
+    mix(h ^ step as u64)
 }
 
-pub fn mix(mut x: u64) -> u64 {
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
-}
-
-pub fn episode_route(seed: u64, env: u32, episode: u64, count: u32) -> u32 {
-    (mix(seed ^ (env as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        ^ episode.wrapping_mul(0xd1b5_4a32_d192_ed03)) % count as u64) as u32
-}
-
-/// (right, forward), normalized; the public action numbering is clockwise.
-pub fn action_direction(action: i64) -> [f32; 2] {
-    const D: f32 = core::f32::consts::FRAC_1_SQRT_2;
-    match action {
-        1 => [0.0, 1.0], 2 => [D, D], 3 => [1.0, 0.0],
-        4 => [D, -D], 5 => [0.0, -1.0], 6 => [-D, -D],
-        7 => [-1.0, 0.0], 8 => [-D, D], _ => [0.0, 0.0],
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn commands_are_unit_and_clockwise() {
-        assert_eq!(action_direction(0), [0.0, 0.0]);
-        assert_eq!(action_direction(3), [1.0, 0.0]);
-        assert_eq!(action_direction(7), [-1.0, 0.0]);
-        for a in 1..=8 {
-            let [r, f] = action_direction(a);
-            assert!((r * r + f * f - 1.0).abs() < 1e-6);
-        }
-    }
-    #[test]
-    fn route_selection_is_episode_local_and_repeatable() {
-        // Repeated routes are legal; test independent sequences, not uniqueness.
-        assert!((0..128).any(|episode|
-            episode_route(7, 2, episode, 128) != episode_route(7, 3, episode, 128)));
-        assert!((0..128).any(|episode|
-            episode_route(7, 2, episode, 128) != episode_route(8, 2, episode, 128)));
-    }
+/// Uniform in (0, 1) for `lane` of a stream base.
+#[inline(always)]
+pub fn unit(base: u64, lane: u32) -> f32 {
+    let h = mix(base ^ (lane as u64).wrapping_mul(LANE_MUL));
+    ((h >> 40) as f32 + 0.5) * (1.0 / 16_777_216.0)
 }

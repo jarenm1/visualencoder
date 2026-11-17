@@ -11,7 +11,9 @@ use anyhow::{Context, Result, ensure};
 use glam::{Mat3, Mat4, Vec3};
 use sha2::{Digest, Sha256};
 use sim_render::{BaseColorImage, BaseColorTexture, Instance, MeshData, MeshMaterial, MeshVertex, WrapMode};
-use sim_state::collision::{BvhNode, Triangle};
+use sim_state::collision::{BvhNode, LANDABLE, Triangle};
+
+pub mod drone;
 
 pub struct CityScene {
     pub meshes: Vec<MeshData>,
@@ -19,14 +21,29 @@ pub struct CityScene {
     pub nodes: Vec<BvhNode>,
     pub triangles: Vec<Triangle>,
     pub half_extent: f32,
+    pub landable: Landable,
     pub fingerprint: String,
+}
+
+/// Landable geometry. Every landable vertex lies within the level band, so the plane at
+/// `height` (the highest landable vertex) is at or above every landable feature.
+#[derive(Clone, Copy, Debug)]
+pub struct Landable {
+    pub height: f32,
+    pub triangles: usize,
+    pub non_level: usize,
 }
 
 // Triangle-centroid bins bound the work submitted to each camera without replacing
 // or clipping any geometry. Large triangles retain their full conservative bounds.
 const CHUNK_METRES: f32 = 16.0;
 const LEAF_TRIANGLES: usize = 8;
-const ASSETS: [&str; 6] = ["building.glb", "vegetation.glb", "vehicle.glb", "road.glb", "prop.glb", "ground.glb"];
+const ASSETS: [(&str, &str); 6] = [("building.glb", "building"), ("vegetation.glb", "vegetation"),
+    ("vehicle.glb", "vehicle"), ("road.glb", "road"), ("prop.glb", "prop"), ("ground.glb", "ground")];
+// Every landable vertex must lie within this band of y = 0.
+const LEVEL_BAND: f32 = 0.25;
+// Landable triangles with |n_y| / |n| at or below this cosine are counted as non-level (curbs, steps).
+const LEVEL_COS: f32 = 0.98;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct MaterialKey {
@@ -60,7 +77,9 @@ impl CityScene {
         let mut hash = Sha256::new();
         hash_file(&mut hash, "layout.json", &layout);
         let mut importer = Importer::default();
-        for name in ASSETS {
+        let classes = json["classes"].as_array().context("layout lacks classes")?;
+        for (name, class_name) in ASSETS {
+            let class = class_index(classes, class_name)?;
             let bytes = std::fs::read(path.join(name)).with_context(|| format!("reading {name}"))?;
             hash_file(&mut hash, name, &bytes);
             // These city GLBs are self-contained. import_slice resolves embedded
@@ -69,11 +88,12 @@ impl CityScene {
             let images = images.into_iter().map(|data| importer.image(data)).collect::<Result<Vec<_>>>()?;
             let scene = document.default_scene().or_else(|| document.scenes().next()).context("GLB lacks a scene")?;
             for node in scene.nodes() {
-                importer.node(node, Mat4::IDENTITY, &buffers, &images)?;
+                importer.node(node, Mat4::IDENTITY, &buffers, &images, class)?;
             }
         }
         ensure!(!importer.triangles.is_empty(), "city contains no triangles");
         ensure!(importer.triangles.len() <= u32::MAX as usize, "city triangle count exceeds collision ABI");
+        let landable = landable_plane(&importer.triangles)?;
         let meshes: Vec<_> = importer.chunks.into_values().map(|chunk| chunk.mesh).collect();
         let instances = (0..meshes.len()).map(|mesh| {
             let mut instance = Instance::static_mesh(mesh);
@@ -84,15 +104,16 @@ impl CityScene {
         let leaves = importer.triangles.len().div_ceil(LEAF_TRIANGLES).next_power_of_two();
         let mut nodes = Vec::with_capacity(leaves * 2 - 1);
         build_bvh(&mut importer.triangles, 0, &mut nodes);
-        Ok(Self { meshes, instances, nodes, triangles: importer.triangles, half_extent,
+        Ok(Self { meshes, instances, nodes, triangles: importer.triangles, half_extent, landable,
             fingerprint: format!("sha256:{:x}", hash.finalize()) })
     }
 
-    pub fn sweep_hits(&self, from: [f32; 3], to: [f32; 3], radius: f32) -> bool {
+    /// Bit k of `ignore` skips triangles of class k; the BVH is still traversed in full.
+    pub fn sweep_hits(&self, from: [f32; 3], to: [f32; 3], radius: f32, ignore: u32) -> bool {
         // The immutable vectors own every node/range visited by the shared
         // stackless CPU/CUDA implementation for the duration of this call.
         unsafe { sim_state::collision::sweep_hits(self.nodes.as_ptr(), self.nodes.len() as u32,
-            self.triangles.as_ptr(), from, to, radius) }
+            self.triangles.as_ptr(), from, to, radius, ignore) }
     }
 }
 
@@ -136,7 +157,7 @@ impl Importer {
         Ok(image)
     }
 
-    fn node(&mut self, node: gltf::Node<'_>, parent: Mat4, buffers: &[gltf::buffer::Data], images: &[Arc<BaseColorImage>]) -> Result<()> {
+    fn node(&mut self, node: gltf::Node<'_>, parent: Mat4, buffers: &[gltf::buffer::Data], images: &[Arc<BaseColorImage>], class: u32) -> Result<()> {
         let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
         let linear = Mat3::from_mat4(world);
         ensure!(world.is_finite() && linear.determinant().abs() > 1e-12, "invalid GLB node transform");
@@ -186,7 +207,7 @@ impl Importer {
                     let mut face = [face[0], face[1], face[2]];
                     if mirrored { face.swap(1, 2); }
                     let p = face.map(|i| vertices[i as usize].position);
-                    self.triangles.push(Triangle { a: lane(p[0]), b: lane(p[1]), c: lane(p[2]) });
+                    self.triangles.push(Triangle { a: tagged(p[0], class), b: lane(p[1]), c: lane(p[2]) });
                     let center = (Vec3::from_array(p[0]) + Vec3::from_array(p[1]) + Vec3::from_array(p[2])) / 3.0;
                     let chunk = self.chunks.entry(((center.x / CHUNK_METRES).floor() as i32,
                         (center.z / CHUNK_METRES).floor() as i32, key.clone())).or_insert_with(|| Chunk {
@@ -201,7 +222,7 @@ impl Importer {
                 }
             }
         }
-        for child in node.children() { self.node(child, world, buffers, images)?; }
+        for child in node.children() { self.node(child, world, buffers, images, class)?; }
         Ok(())
     }
 }
@@ -212,6 +233,37 @@ fn wrap(mode: gltf::texture::WrappingMode) -> WrapMode {
         gltf::texture::WrappingMode::Repeat => WrapMode::Repeat }
 }
 fn lane(p: [f32; 3]) -> [f32; 4] { [p[0], p[1], p[2], 0.0] }
+fn tagged(p: [f32; 3], class: u32) -> [f32; 4] { [p[0], p[1], p[2], class as f32] }
+fn class_index(classes: &[serde_json::Value], name: &str) -> Result<u32> {
+    classes.iter().position(|c| c.as_str() == Some(name)).map(|i| i as u32)
+        .with_context(|| format!("layout lacks class {name}"))
+}
+/// Verifies that every landable vertex lies in the level band and summarises the landable
+/// surface. Zero-area triangles still constrain the band but do not count as non-level.
+fn landable_plane(triangles: &[Triangle]) -> Result<Landable> {
+    let mut height = f32::NEG_INFINITY;
+    let mut landable = Landable { height: 0.0, triangles: 0, non_level: 0 };
+    for t in triangles {
+        let class = t.a[3] as u32;
+        if class >= 32 || (LANDABLE >> class) & 1 == 0 {
+            continue;
+        }
+        let p = [t.a, t.b, t.c].map(|v| Vec3::new(v[0], v[1], v[2]));
+        for v in p {
+            ensure!(v.y.abs() <= LEVEL_BAND, "landable vertex at y = {} lies outside the level band", v.y);
+            height = height.max(v.y);
+        }
+        landable.triangles += 1;
+        let n = (p[1] - p[0]).cross(p[2] - p[0]);
+        let len = n.length();
+        if len >= 1e-6 && (n.y / len).abs() <= LEVEL_COS {
+            landable.non_level += 1;
+        }
+    }
+    ensure!(landable.triangles > 0, "city has no landable triangles");
+    landable.height = height;
+    Ok(landable)
+}
 
 fn build_bvh(triangles: &mut [Triangle], first: usize, nodes: &mut Vec<BvhNode>) {
     let mut min = Vec3::splat(f32::INFINITY);
@@ -314,5 +366,21 @@ mod tests {
         let b = mesh.vertices[face[1] as usize].position;
         let c = mesh.vertices[face[2] as usize].position;
         [a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]].map(f32::to_bits)
+    }
+
+    #[test]
+    fn landable_plane_accepts_any_orientation_inside_band_and_rejects_outside() {
+        let flat = |y: f32, class: f32| Triangle {
+            a: [0.0, y, 0.0, class], b: [1.0, y, 0.0, 0.0], c: [0.0, y, 1.0, 0.0],
+        };
+        let level = landable_plane(&[flat(0.1, 1.0), flat(0.2, 2.0), flat(0.5, 3.0)]).unwrap();
+        assert_eq!((level.height, level.triangles, level.non_level), (0.2, 2, 0));
+        let curb = Triangle { a: [0.0, 0.0, 0.0, 2.0], b: [1.0, 0.0, 0.0, 0.0], c: [0.0, 0.25, 0.5, 0.0] };
+        let step = landable_plane(&[curb]).unwrap();
+        assert_eq!((step.height, step.triangles, step.non_level), (0.25, 1, 1));
+        let slope = Triangle { a: [0.0, 0.0, 0.0, 1.0], b: [1.0, 0.0, 0.0, 0.0], c: [0.0, 1.0, 1.0, 0.0] };
+        assert!(landable_plane(&[slope]).is_err());
+        assert!(landable_plane(&[flat(0.5, 1.0)]).is_err());
+        assert!(landable_plane(&[flat(0.0, 3.0)]).is_err());
     }
 }

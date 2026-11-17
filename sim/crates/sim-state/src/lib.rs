@@ -8,6 +8,7 @@
 use bytemuck::{Pod, Zeroable};
 
 pub mod collision;
+pub mod drone;
 
 /// One rigid body. The fourth lane of each non-quaternion vector is reserved zero.
 ///

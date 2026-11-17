@@ -6,7 +6,8 @@ const context = screen.getContext("2d");
 const timeline = $("timeline");
 const playButton = $("play-pause");
 const playbackIds = ["play-pause", "rewind", "step-back", "step-forward", "timeline"];
-const MODES = ["split", "first", "encoder", "third"];
+const ALL_MODES = ["split", "first", "encoder", "third"];
+let MODES = ALL_MODES;
 const PLAY_ICON = "M4 2.5v11L13 8z";
 const PAUSE_ICON = "M4 2.5h3v11H4zM9 2.5h3v11H9z";
 const VIEW_ICONS = {
@@ -38,7 +39,7 @@ function panels() {
   if (mode === "first") return [video(first)];
   if (mode === "third") return [video(third)];
   if (mode === "encoder") return [encoder];
-  return [video(first), encoder, video(third)];
+  return manifest.encoder_map ? [video(first), encoder, video(third)] : [video(first), video(third)];
 }
 
 function resize() {
@@ -70,7 +71,8 @@ function drawEncoder(frame, x, width, height) {
 }
 
 function present(source, time) {
-  if (source !== video || source.seeking || source.readyState < 2 || pendingTarget !== null || failed || !encoderMap) return;
+  if (source !== video || source.seeking || source.readyState < 2 || pendingTarget !== null || failed
+    || (manifest.encoder_map && !encoderMap)) return;
   const frame = frameAt(time);
   let x = 0;
   for (const panel of panels()) {
@@ -150,12 +152,12 @@ function chooseEnvironment(index) {
   const current = () => token === generation && source === video;
   let metadataReady = false;
   const ready = () => {
-    if (!current() || !metadataReady || !encoderMap || failed) return;
+    if (!current() || !metadataReady || (manifest.encoder_map && !encoderMap) || failed) return;
     sourceReady = true;
     setControls(true);
     present(source, source.currentTime);
   };
-  fetch(`/replay/${encodeURIComponent(env.encoder_map)}`, { cache: "no-store" })
+  if (manifest.encoder_map) fetch(`/replay/${encodeURIComponent(env.encoder_map)}`, { cache: "no-store" })
     .then((response) => {
       if (!response.ok) throw new Error(`${env.encoder_map}: HTTP ${response.status}`);
       return response.arrayBuffer();
@@ -227,7 +229,7 @@ function cycleView() {
 
 function validateManifest(data) {
   const demand = (condition, message) => { if (!condition) throw new Error(message); };
-  demand(data?.format === "sim-city-replay-v1", "Unsupported recording format");
+  demand(data?.format === "sim-city-replay-v2", "Unsupported recording format");
   demand(Number.isFinite(data.control_hz) && data.control_hz > 0, "Invalid recording frame rate");
   demand(Number.isInteger(data.video_width) && Number.isInteger(data.video_height), "Missing video dimensions");
   for (const key of ["first_person", "third_person"]) {
@@ -235,14 +237,14 @@ function validateManifest(data) {
     demand(Array.isArray(rect) && rect.length === 4 && rect.every(Number.isInteger) && rect[0] >= 0 && rect[1] >= 0 && rect[2] > 0 && rect[3] > 0
       && rect[0] + rect[2] <= data.video_width && rect[1] + rect[3] <= data.video_height, `Invalid ${key} crop`);
   }
-  demand(Number.isInteger(data.encoder_map?.width) && data.encoder_map.width > 0
-    && Number.isInteger(data.encoder_map?.height) && data.encoder_map.height > 0, "Missing encoder map layout");
+  demand(data.encoder_map == null || (Number.isInteger(data.encoder_map.width) && data.encoder_map.width > 0
+    && Number.isInteger(data.encoder_map.height) && data.encoder_map.height > 0), "Invalid encoder map layout");
   demand(Array.isArray(data.environments) && data.environments.length > 0, "Recording has no environments");
   for (const env of data.environments) {
     demand(Number.isInteger(env.frame_count) && env.frame_count > 0, `Invalid frame count for environment ${env.id}`);
     demand(Math.abs(env.duration_seconds - env.frame_count / data.control_hz) < 0.0001, `Invalid duration for environment ${env.id}`);
     demand(typeof env.video === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]*\.mp4$/.test(env.video), "Unsafe recording video filename");
-    demand(typeof env.encoder_map === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]*\.encoder$/.test(env.encoder_map), "Unsafe encoder map filename");
+    demand(data.encoder_map == null || (typeof env.encoder_map === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]*\.encoder$/.test(env.encoder_map)), "Unsafe encoder map filename");
   }
   return data;
 }
@@ -277,8 +279,12 @@ document.addEventListener("keydown", (event) => {
     $("next-env").disabled = !multiple;
     $("random-env").disabled = !multiple;
     $("view").disabled = false;
-    mapCanvas.width = manifest.encoder_map.width;
-    mapCanvas.height = manifest.encoder_map.height;
+    if (manifest.encoder_map) {
+      mapCanvas.width = manifest.encoder_map.width;
+      mapCanvas.height = manifest.encoder_map.height;
+    } else {
+      MODES = ALL_MODES.filter((name) => name !== "encoder");
+    }
     resize();
     chooseEnvironment(0);
   } catch (error) {

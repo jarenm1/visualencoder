@@ -1,4 +1,6 @@
-# GPU-resident visual learning
+# GPU-resident quadrotor visual-goal learning
+
+Task `city-drone-goal-v1`, ABI v3. A quadrotor in the imported city must reach a goal shown only as an image. The native CUDA environment owns dynamics, sensors, rendering and reward; Python owns the learner, evaluation and reporting.
 
 Use the root Python environment (`nix develop` from the repository root installs it) and the simulator's CUDA/Vulkan shell when launching native learning.
 
@@ -6,71 +8,84 @@ Use the root Python environment (`nix develop` from the repository root installs
 # Build outside the timed training process.
 cd sim
 nix develop --command cargo oxide build --arch sm_120 \
-  --device-codegen-crate sim_physics,sim_env -- -p sim-env --profile training
+  --device-codegen-crate sim_physics,sim_env -- -p sim-env -p sim-smoke --profile training
 cd ..
 
 nix develop path:sim --command .venv/bin/python sim/python/train.py profile \
-  --encoder mean --num-envs 16 --width 320 --height 240 \
-  --library .sim-target/training/libsim_env.so --out runs/city-profile
+  --encoder mean --num-envs 64 --width 320 --height 240 \
+  --library .sim-target/training/libsim_env.so --out runs/drone-profile
 
 nix develop path:sim --command .venv/bin/python sim/python/train.py benchmark \
-  --encoder mean --batch-sizes 16 32 64 --width 320 --height 240 \
-  --library .sim-target/training/libsim_env.so --out runs/city-benchmark
+  --encoder mean --batch-sizes 64 128 --width 320 --height 240 \
+  --library .sim-target/training/libsim_env.so --out runs/drone-benchmark
 
 nix develop path:sim --command .venv/bin/python sim/python/train.py train \
-  --encoder mean --num-envs 16 --width 320 --height 240 \
-  --total-steps 3000000 --validation-every 262144 --wall-seconds 3300 \
-  --library .sim-target/training/libsim_env.so --out runs/city-mean
+  --encoder mean --num-envs 64 --eval-envs 384 --width 320 --height 240 \
+  --total-steps 3000000 --validation-every 1000000 --wall-seconds 3600 \
+  --library .sim-target/training/libsim_env.so --out runs/drone-mean
 
 nix develop path:sim --command .venv/bin/python sim/python/train.py eval \
-  --checkpoint runs/city-mean/best.pt \
-  --library .sim-target/training/libsim_env.so --out runs/city-mean-eval
+  --checkpoint runs/drone-mean/best.pt --split test \
+  --library .sim-target/training/libsim_env.so --out runs/drone-mean-test
+
+nix develop path:sim --command .venv/bin/python sim/python/train.py memory-check \
+  --encoder mean --num-envs 64 --eval-envs 384 --repeats 3 \
+  --library .sim-target/training/libsim_env.so --out runs/drone-memory
+
+nix develop path:sim --command .venv/bin/python sim/python/train.py verify-trace \
+  --trace runs/drone-profile/trace.json
 ```
 
-Arms: `pretrained`, `baseline`, `mean`, `state` (privileged ceiling), `proprio` (no-vision baseline), or a real `run:<directory>` checkpoint. Visual arms use the actual frozen encoder online, spatially pooled tokens and a recurrent actor/critic. PPO reuses GPU feature rollouts; it does not run the encoder again for every update epoch. The native ABI tensors are borrowed, never copied, and all model/policy/native work uses the native CUDA stream.
+Unit tests need no simulator: `cd sim/python && python -m unittest`.
 
-At the policy input, goal displacement is scaled by 32m, vertical displacement by 6m, and velocity by 3m/s; clock and previous-action values retain unit scale. ABI tensors remain in physical units. Checkpoints record these scales.
+## Task contract
 
-The task is real-city block navigation: fixed altitude 6m, hover or eight goal-frame velocity commands at 3m/s, six exact swept-sphere collision substeps at 120Hz per 20Hz action, and GPU autoresets. The level camera automatically faces the final goal. This is kinematic navigation, not rotor/aerodynamic flight. The observed clock makes the 320-step horizon terminal; GAE suppresses bootstrap at every terminal and GRU memory resets at episode boundaries.
+- Dynamics: quadrotor flight at the native control rate (`control_hz` in the checkpoint metadata). Actions are `[throttle, roll, pitch, yaw]`, each clamped to [-1, 1] before the environment applies it. The learner stores the unclipped sample for log-probability.
+- Starts are 50% landed and 50% flying. Diagnostics index 19 records the start-landed flag.
+- Curriculum buckets are `visible`, `partial` and `hidden`. Start weights are (0.8, 0.15, 0.05) with floors (0.10, 0.10, 0.05). Adaptive promotion and demotion use per-bucket EMA success. Evaluation always uses uniform weights.
+- Episodes end on success, collision, out-of-bounds, or the native horizon (`horizon`, 450 steps). Outcomes are exclusive, with priority success > collision > out-of-bounds > timeout.
+- Catalog: at least 4096 candidate designs. Splits use styles `TRAIN=0`, `VALIDATION=1`, `TEST=2`, with validation seed 10001 and test seed 20002.
 
-Training, validation and test occupy separate 64m city districts, each with 128 independently seeded routes. Routes are 12–38m, require a blocked direct line, and have geometry-checked waypoint paths with 0.85m planning clearance for the 0.35m collision sphere. Reward is `0.2 × path-progress − 0.01` per step, with +5 goal/−5 collision. Visual actors receive goal-relative proprioception, never route waypoints; only the explicit state ceiling receives privileged hints.
+## Policy
 
-Model selection uses validation only. Final evaluation uses exactly the first completed episode of each of at least 128 environments; hover, goal-centering and random-action heuristics use the same initial routes. `oracle-diagnostic` separately checks privileged route following and is **not learned or visual evidence**. No learned checkpoint is replaced by a fallback.
+Frozen encoder tokens are computed once per control tick and reused by every PPO epoch. Visual arms use `GoalAttention` over patch tokens of shape `[N, 15, 20, D]` (320×240 input) with the goal tokens `concat(CLS, mean patch)` from the goal catalog. The attended output is 396 wide: 256 attended features, 8 expected-xy values, 4 peak logits, and a 128-wide global projection. Proprioception (18) is concatenated after it.
 
-All resource-creating commands accept `--city assets/city` (the default). ABI v2 and `sim-city-ppo-v2` checkpoints record scene-content fingerprints, controls, route splits, rewards and native library hashes. Historical gap checkpoints are rejected rather than silently evaluated as city policies.
+Arms (`--encoder`):
 
-The initial engineering acceptance criterion is held-out visual success ≥0.8 and ≥0.2 absolute above the best blind heuristic on ≥128 episodes, within the declared process wall budget. It is a task-level criterion, not real-flight validation or proof of convergence. `summary.json` records actual steps, selected checkpoint, initialization/training/evaluation wall time and incomplete-budget status. Never infer convergence from a timer stopping.
+| Arm | Actor input | Notes |
+|---|---|---|
+| `mean` (default) | visual, `run:runs/mean` | paired-consistency encoder |
+| `pretrained` | visual, `lingbot:small` | off-the-shelf encoder |
+| `baseline` | visual, `run:runs/baseline` | standard-distilled encoder |
+| `state` | privileged (18) + proprioception | privileged ceiling; not visual evidence |
+| `hint` | proprioception only | no-vision baseline |
 
-`mean_steps` includes failed episodes; `mean_success_steps` is conditional on success and is null when none succeed. Validation reuses one environment/stream so Torch allocator pools and cuBLAS workspaces do not accumulate per evaluation. The `memory-check` command measures repeated full evaluations after warmup without optimizer updates.
+The critic always receives privileged + proprioception. The actor is a GRU over the trunk output, with a Gaussian head whose log-std is state-independent (initial -0.5). Memory resets at episode starts. Terminal GAE never bootstraps across a done flag.
 
-`profile` captures real collection and PPO updates after initialization. Both `sim.collect` and `sim.ppo_update` must pass, and `verification.json` records both verdicts. Launch correlations catch delayed H2D/D2H activities even after the CPU scope closes; host waits in either scope also fail the gate. Initialization, end-batch metric export and checkpoints are separate explicit boundaries. Vulkan draws are included in end-to-end timing, but CUDA Kineto cannot isolate Vulkan render time; the report does not invent it by subtraction.
+Native tensors are borrowed through DLPack on the native CUDA stream. Reset, step, and rollout never call `.item()`, `.cpu()`, or boolean-mask indexing; readbacks happen only at end-of-rollout and evaluation boundaries.
 
-Profiler traces and checkpoints live under the requested `runs/` directory. Native library and encoder hashes, source hashes, seeds, resolution, package versions, PPO settings and task protocol accompany every training run.
+## Evaluation
 
-## Measured city pipeline
+Final tests use the first completed episode of each of at least 384 environments (`--eval-envs`, enforced). Reported:
 
-RTX 5070 Ti, 320×240 RGB, frozen paired-consistency encoder; concurrent workstation workloads were not controlled. Native timing includes kinematic control, exact collision, Vulkan culling/rasterization, sensor packing and CUDA conversion—not an isolated draw time.
+- success with a Wilson 95% interval, collision, out-of-bounds, timeout;
+- `mean_steps` (all episodes) and `mean_success_steps` (conditional on success, null when none succeed);
+- per-bucket and start-landed/flying breakdowns.
 
-| Batch | Native images/s | Encoder images/s | Full PPO transitions/s |
-|---:|---:|---:|---:|
-| 16 | 8,755 | 1,626 | 1,201 |
-| 32 | 9,616 | 1,539 | 1,201 |
-| 64 | 11,735 | 1,367 | 1,080 |
+Blind controls `hover` (fixed hover action) and `random` (uniform [-1, 1]) run on the same test seed and style. Validation selects `best.pt` on validation success; the reported test uses `best.pt`.
 
-Measurements: `runs/city-benchmark-final/benchmark.json`. The final batch-16 trace checked 41,300 collection and 4,062 PPO CUDA runtime calls: zero host transfers or host waits in either scope (`runs/city-profile-final/verification.json`). GPU packing/conversion and rollout feature copies still occur.
+## Checkpoints
 
-The privileged error-diffused route oracle completed 128/128 episodes in each split with zero collisions (`runs/city-oracle-quantized/oracle-diagnostic.json`). This checks task solvability, not learned-policy performance. Simple nearest-heading pursuit cut inside clear route chords; world-frame velocity error diffusion removes that quantization error without changing geometry or routes.
+Format `sim-drone-ppo-v1`. A checkpoint records task, ABI version, encoder spec and fingerprint, policy mode, control rate, city fingerprint, native library hash (provenance only, not compared, so rebuilds stay valid), seeds and PPO settings. Loading rejects v1/v2 checkpoints and ABI v2 libraries.
 
-Actual camera views: `runs/city-smoke/city-cameras.png`. Eight blind-forward episodes collided; hover preserved position exactly over the finite horizon. The same run reported no Vulkan validation errors.
+## Replay and reports
 
-Each city learner executed 2,999,808 transitions with matched PPO settings and one training seed:
+`scripts/render_navigation.py --checkpoint runs/drone-mean/best.pt` renders one first-episode rollout (`rollout.gif`, `contact.png`, `path.png`, `path.json`, `rollout.json`). `scripts/show_navigation.py --runs runs/drone-mean runs/drone-pretrained ...` writes `report/city-drone-goal.typ` and `.json` from completed runs only. Both reject results with fewer than 384 episodes or a different task or ABI.
 
-| Policy inputs | Successes / 128 | Collisions / 128 | Process minutes |
-|---|---:|---:|---:|
-| Frozen paired encoder + proprioception | 84 | 24 | 50.05 |
-| Proprioception only | 0 | 0 | 13.34 |
-| Privileged waypoint state + proprioception | 127 | 1 | 13.57 |
+Replay export (`sim_rl.replay`) writes format `sim-city-replay-v2`: a manifest plus per-environment states (`world_x, world_y, world_z, quat_x..w, target_x, target_y, target_z, design, clock, landed`) and transitions (`throttle, roll, pitch, yaw, reward, done, success, collision, out_of_bounds`), trimmed to the first done frame. Run it from `sim/python` with `PYTHONPATH=. ../../.venv/bin/python -m sim_rl.replay --checkpoint ... --library ...`.
 
-Runs: `runs/city-{mean,proprio,state}-320-seed0`. Times include initialization and evaluation. Validation selected the visual checkpoint at 1,572,864 steps. All three blind heuristics scored 0/128. The visual 80% success target was **not met**; these results do not claim convergence or an advantage over other visual encoders. Privileged waypoints are not visual-policy inputs.
+## Resource notes
 
-The fixed first test rollout succeeds in 234 steps (11.7s): `reports/experiments/city-navigation-rollout/rollout.gif`, with actual world-path diagnostics beside it. Tables and intervals: `report/city-navigation.typ` and `.json`; architecture/timing/rollout evidence is compiled into `report/supplement.pdf`.
+- Rollout token memory is about 944 MB at 64 environments, D=384, bf16.
+- Replay token memory is about 450 × n × 300 × D × 2 bytes; host RGB adds about 1.66 GB at 16 environments.
+- Profiling verifies zero host transfers and host waits inside `sim.collect` and `sim.ppo_update` scopes; `verification.json` records the verdict.

@@ -36,9 +36,11 @@ fn cull(@builtin(global_invocation_id) id: vec3<u32>) {
         let body = bodies[instance.metadata.x];
         center = rotate(body.rotation, center) + body.position.xyz;
     }
+    // Camera filter from metadata.z: 0 draws in every camera, otherwise only camera z - 1.
+    let owned = instance.metadata.z == 0u || instance.metadata.z == id.y + 1u;
     let m = transpose(cameras[id.y].view_projection);
     // WebGPU clip volume is -w <= x,y <= w and 0 <= z <= w.
-    let visible = !(outside(m[3] + m[0], center, radius)
+    let visible = owned && !(outside(m[3] + m[0], center, radius)
         || outside(m[3] - m[0], center, radius)
         || outside(m[3] + m[1], center, radius)
         || outside(m[3] - m[1], center, radius)

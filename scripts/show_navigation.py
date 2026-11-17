@@ -1,91 +1,89 @@
-"""Generate city navigation tables from completed ABI-v2 GPU experiments only."""
+"""Generate city-drone visual-goal tables from completed ABI-v3 training runs only."""
 
 import argparse
 import json
-import math
+import sys
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT / "sim/python")]
+from sim_rl.cli import MIN_EPISODES  # noqa: E402
+from sim_rl.features import ARMS  # noqa: E402
+from sim_rl.native import ABI_VERSION, TASK  # noqa: E402
 
-def wilson(successes: float, count: int) -> tuple[float, float]:
-    z = 1.959963984540054
-    proportion = successes / count
-    denominator = 1 + z * z / count
-    center = (proportion + z * z / (2 * count)) / denominator
-    half = z * math.sqrt(proportion * (1 - proportion) / count + z * z / (4 * count * count)) / denominator
-    return center - half, center + half
+LABELS = {"pretrained": "Off-the-shelf ViT-S", "baseline": "Standard-distilled ViT-S",
+          "mean": "Paired-consistency ViT-S", "state": "Privileged state", "hint": "Proprioception only"}
+BUCKETS = ("visible", "partial", "hidden")
+ARM_OF = {spec: arm for arm, spec in ARMS.items()}
+SHARED = ("control_hz", "width", "height", "city_fingerprint")
+
+
+def load_run(run):
+    summary = json.loads((run / "summary.json").read_text())
+    final = json.loads((run / "final-test.json").read_text())
+    if summary.get("task") != TASK or summary.get("abi_version") != ABI_VERSION:
+        raise ValueError(f"{run}: not a {TASK} ABI {ABI_VERSION} result")
+    if final["policy"]["episodes"] < MIN_EPISODES:
+        raise ValueError(f"{run}: fewer than {MIN_EPISODES} independent final episodes")
+    return summary, final
+
+
+def typst_table(headers, rows, caption):
+    columns = ", ".join(["auto"] * len(headers))
+    align = ", ".join(["left"] + ["center"] * (len(headers) - 1))
+    head = ", ".join(f"[*{header}*]" for header in headers)
+    body = "\n".join("  " + ", ".join(f"[{cell}]" for cell in row) + "," for row in rows)
+    return (f"#figure(table(\n  columns: ({columns}),\n  align: ({align}),\n  stroke: none, table.hline(),\n"
+            f"  {head},\n  table.hline(stroke: 0.5pt),\n{body}\n  table.hline(),\n), caption: [{caption}])\n\n")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runs", nargs="+", type=Path, required=True)
-    parser.add_argument("--out", type=Path, default=Path("report/city-navigation.typ"))
+    parser.add_argument("--out", type=Path, default=Path("report/city-drone-goal.typ"))
     args = parser.parse_args()
-    rows = []
-    measurements = []
-    for run in args.runs:
-        result = json.loads((run / "summary.json").read_text())
-        metadata = json.loads((run / "provenance.json").read_text())
-        contract = metadata.get("task_contract", {})
-        if metadata.get("task") != "city-block-navigation-v1" or contract.get("abi_version") != 2:
-            raise ValueError(f"{run}: historical gap results are not city navigation evidence")
-        if measurements and contract != measurements[0]["task_contract"]:
-            raise ValueError(f"{run}: scene/control/split/reward contract differs between compared city runs")
-        if result["actual_steps"] < 1 or result["final_test"] is None:
-            raise ValueError(f"{run}: no completed trained-policy evaluation")
-        if metadata["native_sha256"] == "" or metadata["encoder_sha256"] == "":
-            raise ValueError(f"{run}: missing measured-model provenance")
-        label = {"lingbot:small": "Off-the-shelf ViT-S", "run:runs/baseline": "Standard-distilled ViT-S",
-                 "run:runs/mean": "Paired-consistency ViT-S", "state": "Privileged waypoint state",
-                 "proprio": "Proprioception only"}.get(metadata["encoder"], metadata["encoder"])
-        key = "visual" if metadata["actor_inputs"].startswith("pooled visual") else metadata["encoder"]
-        score = result["final_test"][key]
-        count = score["episodes"]
-        if count < 128:
-            raise ValueError(f"{run}: insufficient independent final episodes")
-        interval = wilson(score["success"] * count, count)
-        elapsed = result["elapsed_seconds_including_initialization_training_evaluation"]
-        goal_steps = score["mean_success_steps"]
-        rows.append([label, f"{result['actual_steps']:,}", f"{elapsed / 60:.2f}",
-                     f"{score['success']:.3f} [{interval[0]:.3f}, {interval[1]:.3f}]",
-                     f"{score['collision']:.3f}",
-                     "—" if goal_steps is None else f"{goal_steps / contract['control_hz']:.2f}"])
-        measurements.append({"run": str(run), "encoder": metadata["encoder"], "seed": metadata["seed"],
-                             "actual_steps": result["actual_steps"], "selected_steps": result["selected_steps"],
-                             "elapsed_seconds": elapsed, "width": metadata["width"], "height": metadata["height"],
-                             "task_contract": contract,
-                             "success_wilson95": interval, "gpu": metadata["gpu"], "result": result})
-    first = measurements[0]
-    resolutions = {(r["width"], r["height"]) for r in measurements}
-    seeds = {r["seed"] for r in measurements}
-    contract = first["task_contract"]
-    text = "== GPU-owned city block navigation\n"
-    text += "A separate Rust workspace tests frozen encoders on the actual imported city geometry at stabilized altitude. "
-    text += "Hardware: " + ", ".join(sorted({r["gpu"] for r in measurements})) + ". "
-    text += "Vulkan/wgpu-hal rasterization shares device-local buffers with NVIDIA Rust CUDA through external-memory FDs and timeline semaphores. "
-    text += "CUDA owns kinematic agent state, swept collisions, reward, reset and camera state; a recurrent PPO actor reads frozen visual tokens and proprioception. "
-    text += "Frozen encoder inference is bfloat16; the actor and critic use float32. "
-    text += "Visual actors receive only images and final-goal proprioception, never route waypoints or collision geometry; the explicit state ceiling sees next-waypoint state. "
-    text += f"The {contract['action_count']}-action controller commands hover or eight unit-normalized horizontal velocity headings in the goal-facing camera frame, with automatic goal yaw. "
-    text += f"Kinematic/collision substeps run at {contract['physics_hz']} Hz and control at {contract['control_hz']} Hz; the finite terminal horizon is {contract['horizon']} steps. "
-    text += "Collision uses exact swept-sphere tests against the same transformed city triangles used for rendering. City RGB uses palette base colours, not the legacy phototexture/normal-map/shadow pipeline. "
-    text += "Dense reward measures progress along collision-free route waypoints, with time cost and terminal success/collision terms. "
-    text += f"Scene content fingerprint: #raw({json.dumps(contract['city_fingerprint'])}).\n\n"
-    if len(resolutions) == 1:
-        width, height = next(iter(resolutions))
-        text += f"All compared runs use {width}×{height} RGB and the same episode protocol. "
-    text += "Selection uses a validation route district; train, validation and final-test routes occupy spatially disjoint city districts with fixed independent catalogs. "
-    text += "Each policy is tested on the first completed episode of at least 128 environments; the table reports actual executed transitions and end-to-end process time, including initialization and evaluation but excluding compilation.\n\n"
-    text += "#figure(table(\n  columns: (auto, auto, auto, auto, auto, auto),\n  align: (left, center, center, center, center, center),\n  stroke: none, table.hline(),\n"
-    text += "  [*Actor features*], [*Transitions*], [*Minutes*], [*Success [95% CI]* ↑], [*Collision* ↓], [*Goal (s)*],\n  table.hline(stroke: 0.5pt),\n"
-    text += "\n".join("  " + ", ".join(f"[{value}]" for value in row) + "," for row in rows)
-    text += "\n  table.hline(),\n), caption: [Independent city navigation experiment. Goal time is conditional on success (dash: none); commanded horizontal speed and altitude are stabilized. Process times include the observed concurrent workload, not a controlled encoder-speed comparison. "
-    text += f"Intervals are Wilson intervals over test episodes, not training-seed uncertainty. {len(seeds)} training seed(s) shown; no claim of convergence or real-world flight transfer.])\n\n"
-    blind = first["result"]["final_test"]
-    text += "Blind controls on the same test episodes achieve success "
-    text += ", ".join(f"{name.replace('_', ' ')} {blind[name]['success']:.3f}" for name in ("hover", "goal_centering", "random")) + ". "
-    text += "The profiling command separately verifies zero host transfers or CUDA host waits inside actual visual collection and PPO update ranges. "
-    text += "Initialization, post-rollout logging and checkpoint/image export are explicit boundaries outside that claim. "
-    text += "This is a rendered city navigation experiment with goal-facing stabilized control, not full rotor flight or proof of transfer to a physical drone.\n"
+    runs = [load_run(run) for run in args.runs]
+    first = runs[0][0]
+    for summary, _ in runs[1:]:
+        for key in SHARED:
+            if summary[key] != first[key]:
+                raise ValueError(f"{key} differs between compared runs")
+    rows, bucket_rows, measurements = [], [], []
+    for run, (summary, final) in zip(args.runs, runs):
+        policy = final["policy"]
+        low, high = policy["success_wilson95"]
+        goal_steps = policy["mean_success_steps"]
+        arm = ARM_OF.get(summary["encoder"], summary["encoder"])
+        elapsed = summary["elapsed_seconds_including_initialization_training_evaluation"]
+        rows.append([LABELS.get(arm, arm), f"{summary['steps']:,}", f"{elapsed / 60:.2f}",
+                     f"{policy['success']:.3f} [{low:.3f}, {high:.3f}]", f"{policy['collision']:.3f}",
+                     "—" if goal_steps is None else f"{goal_steps / summary['control_hz']:.2f}"])
+        for name in BUCKETS:
+            bucket = policy["buckets"][name]
+            bucket_rows.append([LABELS.get(arm, arm), name, str(bucket["episodes"]),
+                                "—" if bucket.get("success") is None else f"{bucket['success']:.3f}"])
+        measurements.append({"run": str(run), "encoder": summary["encoder"], "seed": summary["seed"],
+                             "summary": summary, "final_test": final})
+    fingerprint = json.dumps(first["city_fingerprint"])
+    blind = runs[0][1]["heuristics"]
+    text = "== City drone visual-goal navigation\n"
+    text += ("A quadrotor in the imported city must reach a goal shown only in an image. "
+             "Frozen encoder tokens feed a goal-attention actor with proprioception; a GRU PPO learner "
+             "trains on the native ABI-v3 CUDA environment. "
+             "Starts are 50% landed and 50% flying; curriculum buckets are visible, partial and hidden. ")
+    text += (f"Control runs at {first['control_hz']} Hz; frames are {first['width']}×{first['height']} RGB. "
+             f"City content fingerprint: #raw({fingerprint}).\n\n")
+    text += ("Each policy is tested on the first completed episode of at least "
+             f"{MIN_EPISODES} environments with uniform bucket weights. Intervals are Wilson 95% over test episodes. "
+             "Process times include initialization, training and evaluation but exclude compilation.\n\n")
+    text += typst_table(["Actor features", "Transitions", "Minutes", "Success [95% CI] ↑", "Collision ↓",
+                         "Goal (s)"], rows,
+                        "Independent visual-goal experiment. Goal time is conditional on success "
+                        "(dash: none). No convergence or real-flight transfer claim.")
+    text += typst_table(["Actor features", "Bucket", "Episodes", "Success"], bucket_rows,
+                        "Per-visibility-bucket success on the same test episodes.")
+    text += ("Blind controls on the same test episodes: "
+             + ", ".join(f"{name} {blind[name]['success']:.3f}" for name in ("hover", "random")) + ".\n")
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(text)
     args.out.with_suffix(".json").write_text(json.dumps(measurements, indent=2) + "\n")

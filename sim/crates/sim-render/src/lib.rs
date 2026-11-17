@@ -44,7 +44,8 @@ impl Default for Material {
 
 /// Local mesh transform, optionally attached to a GPU body. Composition is
 /// body_translation * body_rotation * local_translation * local_rotation * scale.
-/// Mesh instances are GPU frustum-culled and drawn with indexed multi-draw.
+/// Mesh instances are GPU frustum-culled per camera and drawn with indexed multi-draw;
+/// the camera filter is applied in the same cull pass.
 #[derive(Clone, Copy, Debug)]
 pub struct Instance {
     pub mesh: usize,
@@ -56,6 +57,8 @@ pub struct Instance {
     pub material: Material,
     /// Zero is reserved for background.
     pub object_id: u32,
+    /// `Some(c)` draws only into camera index `c` of the batch; `None` draws into every camera.
+    pub camera: Option<u32>,
 }
 
 impl Instance {
@@ -68,6 +71,7 @@ impl Instance {
             scale: [1.0; 3],
             material: Material::default(),
             object_id: 1,
+            camera: None,
         }
     }
 

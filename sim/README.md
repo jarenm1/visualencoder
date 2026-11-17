@@ -6,12 +6,12 @@ A separate Rust workspace derived from Triage's rendering and simulation concept
 
 | Crate | Responsibility |
 |---|---|
-| `sim-state` | `no_std` body/action/integration layouts and shared swept-sphere/BVH collision math |
+| `sim-state` | `no_std` body/action/integration layouts, class-masked swept-sphere/BVH collision, quadrotor constants, `EpisodeSpec` and the shared body-mounted camera basis |
 | `sim-interop` | UUID-matched Vulkan/CUDA device, exportable allocations, FD ownership, stream/timeline synchronization |
-| `sim-render` | Textured meshes, GPU frustum culling, indirect draws, cameras and sensor packing; no physics/CUDA dependency |
-| `sim-scene` | City GLB/material loading, spatial render chunks, matching triangle BVH and content fingerprint |
+| `sim-render` | Textured meshes, procedural target shapes, GPU frustum culling with per-camera instance ownership, indirect draws, cameras and sensor packing; no physics/CUDA dependency |
+| `sim-scene` | City GLB/material loading with semantic class tags, landable-plane check, BVH, fingerprint; 48 target designs, split districts and the visibility-bucketed episode catalog |
 | `sim-physics` | NVIDIA Rust CUDA rigid-body integration, RGBA→NCHW conversion and image reductions |
-| `sim-env` | GPU-owned city navigation, exact-geometry collision, route catalogs and borrowed-device-pointer C ABI v2 |
+| `sim-env` | GPU-owned quadrotor visual-goal task (CTBR dynamics, landing/crash, targets, curriculum sampling) and borrowed-device-pointer C ABI v3 |
 | `sim-smoke` | Executable consumer of the reusable primitives; explicit final image/correctness inspection |
 
 The renderer adapts mesh, camera and lighting ideas from `jarenm1/triage`, particularly `crates/sim-graphics`. It does not copy Triage's Python staging adapter, web application or readback graph. Original attribution is retained in adapted source.
@@ -80,11 +80,11 @@ For a learner, preprocess into **ordinary CUDA-owned storage**, not an exchange-
 
 ## Scope
 
-The physics primitive is semi-implicit rigid-body integration with gravity, force, torque, damping and quaternion normalization. It does not claim a contact solver or rotor aerodynamics. The city learning task uses **kinematic velocity control**: fixed altitude 6m, hover or eight horizontal headings at 3m/s, a level goal-facing camera, and six swept collision substeps per 20Hz action. This is navigation RL, not full drone-flight RL.
+The city learning task (`city-drone-goal-v1`, ABI v3, see `crates/sim-env/sim_env.h`) is quadrotor flight with the controls a flight controller accepts: collective thrust plus roll/pitch/yaw body rates. CUDA integrates a 1 kg quadrotor at 240 Hz (8 substeps per 30 Hz action) with thrust lag, a saturated rate inner loop with gyroscopic torque, body-frame drag and gravity; the camera is rigidly mounted with 15° uptilt. Episodes start landed (take-off required) or already flying, and end on success (within 1.5 m of the target at ≤3 m/s), crash (any non-ground geometry, or touchdown faster than 2 m/s or tilted over 30°), leaving the district or the 40 m ceiling, or the 15 s horizon. Rotor aerodynamics, ground effect and battery are not modelled.
 
 Each batch shares the actual 1,799,347-triangle city across its independent cameras. Rendering uses 16m spatial chunks, GPU frustum culling and persistent indirect draws. Collision uses the same transformed GLB triangles, not layout AABBs. The renderer imports palette textures and material factors; it does not reproduce the legacy renderer's Poly Haven normal maps or sun shadows. Texture sampling is nearest/bilinear without mipmaps.
 
-Training, validation and test use separate 64m city districts, each with 128 geometry-checked routes. Every route has a blocked direct line and a collision-free waypoint path. Actor inputs exclude those waypoints unless the explicit privileged state baseline is selected. See [`python/README.md`](python/README.md) for training and provenance.
+Ground and road triangles are landable: every landable vertex lies within 0.25 m of y=0 (roads have 0.2 m curbs), so contact uses one analytic plane at the highest landable vertex and swept collision ignores those classes. Training, validation and test use disjoint districts and disjoint target designs (32/8/8). Each split has a fixed 65,536-episode catalog; visibility of the target from the start camera (64 surface samples, exact occlusion) sorts episodes into visible (≥50%), partial (5–50%) and hidden (<5%, including outside the view) buckets, and reset samples buckets from GPU-resident curriculum weights. Hidden episodes are common because start yaw is random. The policy gets a GPS-like hint with per-episode error up to 25% of the start distance; precise approach needs vision. See [`python/README.md`](python/README.md) for training and provenance.
 
 `sim-smoke` verifies actual rendered geometry, metric depth, object IDs, analytic translation, quaternion normalization and every converted pixel. Its final PPM and correctness readbacks are explicit inspection steps outside the hot loop. Profiler captures must likewise distinguish initialization/inspection from collection; GPU pointers alone are not proof of zero host staging.
 

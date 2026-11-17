@@ -36,6 +36,13 @@
           export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [ pkgs.vulkan-loader ]}:''${LD_LIBRARY_PATH:-}
           export VK_LAYER_PATH=${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d
           export CUDA_OXIDE_DEVICE_ARCH=sm_120
+          # Torch's Triton kernels: NixOS has no ldconfig cache or FHS loader for
+          # Triton's bundled ptxas, so use the shell's CUDA tools and host driver.
+          export TRITON_LIBCUDA_PATH=/run/opengl-driver/lib
+          export TRITON_PTXAS_PATH="$(command -v ptxas)"
+          export TRITON_PTXAS_BLACKWELL_PATH="$(command -v ptxas)"
+          export TRITON_CUOBJDUMP_PATH="$(command -v cuobjdump)"
+          export TRITON_NVDISASM_PATH="$(command -v nvdisasm)"
         '';
       };
     in {

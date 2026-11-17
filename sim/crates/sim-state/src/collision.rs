@@ -1,7 +1,9 @@
 //! Immutable triangle/BVH layouts shared by asset loading and Rust CUDA queries.
 use bytemuck::{Pod, Zeroable};
 
-/// World-space triangle. Fourth lanes are reserved zero; coordinates are Y-up metres.
+/// World-space triangle. The fourth lane of `a` is the class index (0 sky, 1 ground,
+/// 2 road, 3 building, 4 vegetation, 5 vehicle, 6 prop); fourth lanes of `b` and `c` are
+/// reserved zero. Coordinates are Y-up metres.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct Triangle {
@@ -141,16 +143,28 @@ fn bounds_hit(node: BvhNode, from: [f32; 3], to: [f32; 3], radius: f32) -> bool 
     true
 }
 
+/// Classes whose surfaces are landable (ground and road). Pass as the `ignore` mask to
+/// query only non-landable geometry.
+pub const LANDABLE: u32 = 0b110;
+
+#[inline(always)]
+fn class_bit(triangle: &Triangle) -> u32 {
+    let class = triangle.a[3] as u32;
+    if class < 32 { 1 << class } else { 0 }
+}
+
 /// Exact swept-sphere query using a stackless, radius-expanded BVH traversal.
 /// Face crossing, endpoint/face and swept edge/corner distances are all tested.
 /// Tangency counts as collision. Degenerate triangles reduce to their edges.
+/// Triangles whose class bit (bit k = class k) is set in `ignore` are skipped; BVH
+/// bounds still cover them, so traversal stays conservative.
 ///
 /// # Safety
 /// `nodes` must reference `node_count` valid preorder nodes with forward escape
 /// indices. Leaf ranges must reference valid `triangles`. Inputs must be finite
 /// and radius nonnegative. Both arrays remain immutable during the query.
 pub unsafe fn sweep_hits(nodes: *const BvhNode, node_count: u32, triangles: *const Triangle,
-    from: [f32; 3], to: [f32; 3], radius: f32) -> bool {
+    from: [f32; 3], to: [f32; 3], radius: f32, ignore: u32) -> bool {
     let mut index = 0;
     while index < node_count {
         let node = unsafe { *nodes.add(index as usize) };
@@ -162,7 +176,8 @@ pub unsafe fn sweep_hits(nodes: *const BvhNode, node_count: u32, triangles: *con
         let mut triangle = node.meta[0];
         let end = triangle + count;
         while triangle < end {
-            if triangle_hits(unsafe { *triangles.add(triangle as usize) }, from, to, radius * radius) {
+            let tri = unsafe { *triangles.add(triangle as usize) };
+            if class_bit(&tri) & ignore == 0 && triangle_hits(tri, from, to, radius * radius) {
                 return true;
             }
             triangle += 1;
@@ -181,7 +196,7 @@ mod tests {
             c: [0.0, 2.0, 0.0, 0.0] };
         let node = BvhNode { bounds_min: [0.0; 4], bounds_max: [2.0, 2.0, 0.0, 0.0],
             meta: [0, 1, 1, 0] };
-        unsafe { sweep_hits(&node, 1, &triangle, from, to, radius) }
+        unsafe { sweep_hits(&node, 1, &triangle, from, to, radius, 0) }
     }
 
     #[test]
@@ -208,6 +223,25 @@ mod tests {
     }
 
     #[test]
+    fn ignore_mask_skips_landable_classes_only() {
+        let mut tri = Triangle { a: [0.0, 0.0, 0.0, 1.0], b: [2.0, 0.0, 0.0, 0.0],
+            c: [0.0, 2.0, 0.0, 0.0] };
+        let node = BvhNode { bounds_min: [0.0; 4], bounds_max: [2.0, 2.0, 0.0, 0.0],
+            meta: [0, 1, 1, 0] };
+        let from = [0.5, 0.5, -100.0];
+        let to = [0.5, 0.5, 100.0];
+        let query = |t: &Triangle, ignore: u32| unsafe {
+            sweep_hits(&node, 1, t, from, to, 0.35, ignore)
+        };
+        assert!(query(&tri, 0));
+        assert!(!query(&tri, LANDABLE));
+        tri.a[3] = 2.0;
+        assert!(!query(&tri, LANDABLE));
+        tri.a[3] = 3.0;
+        assert!(query(&tri, LANDABLE));
+    }
+
+    #[test]
     fn traversal_skips_subtrees_and_reaches_later_leaf() {
         let triangle = Triangle { a: [0.0, 0.0, 0.0, 0.0], b: [2.0, 0.0, 0.0, 0.0],
             c: [0.0, 2.0, 0.0, 0.0] };
@@ -218,6 +252,6 @@ mod tests {
             BvhNode { bounds_min: [0.0; 4], bounds_max: [2.0, 2.0, 0.0, 0.0], meta: [0, 1, 4, 0] },
         ];
         assert!(unsafe { sweep_hits(nodes.as_ptr(), 4, &triangle,
-            [0.5, 0.5, -1.0], [0.5, 0.5, 1.0], 0.35) });
+            [0.5, 0.5, -1.0], [0.5, 0.5, 1.0], 0.35, 0) });
     }
 }

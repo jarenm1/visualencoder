@@ -1,610 +1,432 @@
-"""Timed native visual-RL experiments. All GPU work shares the native stream."""
+"""Command-line entry points: train, eval, benchmark, profile, memory-check, verify-trace."""
 from __future__ import annotations
 
 import argparse
-import ctypes as ct
 import hashlib
-import importlib.metadata
 import json
-import math
-import platform
-import sys
+import random
 import time
-from contextlib import nullcontext
-from dataclasses import asdict
 from pathlib import Path
 
 import torch
 
+from .curriculum import MODES as CURRICULUM_MODES
+from .evaluation import HEURISTICS, evaluate
 from .features import ARMS, PREPROCESSING, FrozenFeatures
-from .native import DEFAULT_CITY, TASK, CudaEnv
-from .ppo import PROPRIO_SCALE, Config, Policy, Trainer, evaluate, gpu_range
+from .model import ActorCritic
+from .native import ABI_VERSION, DEFAULT_CITY, TASK, CudaEnv
+from .ppo import Config, Trainer
 from .profiling import capture, verify_trace
 
 ROOT = Path(__file__).resolve().parents[3]
-VALIDATION_SEED, TEST_SEED = 100_003, 200_003
-VALIDATION_STYLE, TEST_STYLE = 1, 2
-CHECKPOINT_FORMAT = "sim-city-ppo-v2"
+DEFAULT_LIBRARY = ROOT / ".sim-target/training/libsim_env.so"
+CHECKPOINT_FORMAT = "sim-drone-ppo-v1"
+TRAIN_STYLE, VALIDATION_STYLE, TEST_STYLE = 0, 1, 2
+VALIDATION_SEED, TEST_SEED = 10_001, 20_002
+MIN_EPISODES = 384
+DEFAULTS = Config()
+ACTOR_INPUTS = {
+    "visual": "goal-attention(frozen CLS + patch tokens, goal table) + proprio(18)",
+    "state": "privileged(18) + proprio(18)",
+    "hint": "proprio(18)",
+}
+CRITIC_INPUTS = "privileged(18) + proprio(18)"
+# Recorded and compared on load; the library hash is provenance only (rebuilds keep the contract).
+CHECKED_KEYS = ("task", "abi_version", "action_dim", "horizon", "control_hz",
+                "width", "height", "policy_mode", "encoder", "feature_dim", "encoder_fingerprint",
+                "preprocessing", "native_task_contract")
 
 
-def write_json(path, value):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+def seed_all(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def sha256(path):
     digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for block in iter(lambda: stream.read(1 << 20), b""):
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
     return digest.hexdigest()
 
 
-def provenance(args, features, env, config):
-    packages = {}
-    for name in ("torch", "transformers", "lingbot-vision", "numpy"):
-        try:
-            packages[name] = importlib.metadata.version(name)
-        except importlib.metadata.PackageNotFoundError:
-            packages[name] = None
-    driver = ct.CDLL("libcuda.so.1")
-    version = ct.c_int()
-    if driver.cuDriverGetVersion(ct.byref(version)) != 0:
-        raise RuntimeError("cannot query CUDA driver version")
-    sources = list((ROOT / "sim" / "python").rglob("*.py"))
-    sources += list((ROOT / "sim" / "crates").rglob("*.rs"))
-    sources += list((ROOT / "sim" / "crates").rglob("Cargo.toml"))
-    sources += [ROOT / "src" / "visenc" / "models.py", ROOT / "sim" / "Cargo.toml", ROOT / "sim" / "Cargo.lock"]
-    return {"encoder": features.spec, "encoder_sha256": features.fingerprint,
-            "checkpoint_format": CHECKPOINT_FORMAT,
-            "preprocessing": PREPROCESSING, "seed": args.seed, "width": env.width, "height": env.height,
-            "num_envs": env.n, "feature_dim": features.dim, "ppo": asdict(config),
-            "native_abi": "sim_env C ABI v2, fields 0..8, CUDA-only borrowed allocations",
-            "task_contract": env.task_contract, "native_metadata": env.metadata,
-            "action_count": env.action_count, "horizon": env.horizon, "neutral_action": env.neutral_action,
-            "policy_proprio_scale": list(PROPRIO_SCALE),
-            "native_library": str(env.library), "native_sha256": sha256(env.library),
-            "source_sha256": {str(path.relative_to(ROOT)): sha256(path) for path in sorted(sources)},
-            "python": sys.version, "platform": platform.platform(), "packages": packages,
-            "torch_cuda": torch.version.cuda, "cuda_driver": version.value,
-            "gpu": torch.cuda.get_device_name(0), "command": sys.argv,
-            "train_style": 0, "validation_style": VALIDATION_STYLE, "final_test_style": TEST_STYLE,
-            "validation_seed": VALIDATION_SEED, "final_test_seed": TEST_SEED,
-            "task": TASK,
-            "actor_inputs": "pooled visual tokens plus proprio[8]; no route/geometry hints" if features.encoder is not None
-                            else "privileged next-waypoint[4] plus proprio[8]" if features.spec == "state" else "proprio[8] only"}
+def mode_of(features):
+    return "visual" if features.visual else features.spec
 
 
-def make_config(args):
-    config = Config(total_steps=args.total_steps, rollout_steps=args.rollout_steps,
-                    sequence_length=args.sequence_length, epochs=args.epochs,
-                    minibatch_sequences=args.minibatch_sequences, hidden_size=args.hidden_size,
-                    learning_rate=args.learning_rate, entropy=args.entropy)
-    config.validate()
-    return config
+def build_policy(env, features):
+    """Visual arms attend over the frozen patch grid; the grid is height//16 x width//16."""
+    return ActorCritic(mode_of(features), features.dim, 2 * features.dim,
+                       env.height // 16, env.width // 16, env.action_dim).to(env.device)
 
 
-def seed_all(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.set_num_threads(4)
+def provenance(env, features, curriculum):
+    mode = mode_of(features)
+    return {
+        "format": CHECKPOINT_FORMAT, "task": TASK, "abi_version": ABI_VERSION,
+        "action_dim": env.action_dim, "horizon": env.horizon, "control_hz": env.control_hz,
+        "design_count": env.design_count, "width": env.width, "height": env.height,
+        "policy_mode": mode, "encoder": features.spec, "feature_dim": features.dim,
+        "encoder_fingerprint": features.fingerprint, "preprocessing": PREPROCESSING,
+        "actor_inputs": ACTOR_INPUTS[mode], "critic_inputs": CRITIC_INPUTS,
+        "curriculum": curriculum, "native_task_contract": env.task_contract,
+        "native_library_sha256": sha256(env.library),
+    }
 
 
-def resources(args, n=None):
-    env = CudaEnv(args.library, n or args.num_envs, args.seed, args.width, args.height, 0, args.city)
-    args.task_contract = env.task_contract
-    try:
-        with env.execution():
-            features = FrozenFeatures(args.encoder, env.device)
-            seed_all(args.seed)  # Backbone loading must not change policy initialization.
-            policy = Policy(features.dim, env.action_count, args.hidden_size).to(env.device)
-            trainer = Trainer(env, features, policy, make_config(args))
-            trainer.warmup(args.seed)
-        return env, features, policy, trainer
-    except BaseException:
-        env.close()
-        raise
+def checkpoint(policy, metadata, steps):
+    return {"format": CHECKPOINT_FORMAT, "metadata": {**metadata, "steps": steps},
+            "model": policy.state_dict()}
 
 
-def checkpoint(path, trainer, metadata, elapsed, status):
-    """Checkpoint serialization is an explicit logging/end-batch boundary."""
-    trainer.env.stream.synchronize()
-    path = Path(path)
-    temporary = path.with_suffix(".tmp")
-    torch.save({"format": CHECKPOINT_FORMAT, "policy": trainer.policy.state_dict(),
-                "optimizer": trainer.optimizer.state_dict(), "steps": trainer.steps,
-                "elapsed_seconds": elapsed, "budget_status": status, "metadata": metadata,
-                "torch_rng": torch.get_rng_state(), "cuda_rng": torch.cuda.get_rng_state_all()}, temporary)
-    temporary.replace(path)
-
-
-def load_checkpoint(path, args):
-    path = Path(path)
-    if not path.is_file():
-        raise FileNotFoundError(f"evaluation requires a trained checkpoint: {path}")
-    saved = torch.load(path, map_location="cpu", weights_only=False)
+def load_checkpoint(path):
+    saved = torch.load(path, map_location="cpu", weights_only=True)
     if saved.get("format") != CHECKPOINT_FORMAT:
-        raise ValueError("requires a sim-city-ppo-v2 checkpoint; historical gap checkpoints cannot be used for city navigation")
-    if saved.get("steps", 0) < 1:
-        raise ValueError("checkpoint must contain an actually trained city policy")
+        raise ValueError(f"{path} is not a {CHECKPOINT_FORMAT} checkpoint; v1/v2 city and historical "
+                         "gap checkpoints cannot be used for city-drone-goal-v1")
     metadata = saved["metadata"]
-    if metadata.get("task") != TASK or not isinstance(metadata.get("task_contract"), dict):
-        raise ValueError("checkpoint is missing the city task/provenance contract")
-    expected_split = {"train_style": 0, "validation_style": VALIDATION_STYLE,
-                      "final_test_style": TEST_STYLE, "validation_seed": VALIDATION_SEED,
-                      "final_test_seed": TEST_SEED}
-    if any(metadata.get(key) != value for key, value in expected_split.items()):
-        raise ValueError("checkpoint evaluation split/seed provenance is incompatible")
-    if metadata["preprocessing"] != PREPROCESSING:
-        raise ValueError("checkpoint preprocessing is incompatible")
-    if sha256(args.library) != metadata["native_sha256"]:
-        raise ValueError("native environment library differs from training provenance")
+    if metadata.get("abi_version") != ABI_VERSION or metadata.get("task") != TASK:
+        raise ValueError("checkpoint targets an incompatible native ABI or task; retrain on sim_env ABI v3")
     return saved
 
 
 def validate_checkpoint(saved, env, features):
-    """Reject scene/control/split/reward changes before loading any actor weights."""
-    metadata = saved["metadata"]
-    recorded_contract = {key: value for key, value in metadata["native_metadata"].items()
-                         if key not in ("city_path", "style", "split")}
-    if recorded_contract != metadata["task_contract"]:
-        raise ValueError("checkpoint contains inconsistent native city metadata")
-    if metadata["task_contract"] != env.task_contract:
-        raise ValueError("checkpoint city scene/control/split/reward metadata differs from the native environment")
-    if (metadata.get("action_count"), metadata.get("horizon"), metadata.get("neutral_action")) != (
-            env.action_count, env.horizon, env.neutral_action):
-        raise ValueError("checkpoint city action/horizon metadata is incompatible")
-    if metadata["feature_dim"] != features.dim or metadata["encoder_sha256"] != features.fingerprint:
-        raise ValueError("actual frozen encoder/feature contract differs from checkpoint")
-    if metadata.get("policy_proprio_scale") != list(PROPRIO_SCALE):
-        raise ValueError("checkpoint policy proprioception normalization differs")
+    recorded = saved["metadata"]
+    expected = provenance(env, features, recorded.get("curriculum"))
+    for key in CHECKED_KEYS:
+        if recorded.get(key) != expected[key]:
+            raise ValueError(f"checkpoint {key} differs from the native/feature configuration: "
+                             f"recorded {recorded.get(key)!r}, current {expected[key]!r}")
 
 
-def run_evaluation(args, features, policy, seed, style, blind=True, env=None):
-    # Reuse the validation environment/stream throughout training: Torch's
-    # caching allocator and cuBLAS workspaces are associated with that stream.
-    # The caller finishes training first; evaluate waits at each batch end.
-    manager = (CudaEnv(args.library, args.eval_envs, seed, args.width, args.height, style, args.city)
-               if env is None else nullcontext(env))
-    with manager as env:
-        if (env.n, env.width, env.height, env.style) != (args.eval_envs, args.width, args.height, style):
-            raise ValueError("evaluation environment configuration differs from requested split")
-        if env.task_contract != args.task_contract or policy.action_count != env.action_count:
-            raise ValueError("evaluation city task contract differs from the training/checkpoint environment")
-        with env.execution():
-            env.reset(seed)
-            result = {"visual" if features.encoder is not None else features.spec: evaluate(env, features, policy)}
-            if blind:
-                for heuristic in ("hover", "goal_centering", "random"):
-                    env.reset(seed)
-                    result[heuristic] = evaluate(env, features, heuristic=heuristic, seed=seed)
-        memory = cuda_memory(env)
-    result["seed"], result["style"] = seed, style
-    result["cuda_memory"] = memory
-    result["native_metadata"] = env.metadata
+def make_config(args):
+    return Config(total_steps=args.total_steps, rollout_steps=args.rollout_steps,
+                  sequence_length=args.sequence_length, epochs=args.epochs,
+                  minibatch_sequences=args.minibatch_sequences, learning_rate=args.learning_rate,
+                  gamma=args.gamma, gae_lambda=args.gae_lambda, clip=args.clip, entropy=args.entropy,
+                  value_coefficient=args.value_coefficient, max_grad_norm=args.max_grad_norm,
+                  curriculum=args.curriculum)
+
+
+def open_env(args, n, seed, style):
+    return CudaEnv(args.library, n, seed, args.width, args.height, style, args.city)
+
+
+def check_episodes(result):
+    if result["episodes"] < MIN_EPISODES:
+        raise RuntimeError(f"evaluation produced {result['episodes']} episodes; at least {MIN_EPISODES} required")
     return result
 
 
-def cuda_memory(env):
-    """Read allocator/global device metrics only at completed batch boundaries."""
-    free, total = torch.cuda.mem_get_info(env.device)
-    return {"stream": env.stream.cuda_stream, "allocated_bytes": torch.cuda.memory_allocated(env.device),
-            "reserved_bytes": torch.cuda.memory_reserved(env.device),
-            "global_free_bytes": free, "global_total_bytes": total}
+def emit(payload, path=None):
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    if path is None:
+        print(text, end="")
+        return
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(text)
 
 
-def evaluation_summary(evaluation, features):
-    key = "visual" if features.encoder is not None else features.spec
-    score = evaluation[key]["success"]
-    blind = max(evaluation[name]["success"] for name in ("hover", "goal_centering", "random"))
-    enough = evaluation[key]["episodes"] >= 128
-    return {"policy_success": score, "best_blind_success": blind, "absolute_gain": score - blind,
-            "episodes": evaluation[key]["episodes"],
-            "meaningful_visual_goal_met": bool(features.encoder is not None and enough and score >= 0.8 and score - blind >= 0.2),
-            "criterion": "visual success >=0.8 and >=0.2 absolute above best blind heuristic on >=128 held-out episodes"}
-
-
-def readable_report(out, result):
-    rows = ["# Native GPU city navigation RL", "", "```json", json.dumps(result, indent=2, allow_nan=False), "```", ""]
-    (Path(out) / "report.md").write_text("\n".join(rows))
-
-
-def train(args, process_started):
-    if args.wall_seconds <= 0 or args.eval_envs < 128:
-        raise ValueError("positive wall budget and >=128 held-out evaluation episodes required")
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
-    if any(out.iterdir()):
-        raise FileExistsError(f"refusing to overwrite run: {out}")
-    deadline = process_started + args.wall_seconds
-    seed_all(args.seed)
-    env, features, policy, trainer = resources(args)
-    timings = {"initialization_seconds": time.monotonic() - process_started,
-               "collection_seconds": 0.0, "ppo_seconds": 0.0, "validation_seconds": 0.0,
-               "final_evaluation_seconds": 0.0, "checkpoint_seconds": 0.0}
-    metadata = provenance(args, features, env, trainer.config)
-    write_json(out / "provenance.json", metadata)
-    best, validations, last_validation = -math.inf, [], 0
-    evaluation_seconds = 0.0
-    status = "step_budget_complete"
-    final_evaluation = None
-    last_update_seconds = 0.0
-    validation_env = None
-    try:
-        # Calibrate the actual held-out evaluation cost before spending the
-        # training budget. Its result is NOT used for selection (zero updates).
-        started = time.monotonic()
-        validation_env = CudaEnv(args.library, args.eval_envs, VALIDATION_SEED,
-                                 args.width, args.height, VALIDATION_STYLE, args.city)
-        warm_validation = run_evaluation(args, features, policy, VALIDATION_SEED, VALIDATION_STYLE,
-                                         blind=False, env=validation_env)
-        evaluation_seconds = time.monotonic() - started
-        timings["validation_seconds"] += evaluation_seconds
-        write_json(out / "initial-validation.json", warm_validation)
-        reserve = max(args.final_reserve_seconds, evaluation_seconds * 3.8 + 5)
-        train_deadline = deadline - reserve
-        with (out / "learning-curves.jsonl").open("a", buffering=1) as log, env.execution():
-            while trainer.steps < args.total_steps:
-                # CPU clock decisions only at complete rollout boundaries.
-                if time.monotonic() + last_update_seconds >= train_deadline:
-                    status = "wall_budget_incomplete"
-                    break
-                remaining = args.total_steps - trainer.steps
-                block = env.n * trainer.config.sequence_length
-                if remaining < block:
-                    status = "step_budget_complete_rounded_down"
-                    break
-                length = min(trainer.config.rollout_steps, remaining // block * trainer.config.sequence_length)
-                begin = time.monotonic()
-                trainer.collect(length)
-                env.stream.synchronize()  # Explicit end-batch wait outside sim.collect.
-                collected = time.monotonic()
-                losses = trainer.update(length)
-                metrics = trainer.metrics(length, losses)
-                env.stream.synchronize()  # Explicit end-update boundary.
-                updated = time.monotonic()
-                values = metrics.cpu().tolist()  # One post-rollout logging readback.
-                last_update_seconds = updated - begin
-                timings["collection_seconds"] += collected - begin
-                timings["ppo_seconds"] += updated - collected
-                episodes = values[1]
-                record = {"steps": trainer.steps, "elapsed_seconds": updated - process_started,
-                          "transitions_per_second_process": trainer.steps / (updated - process_started),
-                          "collection_transitions_per_second": length * env.n / (collected - begin),
-                          "update_seconds": updated - collected, "reward_mean": values[0],
-                          "completed_episodes": episodes, "success": values[2] / max(1, episodes),
-                          "collision": values[3] / max(1, episodes), "episode_return": values[4] / max(1, episodes)}
-                record.update(zip(("policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction", "grad_norm"), values[5:]))
-                log.write(json.dumps(record, allow_nan=False) + "\n")
-                print(json.dumps(record, allow_nan=False), flush=True)
-                validate = trainer.steps - last_validation >= args.validation_every
-                if validate and time.monotonic() + evaluation_seconds + last_update_seconds < train_deadline:
-                    started = time.monotonic()
-                    validation = run_evaluation(args, features, policy, VALIDATION_SEED, VALIDATION_STYLE,
-                                                blind=False, env=validation_env)
-                    evaluation_seconds = time.monotonic() - started
-                    timings["validation_seconds"] += evaluation_seconds
-                    key = "visual" if features.encoder is not None else features.spec
-                    score = validation[key]["success"]
-                    validation.update(steps=trainer.steps, elapsed_seconds=time.monotonic() - process_started)
-                    validations.append(validation)
-                    write_json(out / "validation.json", validations)
-                    last_validation = trainer.steps
-                    if score > best:
-                        best = score
-                        started = time.monotonic()
-                        checkpoint(out / "best.pt", trainer, metadata, started - process_started, "validation_selected")
-                        timings["checkpoint_seconds"] += time.monotonic() - started
-                    reserve = max(reserve, evaluation_seconds * 3.8 + 5)
-                    train_deadline = deadline - reserve
-        if trainer.steps < 1:
-            raise RuntimeError("initialization/evaluation exhausted the wall budget before a single PPO update")
-        # Always save actual executed steps; never label a timed stop converged.
-        started = time.monotonic()
-        checkpoint(out / "last.pt", trainer, metadata, started - process_started, status)
-        timings["checkpoint_seconds"] += time.monotonic() - started
-        if not (out / "best.pt").exists():
-            started = time.monotonic()
-            validation = run_evaluation(args, features, policy, VALIDATION_SEED, VALIDATION_STYLE,
-                                        blind=False, env=validation_env)
-            timings["validation_seconds"] += time.monotonic() - started
-            validation.update(steps=trainer.steps, elapsed_seconds=time.monotonic() - process_started)
-            validations.append(validation)
-            write_json(out / "validation.json", validations)
-            checkpoint(out / "best.pt", trainer, metadata, time.monotonic() - process_started, "validation_selected_only_candidate")
-        selected = torch.load(out / "best.pt", map_location="cpu", weights_only=False)
-        with env.execution():
-            policy.load_state_dict(selected["policy"], strict=True)
-        env.stream.synchronize()
-        # The final-test split gets one distinct environment only after the
-        # persistent validation environment has released its native resources.
-        validation_env.close()
-        validation_env = None
-        started = time.monotonic()
-        final_evaluation = run_evaluation(args, features, policy, TEST_SEED, TEST_STYLE, blind=True)
-        timings["final_evaluation_seconds"] = time.monotonic() - started
-        write_json(out / "final-test.json", final_evaluation)
-    finally:
-        if validation_env is not None:
-            validation_env.close()
-        env.close()
-    elapsed = time.monotonic() - process_started
-    result = {"status": status, "actual_steps": trainer.steps, "requested_steps": args.total_steps,
-              "selected_steps": selected["steps"], "elapsed_seconds_including_initialization_training_evaluation": elapsed,
-              "wall_budget_seconds": args.wall_seconds, "within_wall_budget": elapsed <= args.wall_seconds,
-              "compile_excluded": True, "convergence_claim": False, "timings": timings,
-              "final_test": final_evaluation, "acceptance": evaluation_summary(final_evaluation, features),
-              "checkpoint": str(out / "best.pt"), "last_checkpoint": str(out / "last.pt")}
-    write_json(out / "summary.json", result)
-    readable_report(out, result)
-    return result
-
-
-def evaluation_command(args, process_started):
-    if args.eval_envs < 128:
-        raise ValueError("final evaluation requires >=128 independent episodes")
-    saved = load_checkpoint(args.checkpoint, args)
-    metadata = saved["metadata"]
-    args.encoder, args.width, args.height = metadata["encoder"], metadata["width"], metadata["height"]
-    args.hidden_size = metadata["ppo"]["hidden_size"]
-    seed_all(args.seed)
-    # A tiny owner env provides a primary context/stream for model upload only.
-    with CudaEnv(args.library, 1, args.seed, args.width, args.height, 0, args.city) as owner:
-        args.task_contract = owner.task_contract
-        with owner.execution():
-            features = FrozenFeatures(args.encoder, owner.device)
-            validate_checkpoint(saved, owner, features)
-            policy = Policy(features.dim, owner.action_count, args.hidden_size).to(owner.device)
-            policy.load_state_dict(saved["policy"], strict=True)
-            policy.eval().requires_grad_(False)
-        owner.stream.synchronize()
-        seed, style = (VALIDATION_SEED, VALIDATION_STYLE) if args.split == "validation" else (TEST_SEED, TEST_STYLE)
-        result = run_evaluation(args, features, policy, seed, style)
-    result["acceptance"] = evaluation_summary(result, features)
-    result["elapsed_seconds_including_initialization_evaluation"] = time.monotonic() - process_started
-    result["checkpoint_steps"] = saved["steps"]
-    write_json(Path(args.out) / f"{args.split}.json", result)
-    readable_report(args.out, result)
-    return result
-
-
-def timed_gpu(stream, function, iterations):
+def timed(fn, iterations):
+    """Mean GPU seconds per call on the current (env) stream; one host sync at the end."""
+    fn()
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    stream.synchronize()
-    begin = time.monotonic()
-    start.record(stream)
+    start.record()
     for _ in range(iterations):
-        function()
-    end.record(stream)
-    end.synchronize()  # Explicit benchmark end-batch boundary.
-    return {"gpu_seconds": start.elapsed_time(end) / 1000, "wall_seconds": time.monotonic() - begin}
+        fn()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) / 1000 / iterations
 
 
-def benchmark(args, process_started):
-    results = []
-    for n in args.batch_sizes:
-        env, features, policy, trainer = resources(args, n)
-        try:
-            with env.execution(), torch.no_grad():
-                actions = torch.full((n,), env.neutral_action, device=env.device, dtype=torch.int64)
-                native = timed_gpu(env.stream, lambda: env.step(actions), args.iterations)
-                encoder = timed_gpu(env.stream, lambda: features(env), args.iterations)
-            with env.execution():
-                trainer.collect()
-                trainer.update(trainer.config.rollout_steps)  # Warm optimizer/allocator before timing.
-                def full_update():
-                    length = trainer.collect()
-                    trainer.update(length)
-                full = timed_gpu(env.stream, full_update, args.ppo_iterations)
-                # A short actual CUDA trace classifies physics/task/preprocess
-                # kernels, and certifies both collection and PPO zero-staging.
-                verification = capture(trainer, Path(args.out) / f"batch-{n}", 1)
-            frames = args.iterations * n
-            transitions = args.ppo_iterations * trainer.config.rollout_steps * n
-            result = {"batch_size": n, "width": env.width, "height": env.height,
-                      "encoder_spec": features.spec, "native_metadata": env.metadata,
-                      "native_physics_render_preprocess": native, "encoder": encoder,
-                      "full_ppo": full, "native_frames_per_second": frames / native["wall_seconds"],
-                      "encoder_frames_per_second": frames / encoder["wall_seconds"],
-                      "full_training_transitions_per_second": transitions / full["wall_seconds"],
-                      "allocated_cuda_bytes": torch.cuda.max_memory_allocated(), "trace_verification": verification}
-            results.append(result)
-            write_json(Path(args.out) / "benchmark.json", results)
-            print(json.dumps(result, allow_nan=False), flush=True)
-        finally:
-            env.close()
-        del trainer, policy, features
-        torch.cuda.empty_cache()  # Batch boundary, never hidden OOM recovery.
-        torch.cuda.reset_peak_memory_stats()
-    result = {"batches": results, "elapsed_seconds": time.monotonic() - process_started}
-    readable_report(args.out, result)
-    return result
+def _rounded(value):
+    return None if value is None else round(value, 6)
 
 
-def profile_command(args, process_started):
+def train_command(args, started):
     seed_all(args.seed)
-    env, features, policy, trainer = resources(args)
-    try:
+    config = make_config(args)
+    run = args.out
+    run.mkdir(parents=True, exist_ok=True)
+    device = torch.device("cuda:0")
+    features = FrozenFeatures(args.encoder, device)
+    budget_end = started + args.wall_seconds
+    curves = (run / "learning-curves.jsonl").open("w")
+    validations = []
+    best_success, best_path, last_path = -1.0, run / "best.pt", run / "last.pt"
+    with open_env(args, args.num_envs, args.seed, TRAIN_STYLE) as env, \
+            open_env(args, args.eval_envs, VALIDATION_SEED, VALIDATION_STYLE) as validation_env:
         with env.execution():
-            trainer.collect()
-            trainer.update(trainer.config.rollout_steps)
-            result = capture(trainer, args.out, args.profile_iterations)
-            result["native_metadata"] = env.metadata
-            result["width"], result["height"], result["batch_size"] = env.width, env.height, env.n
-    finally:
-        env.close()
-    result["elapsed_seconds"] = time.monotonic() - process_started
-    write_json(Path(args.out) / "city-profile.json", result)
-    return result
+            policy = build_policy(env, features)
+            trainer = Trainer(env, features, policy, config)
+            trainer.warmup(args.seed)
+            metadata = provenance(env, features, args.curriculum)
+
+        def validate():
+            with validation_env.execution():
+                policy.eval()
+                result = check_episodes(evaluate(validation_env, features, policy=policy, seed=VALIDATION_SEED))
+                policy.train()
+            return result
+
+        started_eval = time.monotonic()
+        validate()  # Initial calibration: the evaluation duration sets the final reserve.
+        eval_seconds = time.monotonic() - started_eval
+        reserve = max(args.final_reserve_seconds, eval_seconds * 3.8 + 5)
+        next_validation = args.validation_every
+        while trainer.steps < config.total_steps and time.monotonic() < budget_end - reserve:
+            with env.execution():
+                length = trainer.collect(config.rollout_steps)
+                losses = trainer.update(length)
+                values = trainer.finish_rollout(length, losses).cpu().tolist()
+            completed = values[1]
+            record = {
+                "steps": trainer.steps, "elapsed_seconds": time.monotonic() - started,
+                "reward_mean": values[0], "completed_episodes": completed,
+                "success": values[2], "collision": values[3],
+                "episode_return": values[4] / completed if completed else None,
+                "policy_loss": values[5], "value_loss": values[6], "entropy": values[7],
+                "approx_kl": values[8], "clip_fraction": values[9], "grad_norm": values[10],
+                "bucket_completed": values[11:14], "bucket_success": values[14:17],
+                "bucket_collision": values[17:20], "bucket_out_of_bounds": values[20:23],
+                "weights_used": values[23:26], "weights_next": values[26:29], "success_ema": values[29:32],
+            }
+            curves.write(json.dumps(record) + "\n")
+            curves.flush()
+            if trainer.steps >= next_validation:
+                next_validation += args.validation_every
+                result = validate()
+                validations.append({"steps": trainer.steps, "result": result})
+                if result["success"] > best_success:
+                    best_success = result["success"]
+                    torch.save(checkpoint(policy, metadata, trainer.steps), best_path)
+                torch.save(checkpoint(policy, metadata, trainer.steps), last_path)
+        curves.close()
+        final = validate()
+        validations.append({"steps": trainer.steps, "result": final, "final": True})
+        if final["success"] > best_success:
+            best_success = final["success"]
+            torch.save(checkpoint(policy, metadata, trainer.steps), best_path)
+        torch.save(checkpoint(policy, metadata, trainer.steps), last_path)
+    emit({"validations": validations}, run / "validation.json")
+
+    saved = load_checkpoint(best_path)
+    with open_env(args, args.eval_envs, TEST_SEED, TEST_STYLE) as test_env:
+        with test_env.execution():
+            policy = build_policy(test_env, features)
+            policy.load_state_dict(saved["model"])
+            test = check_episodes(evaluate(test_env, features, policy=policy, seed=TEST_SEED))
+            heuristics = {name: check_episodes(evaluate(test_env, features, heuristic=name, seed=TEST_SEED))
+                          for name in HEURISTICS}
+    elapsed = time.monotonic() - started
+    final_test = {"checkpoint": "best.pt", "checkpoint_sha256": sha256(best_path),
+                  "policy": test, "heuristics": heuristics}
+    emit(final_test, run / "final-test.json")
+    summary = {
+        "task": TASK, "abi_version": ABI_VERSION, "policy_mode": metadata["policy_mode"],
+        "encoder": metadata["encoder"], "seed": args.seed, "width": metadata["width"], "height": metadata["height"],
+        "control_hz": metadata["control_hz"], "city_fingerprint": metadata["native_task_contract"]["city_fingerprint"],
+        "steps": trainer.steps, "best_validation_success": best_success,
+        "test_success": test["success"], "test_success_wilson95": test["success_wilson95"],
+        "elapsed_seconds_including_initialization_training_evaluation": elapsed,
+        "wall_budget_seconds": args.wall_seconds, "within_wall_budget": elapsed <= args.wall_seconds,
+        "compile_excluded": True, "convergence_claim": False,
+    }
+    emit(summary, run / "summary.json")
+    write_report(run, summary, test, heuristics)
+    print(json.dumps(summary, indent=2, sort_keys=True))
 
 
-def memory_check(args, process_started):
-    """Repeat validation on one resource/stream, with no optimizer updates."""
-    if args.validation_repeats < 2 or args.max_growth_mib < 0:
-        raise ValueError("at least two measured repeats and nonnegative growth tolerance required")
+def write_report(run, summary, test, heuristics):
+    def row(name, result):
+        low, high = result["success_wilson95"] or (None, None)
+        return (f"| {name} | {result['episodes']} | {result['success']:.3f} "
+                f"[{low:.3f}, {high:.3f}] | {result['collision']:.3f} | "
+                f"{result['out_of_bounds']:.3f} | {result['timeout']:.3f} |")
+
+    lines = ["# City drone goal test", "", f"Task: `{summary['task']}`, ABI {summary['abi_version']}, "
+             f"policy mode `{summary['policy_mode']}`, steps {summary['steps']}.", "",
+             "| arm | episodes | success [Wilson 95%] | collision | out of bounds | timeout |",
+             "|---|---|---|---|---|---|", row(summary["policy_mode"], test)]
+    lines += [row(name, result) for name, result in heuristics.items()]
+    lines += ["", "Per visibility bucket (policy):", ""]
+    lines += [f"- {name}: episodes {result['episodes']}, success {result.get('success')}"
+              for name, result in test["buckets"].items()]
+    lines += ["", "Per start (policy):", ""]
+    lines += [f"- {name}: episodes {result['episodes']}, success {result.get('success')}"
+              for name, result in test["start_landed"].items()]
+    (run / "report.md").write_text("\n".join(lines) + "\n")
+
+
+def eval_command(args, started):
+    saved = load_checkpoint(args.checkpoint)
+    metadata = saved["metadata"]
+    device = torch.device("cuda:0")
+    features = FrozenFeatures(metadata["encoder"], device)
+    seed, style = (VALIDATION_SEED, VALIDATION_STYLE) if args.split == "validation" else (TEST_SEED, TEST_STYLE)
+    with open_env_checkpoint(args, metadata, seed, style) as env:
+        with env.execution():
+            validate_checkpoint(saved, env, features)
+            policy = build_policy(env, features)
+            policy.load_state_dict(saved["model"])
+            payload = {"checkpoint": str(args.checkpoint), "checkpoint_sha256": sha256(args.checkpoint),
+                       "split": args.split,
+                       "policy": check_episodes(evaluate(env, features, policy=policy, seed=seed)),
+                       "heuristics": {name: check_episodes(evaluate(env, features, heuristic=name, seed=seed))
+                                      for name in HEURISTICS}}
+    emit(payload, args.out)
+
+
+def open_env_checkpoint(args, metadata, seed, style):
+    return CudaEnv(args.library, args.eval_envs, seed, metadata["width"], metadata["height"], style, args.city)
+
+
+def benchmark_command(args, started):
+    rows = []
+    for n in args.batch_sizes:
+        seed_all(args.seed)
+        features = FrozenFeatures(args.encoder, torch.device("cuda:0"))
+        config = make_config(args)
+        with CudaEnv(args.library, n, args.seed, args.width, args.height, TRAIN_STYLE, args.city) as env:
+            with env.execution():
+                policy = build_policy(env, features)
+                trainer = Trainer(env, features, policy, config)
+                trainer.warmup(args.seed)
+                hover = torch.zeros((n, env.action_dim), device=env.device)
+                hover[:, 0] = -0.2
+                native_step = timed(lambda: env.step(hover), args.iterations)
+                encoder = timed(lambda: features.observe(env), args.iterations) if features.visual else None
+                collect = timed(lambda: trainer.collect(config.rollout_steps), 1)
+                update = timed(lambda: trainer.update(config.rollout_steps), 1)
+        transitions = config.rollout_steps * n
+        rows.append({"num_envs": n, "native_step_seconds": native_step, "encoder_seconds": encoder,
+                     "collect_seconds": collect, "update_seconds": update,
+                     "transitions_per_second": transitions / (collect + update)})
+    emit({"arm": args.encoder, "policy_mode": mode_of(features), "rows": rows}, args.out)
+
+
+def profile_command(args, started):
     seed_all(args.seed)
-    env, features, policy, trainer = resources(args)
-    samples = []
-    try:
-        with CudaEnv(args.library, args.eval_envs, VALIDATION_SEED,
-                     args.width, args.height, VALIDATION_STYLE, args.city) as validation_env:
-            for repetition in range(args.validation_repeats + 1):
-                before = cuda_memory(validation_env)
-                evaluation = run_evaluation(args, features, policy, VALIDATION_SEED,
-                                            VALIDATION_STYLE, blind=False, env=validation_env)
-                sample = {"repetition": repetition, "warmup": repetition == 0,
-                          "elapsed_seconds": time.monotonic() - process_started,
-                          "before": before,
-                          **evaluation["cuda_memory"]}
-                samples.append(sample)
-                print(json.dumps(sample), flush=True)
-                write_json(Path(args.out) / "memory-samples.json", samples)
-    finally:
-        env.close()
-    baseline = samples[0]
-    allocated_growth = max(sample["allocated_bytes"] for sample in samples) - baseline["allocated_bytes"]
-    reserved_growth = max(sample["reserved_bytes"] for sample in samples) - baseline["reserved_bytes"]
-    tolerance = args.max_growth_mib * 1024 * 1024
-    bounded = allocated_growth <= tolerance and reserved_growth <= tolerance
-    result = {"bounded_after_warmup": bounded, "samples": samples,
-              "allocated_growth_after_warmup_bytes": allocated_growth,
-              "reserved_growth_after_warmup_bytes": reserved_growth,
-              "growth_tolerance_bytes": tolerance, "optimizer_updates": 0,
-              "native_metadata": env.metadata,
-              "elapsed_seconds": time.monotonic() - process_started,
-              "global_memory_note": "Global free memory includes other processes and is reported, not attributed"}
-    write_json(Path(args.out) / "memory-check.json", result)
-    if not bounded:
-        raise RuntimeError("persistent validation memory grew beyond tolerance: " + json.dumps(result))
-    return result
+    features = FrozenFeatures(args.encoder, torch.device("cuda:0"))
+    config = make_config(args)
+    with open_env(args, args.num_envs, args.seed, TRAIN_STYLE) as env:
+        with env.execution():
+            policy = build_policy(env, features)
+            trainer = Trainer(env, features, policy, config)
+            trainer.warmup(args.seed)
+            result = capture(trainer, args.out, args.iterations)
+    emit(result)
 
 
-@torch.no_grad()
-def oracle_diagnostic(args, process_started):
-    """Privileged route-following proof only: never a learned/visual score."""
+def memory_check_command(args, started):
     seed_all(args.seed)
-    splits = {"train": 0, "validation": VALIDATION_STYLE, "test": TEST_STYLE}
-    results = {}
-    for split, style in splits.items():
-        if args.split != "all" and args.split != split:
-            continue
-        with CudaEnv(args.library, args.num_envs, args.seed, args.width, args.height,
-                     style, args.city) as env, env.execution():
-            env.reset(args.seed)
-            active = torch.ones(env.n, device=env.device)
-            totals = torch.zeros((5, env.n), device=env.device)
-            trace = torch.empty((env.horizon, env.n, 13), device=env.device)
-            actions = torch.empty(env.n, dtype=torch.int64, device=env.device)
-            diagonal = 2 ** -0.5
-            headings = torch.tensor(
-                [[0, 0], [0, 1], [diagonal, diagonal], [1, 0],
-                 [diagonal, -diagonal], [0, -1], [-diagonal, -diagonal],
-                 [-1, 0], [-diagonal, diagonal]], device=env.device)
-            carry = torch.zeros((env.n, 2), device=env.device)
-            step_m = env.metadata["speed_m_s"] / env.metadata["control_hz"]
-            for step in range(env.horizon):
-                trace[step, :, :8].copy_(env.diagnostics)
-                # Nearest-heading pursuit can cut metres inside a long clear
-                # path chord. Error-diffuse velocity quantization in world
-                # coordinates so alternating discrete commands track the chord.
-                forward = torch.stack((env.diagnostics[:, 3] - env.diagnostics[:, 0],
-                                       env.diagnostics[:, 5] - env.diagnostics[:, 2]), -1)
-                forward = torch.nn.functional.normalize(forward, dim=-1)
-                right = torch.stack((-forward[:, 1], forward[:, 0]), -1)
-                target = right * env.privileged[:, :1] + forward * env.privileged[:, 1:2]
-                carry.add_(torch.nn.functional.normalize(target, dim=-1) * step_m)
-                commands = (right[:, None] * headings[None, :, :1]
-                            + forward[:, None] * headings[None, :, 1:]) * step_m
-                actions.copy_((commands - carry[:, None]).square().sum(-1).argmin(-1))
-                carry.sub_(commands.gather(1, actions[:, None, None].expand(-1, 1, 2)).squeeze(1))
-                env.step(actions)
-                carry.mul_((1 - env.done)[:, None])
-                trace[step, :, 8:].copy_(torch.stack(
-                    (actions.float(), env.reward, env.done, env.success, env.collision), -1))
-                totals[0].add_(active * env.reward)
-                totals[1].add_(active * env.success)
-                totals[2].add_(active * env.collision)
-                totals[3].add_(active)
-                totals[4].add_(active * env.done)
-                active.mul_(1 - env.done)
-            env.stream.synchronize()  # Diagnostic export, outside rollout collection.
-            values = totals.sum(1).cpu().tolist()
-            unfinished = active.sum().item()
-            if unfinished or values[4] != env.n:
-                raise RuntimeError("native finite horizon violated during route-oracle diagnostic")
-            results[split] = {"episodes": env.n, "success": values[1] / env.n,
-                              "collision": values[2] / env.n, "mean_return": values[0] / env.n,
-                              "mean_steps": values[3] / env.n, "native_metadata": env.metadata}
-            write_json(Path(args.out) / f"{split}-oracle-trace.json",
-                       {"policy": "privileged_route_oracle", "seed": args.seed,
-                        "native_metadata": env.metadata,
-                        "fields": ["world_x", "world_y", "world_z", "goal_x", "goal_y", "goal_z",
-                                   "route_id", "clock", "action", "reward", "done", "success", "collision"],
-                        "semantics": "pre-action diagnostics; post-action reward/flags; only first episode per env is evidence",
-                        "trace": trace.cpu().tolist()})
-    result = {"policy": "privileged_route_oracle", "learned_or_visual_evidence": False,
-              "quantization": "world-frame error-diffused nine-command velocity tracking",
-              "splits": results, "elapsed_seconds": time.monotonic() - process_started}
-    write_json(Path(args.out) / "oracle-diagnostic.json", result)
-    return result
+    features = FrozenFeatures(args.encoder, torch.device("cuda:0"))
+    config = make_config(args)
+    allocated = []
+    with open_env(args, args.num_envs, args.seed, TRAIN_STYLE) as env:
+        with env.execution():
+            policy = build_policy(env, features)
+            trainer = Trainer(env, features, policy, config)
+            trainer.warmup(args.seed)
+            for _ in range(args.repeats):
+                length = trainer.collect(config.rollout_steps)
+                trainer.update(length)
+                env.stream.synchronize()
+                allocated.append(torch.cuda.memory_allocated(env.device))
+    growth = allocated[-1] - allocated[0]
+    result = {"allocated_bytes": allocated, "growth_bytes": growth,
+              "growth_tolerance_bytes": args.growth_tolerance_bytes}
+    emit(result, args.out)
+    if growth > args.growth_tolerance_bytes:
+        raise RuntimeError(f"device memory grew by {growth} bytes across repeated iterations")
+
+
+def verify_trace_command(args, started):
+    emit({scope: verify_trace(args.trace, scope) for scope in ("sim.collect", "sim.ppo_update")})
+
+
+def add_native(parser):
+    parser.add_argument("--library", type=Path, default=DEFAULT_LIBRARY)
+    parser.add_argument("--city", type=Path, default=DEFAULT_CITY)
+    parser.add_argument("--width", type=int, default=320)
+    parser.add_argument("--height", type=int, default=240)
+    parser.add_argument("--seed", type=int, default=0)
+
+
+def add_learner(parser):
+    parser.add_argument("--encoder", default="mean", help=f"arm: {', '.join(ARMS)} or run:<dir>")
+    parser.add_argument("--curriculum", choices=CURRICULUM_MODES, default="adaptive")
+    parser.add_argument("--num-envs", type=int, default=64)
+    parser.add_argument("--total-steps", type=int, default=DEFAULTS.total_steps)
+    parser.add_argument("--rollout-steps", type=int, default=DEFAULTS.rollout_steps)
+    parser.add_argument("--sequence-length", type=int, default=DEFAULTS.sequence_length)
+    parser.add_argument("--epochs", type=int, default=DEFAULTS.epochs)
+    parser.add_argument("--minibatch-sequences", type=int, default=DEFAULTS.minibatch_sequences)
+    parser.add_argument("--learning-rate", type=float, default=DEFAULTS.learning_rate)
+    parser.add_argument("--gamma", type=float, default=DEFAULTS.gamma)
+    parser.add_argument("--gae-lambda", type=float, default=DEFAULTS.gae_lambda)
+    parser.add_argument("--clip", type=float, default=DEFAULTS.clip)
+    parser.add_argument("--entropy", type=float, default=DEFAULTS.entropy)
+    parser.add_argument("--value-coefficient", type=float, default=DEFAULTS.value_coefficient)
+    parser.add_argument("--max-grad-norm", type=float, default=DEFAULTS.max_grad_norm)
 
 
 def parser():
-    cli = argparse.ArgumentParser(description=__doc__)
-    commands = cli.add_subparsers(dest="command", required=True)
-    for name in ("train", "eval", "benchmark", "profile", "memory-check", "oracle-diagnostic"):
-        p = commands.add_parser(name)
-        p.add_argument("--library", default=str(ROOT / ".sim-target" / "debug" / "libsim_env.so"))
-        p.add_argument("--city", type=Path, default=DEFAULT_CITY)
-        p.add_argument("--encoder", default="pretrained", help="pretrained|baseline|mean|state|proprio|run:<dir>")
-        p.add_argument("--out", required=True)
-        p.add_argument("--seed", type=int, default=0)
-        p.add_argument("--num-envs", type=int, default=64)
-        p.add_argument("--width", type=int, default=192)
-        p.add_argument("--height", type=int, default=128)
-        p.add_argument("--total-steps", type=int, default=1_000_000)
-        p.add_argument("--rollout-steps", type=int, default=64)
-        p.add_argument("--sequence-length", type=int, default=16)
-        p.add_argument("--epochs", type=int, default=4)
-        p.add_argument("--minibatch-sequences", type=int, default=32)
-        p.add_argument("--hidden-size", type=int, default=128)
-        p.add_argument("--learning-rate", type=float, default=3e-4)
-        p.add_argument("--entropy", type=float, default=0.01)
-        p.add_argument("--eval-envs", type=int, default=128)
-        if name == "train":
-            p.add_argument("--wall-seconds", type=float, default=3300)
-            p.add_argument("--final-reserve-seconds", type=float, default=90)
-            p.add_argument("--validation-every", type=int, default=65_536)
-        elif name == "eval":
-            p.add_argument("--checkpoint", required=True)
-            p.add_argument("--split", choices=("validation", "test"), default="test")
-        elif name == "benchmark":
-            p.add_argument("--batch-sizes", type=int, nargs="+", default=[16, 64, 128])
-            p.add_argument("--iterations", type=int, default=16)
-            p.add_argument("--ppo-iterations", type=int, default=2)
-        elif name == "profile":
-            p.add_argument("--profile-iterations", type=int, default=1)
-        elif name == "memory-check":
-            p.add_argument("--validation-repeats", type=int, default=4)
-            p.add_argument("--max-growth-mib", type=float, default=16)
-        elif name == "oracle-diagnostic":
-            p.add_argument("--split", choices=("all", "train", "validation", "test"), default="all")
-    p = commands.add_parser("verify-trace")
-    p.add_argument("trace")
-    p.add_argument("--scope", default="sim.collect")
-    return cli
+    root = argparse.ArgumentParser(description="City drone visual-goal learner (city-drone-goal-v1, ABI v3)")
+    commands = root.add_subparsers(dest="command", required=True)
+
+    train = commands.add_parser("train")
+    add_native(train)
+    add_learner(train)
+    train.add_argument("--out", type=Path, required=True)
+    train.add_argument("--eval-envs", type=int, default=384)
+    train.add_argument("--validation-every", type=int, default=1_000_000)
+    train.add_argument("--wall-seconds", type=float, default=3600)
+    train.add_argument("--final-reserve-seconds", type=float, default=300)
+    train.set_defaults(func=train_command)
+
+    evaluation = commands.add_parser("eval")
+    add_native(evaluation)
+    evaluation.add_argument("--checkpoint", type=Path, required=True)
+    evaluation.add_argument("--split", choices=("validation", "test"), default="test")
+    evaluation.add_argument("--eval-envs", type=int, default=384)
+    evaluation.add_argument("--out", type=Path)
+    evaluation.set_defaults(func=eval_command)
+
+    benchmark = commands.add_parser("benchmark")
+    add_native(benchmark)
+    add_learner(benchmark)
+    benchmark.add_argument("--batch-sizes", type=lambda text: [int(item) for item in text.split(",")],
+                           default=[64, 128])
+    benchmark.add_argument("--iterations", type=int, default=20)
+    benchmark.add_argument("--out", type=Path)
+    benchmark.set_defaults(func=benchmark_command)
+
+    profile = commands.add_parser("profile")
+    add_native(profile)
+    add_learner(profile)
+    profile.add_argument("--iterations", type=int, default=1)
+    profile.add_argument("--out", type=Path, required=True)
+    profile.set_defaults(func=profile_command)
+
+    memory = commands.add_parser("memory-check")
+    add_native(memory)
+    add_learner(memory)
+    memory.add_argument("--repeats", type=int, default=3)
+    memory.add_argument("--growth-tolerance-bytes", type=int, default=1 << 20)
+    memory.add_argument("--out", type=Path)
+    memory.set_defaults(func=memory_check_command)
+
+    verify = commands.add_parser("verify-trace")
+    verify.add_argument("--trace", type=Path, required=True)
+    verify.set_defaults(func=verify_trace_command)
+    return root
 
 
 def main(process_started=None):
-    process_started = time.monotonic() if process_started is None else process_started
+    started = time.monotonic() if process_started is None else process_started
     args = parser().parse_args()
-    if args.command == "verify-trace":
-        result = verify_trace(args.trace, args.scope)
-    else:
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is required; no GPU/encoder fallback")
-        result = {"train": train, "eval": evaluation_command, "benchmark": benchmark,
-                  "profile": profile_command, "memory-check": memory_check,
-                  "oracle-diagnostic": oracle_diagnostic}[args.command](args, process_started)
-    print(json.dumps(result, indent=2, allow_nan=False), flush=True)
+    if getattr(args, "eval_envs", 384) < MIN_EPISODES:
+        raise SystemExit(f"--eval-envs must be at least {MIN_EPISODES} (one first episode per environment)")
+    args.func(args, started)

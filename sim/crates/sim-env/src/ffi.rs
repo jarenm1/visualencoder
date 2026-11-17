@@ -52,7 +52,7 @@ pub unsafe extern "C" fn sim_env_reset(handle: *mut c_void, seed: u64) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sim_env_step(handle: *mut c_void, actions: *const i64) -> i32 {
+pub unsafe extern "C" fn sim_env_step(handle: *mut c_void, actions: *const f32) -> i32 {
     boundary(-1, || {
         unsafe { environment(handle)?.step(actions)?; }
         Ok(0)
