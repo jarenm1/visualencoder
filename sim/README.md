@@ -6,11 +6,12 @@ A separate Rust workspace derived from Triage's rendering and simulation concept
 
 | Crate | Responsibility |
 |---|---|
-| `sim-state` | `no_std`, runtime-independent body/action/integration layouts; Y-up metres, xyzw quaternions |
+| `sim-state` | `no_std` body/action/integration layouts and shared swept-sphere/BVH collision math |
 | `sim-interop` | UUID-matched Vulkan/CUDA device, exportable allocations, FD ownership, stream/timeline synchronization |
-| `sim-render` | Meshes, materials, cameras, GPU-state-driven rasterization and sensor packing; no physics/CUDA dependency |
+| `sim-render` | Textured meshes, GPU frustum culling, indirect draws, cameras and sensor packing; no physics/CUDA dependency |
+| `sim-scene` | City GLB/material loading, spatial render chunks, matching triangle BVH and content fingerprint |
 | `sim-physics` | NVIDIA Rust CUDA rigid-body integration, RGBA→NCHW conversion and image reductions |
-| `sim-env` | GPU-owned flight-through-gap task and borrowed-device-pointer C ABI for learning |
+| `sim-env` | GPU-owned city navigation, exact-geometry collision, route catalogs and borrowed-device-pointer C ABI v2 |
 | `sim-smoke` | Executable consumer of the reusable primitives; explicit final image/correctness inspection |
 
 The renderer adapts mesh, camera and lighting ideas from `jarenm1/triage`, particularly `crates/sim-graphics`. It does not copy Triage's Python staging adapter, web application or readback graph. Original attribution is retained in adapted source.
@@ -21,7 +22,7 @@ The renderer adapts mesh, camera and lighting ideas from `jarenm1/triage`, parti
 cd sim
 nix develop
 cargo host                          # ordinary incremental host-only build
-cargo test -p sim-state -p sim-interop --lib
+cargo test -p sim-state -p sim-interop -p sim-scene --lib
 cargo test -p sim-interop --test exchange -- --ignored --test-threads=1
 cargo oxide build --arch sm_120 --device-codegen-crate sim_physics -- -p sim-smoke
 ../.sim-target/debug/sim-smoke --frames 64 --output smoke.ppm
@@ -79,7 +80,11 @@ For a learner, preprocess into **ordinary CUDA-owned storage**, not an exchange-
 
 ## Scope
 
-The physics primitive is semi-implicit rigid-body integration with gravity, force, torque, damping and quaternion normalization. It does not claim a contact solver, rotor aerodynamics or a complete drone controller. Contact/task logic belongs in the environment consumer. The initial learning task isolates visual steering through a randomized gap; it is not evidence of real-world drone flight.
+The physics primitive is semi-implicit rigid-body integration with gravity, force, torque, damping and quaternion normalization. It does not claim a contact solver or rotor aerodynamics. The city learning task uses **kinematic velocity control**: fixed altitude 6m, hover or eight horizontal headings at 3m/s, a level goal-facing camera, and six swept collision substeps per 20Hz action. This is navigation RL, not full drone-flight RL.
+
+Each batch shares the actual 1,799,347-triangle city across its independent cameras. Rendering uses 16m spatial chunks, GPU frustum culling and persistent indirect draws. Collision uses the same transformed GLB triangles, not layout AABBs. The renderer imports palette textures and material factors; it does not reproduce the legacy renderer's Poly Haven normal maps or sun shadows. Texture sampling is nearest/bilinear without mipmaps.
+
+Training, validation and test use separate 64m city districts, each with 128 geometry-checked routes. Every route has a blocked direct line and a collision-free waypoint path. Actor inputs exclude those waypoints unless the explicit privileged state baseline is selected. See [`python/README.md`](python/README.md) for training and provenance.
 
 `sim-smoke` verifies actual rendered geometry, metric depth, object IDs, analytic translation, quaternion normalization and every converted pixel. Its final PPM and correctness readbacks are explicit inspection steps outside the hot loop. Profiler captures must likewise distinguish initialization/inspection from collection; GPU pointers alone are not proof of zero host staging.
 

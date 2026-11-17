@@ -45,14 +45,18 @@ class Config:
             raise ValueError("learning rate must be positive")
 
 
+PROPRIO_SCALE = (32.0, 6.0, 32.0, 3.0, 3.0, 3.0, 1.0, 1.0)
+
+
 class Policy(nn.Module):
-    def __init__(self, feature_dim, hidden_size=128):
+    def __init__(self, feature_dim, action_count, hidden_size=128):
         super().__init__()
-        self.feature_dim, self.hidden_size = feature_dim, hidden_size
+        self.feature_dim, self.action_count, self.hidden_size = feature_dim, action_count, hidden_size
+        self.register_buffer("proprio_scale", torch.tensor(PROPRIO_SCALE))
         self.input = nn.Sequential(nn.Linear(feature_dim + 8, hidden_size),
                                    nn.LayerNorm(hidden_size), nn.Tanh())
         self.gru = nn.GRUCell(hidden_size, hidden_size)
-        self.actor = nn.Linear(hidden_size, 3)
+        self.actor = nn.Linear(hidden_size, action_count)
         self.critic = nn.Linear(hidden_size, 1)
         for layer in self.modules():
             if isinstance(layer, nn.Linear):
@@ -63,7 +67,7 @@ class Policy(nn.Module):
 
     def forward(self, features, proprio, hidden, starts):
         hidden = hidden * (1 - starts).unsqueeze(-1)
-        hidden = self.gru(self.input(torch.cat((features, proprio), -1)), hidden)
+        hidden = self.gru(self.input(torch.cat((features, proprio / self.proprio_scale), -1)), hidden)
         return self.actor(hidden), self.critic(hidden).squeeze(-1), hidden
 
     def sequence(self, features, proprio, hidden, starts):
@@ -87,7 +91,7 @@ def categorical(logits, actions=None):
 
 
 def terminal_gae(rewards, values, done, gamma, lam, out=None):
-    """Every done, including the 150-step clock, suppresses bootstrap/recursion.
+    """Every done, including the finite episode clock, suppresses bootstrap/recursion.
 
     values has T+1 entries; the final value may describe an autoreset observation,
     but multiplication by (1-done) makes it irrelevant to terminal transitions.
@@ -105,6 +109,8 @@ def terminal_gae(rewards, values, done, gamma, lam, out=None):
 class Trainer:
     def __init__(self, env, features, policy, config):
         config.validate()
+        if policy.action_count != env.action_count:
+            raise ValueError("policy action dimension differs from native city task")
         self.env, self.features, self.policy, self.config = env, features, policy, config
         self.optimizer = torch.optim.Adam(policy.parameters(), lr=config.learning_rate, fused=True, capturable=True)
         self.steps = 0
@@ -129,7 +135,7 @@ class Trainer:
     @torch.no_grad()
     def warmup(self, seed, iterations=3):
         """Initialize kernels/allocator, then discard warmup physics episodes."""
-        action = torch.ones(self.env.n, dtype=torch.int64, device=self.env.device)
+        action = torch.full((self.env.n,), self.env.neutral_action, dtype=torch.int64, device=self.env.device)
         for _ in range(iterations):
             self.policy(self.features(self.env), self.env.proprio, self.memory, self.next_start)
             self.env.step(action)
@@ -234,7 +240,7 @@ class Trainer:
 
 @torch.no_grad()
 def evaluate(env, features, policy=None, heuristic=None, seed=0):
-    """Exactly 150 steps; one first completed episode per environment, on GPU."""
+    """One first completed episode per environment over the native finite horizon."""
     if (policy is None) == (heuristic is None):
         raise ValueError("provide exactly one trained policy or blind heuristic")
     n = env.n
@@ -248,17 +254,18 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0):
     if policy is not None:
         policy.eval()
     with gpu_range("sim.evaluate"):
-        for _ in range(150):
+        for _ in range(env.horizon):
             if policy is not None:
                 logits, _, memory = policy(features(env), env.proprio, memory, starts)
                 actions.copy_(logits.argmax(-1))
-            elif heuristic == "center":
-                actions.fill_(1)
+            elif heuristic == "hover":
+                actions.fill_(env.neutral_action)
             elif heuristic == "random":
-                torch.randint(3, (n,), device=env.device, generator=generator, out=actions)
+                torch.randint(env.action_count, (n,), device=env.device, generator=generator, out=actions)
             elif heuristic == "goal_centering":
-                relative_x = env.proprio[:, 0]
-                actions.copy_(1 + (relative_x > 0.2).long() - (relative_x < -0.2).long())
+                # The city camera auto-yaws at the final goal: forward is the
+                # honest blind goal-centering control, not a waypoint oracle.
+                actions.fill_(1)
             else:
                 raise ValueError(f"unknown blind heuristic {heuristic}")
             env.step(actions)
@@ -269,7 +276,7 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0):
             totals[4].add_(active * env.done)
             active.mul_(1 - env.done)
             starts.copy_(env.done)
-    # A single aggregate transfer after all 150 steps, never a scalar read in
+    # A single aggregate transfer after the finite horizon, never a scalar read in
     # the loop. Include squares for return standard errors and successful
     # lengths separately: collision duration is not time-to-goal.
     aggregate = torch.cat((totals.sum(1), totals[0].square().sum().reshape(1),
@@ -284,4 +291,4 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0):
             "mean_return": mean_return, "mean_steps": values[3] / n,
             "mean_success_steps": mean_success_steps,
             "return_standard_error": (max(0, values[5] / n - mean_return ** 2) / n) ** 0.5,
-            "policy": heuristic or "checkpoint", "horizon_terminal": 150}
+            "policy": heuristic or "checkpoint", "horizon_terminal": env.horizon}

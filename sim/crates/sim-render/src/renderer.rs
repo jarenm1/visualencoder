@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-use std::{num::NonZeroU64, ops::Range};
+use std::{num::NonZeroU64, sync::Arc};
 
 use anyhow::{Result, ensure};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::{Camera, CameraGpu, Instance, MeshData, MeshVertex, OutputLayout, RenderConfig};
+use crate::{BaseColorImage, Camera, CameraGpu, Instance, MeshData, MeshVertex, OutputLayout, RenderConfig, WrapMode};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -16,6 +16,7 @@ struct GpuInstance {
     color: [f32; 4],
     surface: [f32; 4],
     metadata: [u32; 4],
+    pbr: [f32; 4],
 }
 
 impl From<&Instance> for GpuInstance {
@@ -28,6 +29,7 @@ impl From<&Instance> for GpuInstance {
             surface: [instance.material.shininess, instance.material.specular,
                 instance.material.checker_scale, instance.material.checker_contrast],
             metadata: [instance.body_index.unwrap_or(u32::MAX), instance.object_id, 0, 0],
+            pbr: [0.0, 0.5, 0.0, 0.0],
         }
     }
 }
@@ -41,11 +43,20 @@ struct Globals {
     camera_index: [u32; 4],
 }
 
-struct MeshBatch {
-    vertices: wgpu::Buffer,
-    indices: wgpu::Buffer,
-    index_count: u32,
-    instances: Range<u32>,
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct DrawInfo {
+    bounds_min: [f32; 4],
+    bounds_max: [f32; 4],
+    // index_count, first_index, base_vertex (bitcast i32), instance_index
+    command: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TextureInfo {
+    // atlas Y offset, width, height, packed wrapping/filter flags
+    data: [u32; 4],
 }
 
 struct Target {
@@ -92,6 +103,7 @@ impl Target {
 pub struct RenderBindings {
     cameras: Vec<wgpu::BindGroup>,
     pack: wgpu::BindGroup,
+    cull: wgpu::BindGroup,
 }
 
 pub struct Renderer {
@@ -101,7 +113,15 @@ pub struct Renderer {
     render_layout: wgpu::BindGroupLayout,
     pack_pipeline: wgpu::ComputePipeline,
     pack_layout: wgpu::BindGroupLayout,
-    meshes: Vec<MeshBatch>,
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    draws: wgpu::Buffer,
+    draw_count: u32,
+    indirect: wgpu::Buffer,
+    cull_pipeline: wgpu::ComputePipeline,
+    cull_layout: wgpu::BindGroupLayout,
+    texture_pixels: wgpu::TextureView,
+    texture_info: wgpu::Buffer,
     instances: wgpu::Buffer,
     cameras: wgpu::Buffer,
     globals: Vec<wgpu::Buffer>,
@@ -114,15 +134,18 @@ pub struct Renderer {
 
 impl Renderer {
     /// Upload immutable scene resources and preallocate all batch attachments.
-    /// No device features beyond baseline Vulkan wgpu limits are required.
+    /// Requires INDIRECT_FIRST_INSTANCE and indirect execution support.
     pub fn new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         config: RenderConfig,
         meshes: &[MeshData],
         instances: &[Instance],
         cameras: &[Camera],
     ) -> Result<Self> {
         let limits = device.limits();
+        ensure!(device.features().contains(wgpu::Features::INDIRECT_FIRST_INSTANCE),
+            "renderer requires INDIRECT_FIRST_INSTANCE");
         ensure!(config.width > 0 && config.height > 0, "render dimensions must be nonzero");
         ensure!(config.width <= limits.max_texture_dimension_2d && config.height <= limits.max_texture_dimension_2d,
             "render dimensions exceed device texture limits");
@@ -167,23 +190,104 @@ impl Renderer {
         let body_binding_bytes = body_count * 64;
         ensure!(body_binding_bytes <= u64::from(limits.max_storage_buffer_binding_size), "body indices exceed device storage limits");
         let mut grouped_instances = Vec::<GpuInstance>::with_capacity(instances.len());
-        let mut batches = Vec::with_capacity(meshes.len());
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        let mut draws = Vec::new();
+        // Deduplicated sRGB images share a vertical atlas. Each image keeps its
+        // original resolution; shader-side texel wrapping prevents atlas bleed.
+        let mut atlas_width = 1u32;
+        let mut atlas_height = 1u32;
+        let mut texture_info = vec![TextureInfo { data: [0, 1, 1, 0] }];
+        let mut images: Vec<(Arc<BaseColorImage>, u32)> = Vec::new();
         for (mesh_index, mesh) in meshes.iter().enumerate() {
             ensure!(!mesh.vertices.is_empty() && !mesh.indices.is_empty() && mesh.indices.len() % 3 == 0,
                 "mesh {mesh_index} must contain indexed triangles");
             ensure!(mesh.indices.iter().all(|&index| (index as usize) < mesh.vertices.len()), "mesh {mesh_index} has an invalid index");
+            let mut min = glam::Vec3::splat(f32::INFINITY);
+            let mut max = glam::Vec3::splat(f32::NEG_INFINITY);
+            for vertex in &mesh.vertices {
+                let p = glam::Vec3::from_array(vertex.position);
+                ensure!(p.is_finite(), "mesh {mesh_index} has non-finite vertices");
+                min = min.min(p); max = max.max(p);
+            }
+            let first_index = u32::try_from(indices.len())?;
+            let base_vertex = i32::try_from(vertices.len())?;
             let index_count = u32::try_from(mesh.indices.len())?;
-            let start = grouped_instances.len() as u32;
-            grouped_instances.extend(instances.iter().filter(|instance| instance.mesh == mesh_index).map(GpuInstance::from));
-            let end = grouped_instances.len() as u32;
-            if start == end { continue; }
-            batches.push(MeshBatch {
-                vertices: upload(device, "mesh vertices", &mesh.vertices, wgpu::BufferUsages::VERTEX),
-                indices: upload(device, "mesh indices", &mesh.indices, wgpu::BufferUsages::INDEX),
-                index_count,
-                instances: start..end,
-            });
+            vertices.extend_from_slice(&mesh.vertices);
+            indices.extend_from_slice(&mesh.indices);
+            let texture_index = if let Some(texture) = mesh.material.as_ref().and_then(|m| m.base_color_texture.as_ref()) {
+                let image = &texture.image;
+                ensure!(image.width > 0 && image.height > 0
+                    && image.rgba8.len() as u64 == u64::from(image.width) * u64::from(image.height) * 4,
+                    "invalid base-color image");
+                let offset = if let Some((_, offset)) = images.iter().find(|(other, _)| Arc::ptr_eq(other, image)
+                    || (other.width == image.width && other.height == image.height && other.rgba8 == image.rgba8)) {
+                    *offset
+                } else {
+                    let offset = atlas_height;
+                    atlas_height = atlas_height.checked_add(image.height).ok_or_else(|| anyhow::anyhow!("texture atlas height overflow"))?;
+                    atlas_width = atlas_width.max(image.width);
+                    images.push((image.clone(), offset));
+                    offset
+                };
+                let mode = |wrap| match wrap { WrapMode::Repeat => 0, WrapMode::MirroredRepeat => 1, WrapMode::ClampToEdge => 2 };
+                let descriptor = [offset, image.width, image.height,
+                    mode(texture.wrap_u) | (mode(texture.wrap_v) << 2) | (u32::from(texture.linear) << 4)];
+                if let Some(index) = texture_info.iter().position(|info| info.data == descriptor) { index as u32 }
+                else { texture_info.push(TextureInfo { data: descriptor }); (texture_info.len() - 1) as u32 }
+            } else { 0 };
+            for instance in instances.iter().filter(|instance| instance.mesh == mesh_index) {
+                let instance_index = u32::try_from(grouped_instances.len())?;
+                let mut gpu = GpuInstance::from(instance);
+                gpu.metadata[2] = texture_index;
+                if let Some(material) = &mesh.material {
+                    for channel in 0..4 { gpu.color[channel] *= material.base_color_factor[channel]; }
+                    gpu.pbr = [material.metallic_factor, material.roughness_factor, 1.0, 0.0];
+                    gpu.metadata[3] = u32::from(material.double_sided);
+                }
+                grouped_instances.push(gpu);
+                draws.push(DrawInfo { bounds_min: [min.x, min.y, min.z, 0.0],
+                    bounds_max: [max.x, max.y, max.z, 0.0],
+                    command: [index_count, first_index, base_vertex as u32, instance_index] });
+            }
         }
+        let draw_count = u32::try_from(draws.len())?;
+        ensure!(draw_count.div_ceil(64) <= limits.max_compute_workgroups_per_dimension, "too many culling workgroups");
+        let indirect_bytes = u64::from(draw_count) * u64::from(camera_count) * 20;
+        for (label, bytes) in [("draws", draws.len() as u64 * size_of::<DrawInfo>() as u64),
+            ("indirect", indirect_bytes),
+            ("texture descriptors", texture_info.len() as u64 * size_of::<TextureInfo>() as u64)] {
+            ensure!(bytes <= u64::from(limits.max_storage_buffer_binding_size) && bytes <= limits.max_buffer_size,
+                "{label} exceeds device storage limits");
+        }
+        let vertices = upload(device, "scene vertices", &vertices, wgpu::BufferUsages::VERTEX);
+        let indices = upload(device, "scene indices", &indices, wgpu::BufferUsages::INDEX);
+        let draws = upload(device, "scene draw bounds", &draws, wgpu::BufferUsages::STORAGE);
+        let indirect = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("persistent culled draw commands"), size: indirect_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT, mapped_at_creation: false,
+        });
+        ensure!(atlas_width <= limits.max_texture_dimension_2d && atlas_height <= limits.max_texture_dimension_2d,
+            "base-color image atlas exceeds texture dimensions");
+        let atlas = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("base-color sRGB image atlas"),
+            size: wgpu::Extent3d { width: atlas_width, height: atlas_height, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[],
+        });
+        let write_image = |y, width, height, rgba8: &[u8]| {
+            queue.write_texture(wgpu::TexelCopyTextureInfo {
+                texture: &atlas, mip_level: 0, origin: wgpu::Origin3d { x: 0, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            }, rgba8, wgpu::TexelCopyBufferLayout {
+                offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height),
+            }, wgpu::Extent3d { width, height, depth_or_array_layers: 1 });
+        };
+        write_image(0, 1, 1, &[255; 4]);
+        for (image, y) in &images { write_image(*y, image.width, image.height, &image.rgba8); }
+        let texture_pixels = atlas.create_view(&wgpu::TextureViewDescriptor::default());
+        let texture_info = upload(device, "base-color image descriptors", &texture_info, wgpu::BufferUsages::STORAGE);
         let instances = upload(device, "scene instances", &grouped_instances, wgpu::BufferUsages::STORAGE);
         let camera_data: Vec<_> = cameras.iter().map(|camera| camera.gpu(config.width as f32 / config.height as f32)).collect();
         let cameras = upload(device, "scene cameras", &camera_data, wgpu::BufferUsages::STORAGE);
@@ -201,7 +305,7 @@ impl Renderer {
             label: Some("sim-render mesh shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("render.wgsl").into()),
         });
-        let attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+        let attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2];
         let targets = [wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureFormat::R32Float, wgpu::TextureFormat::R32Uint]
             .map(|format| Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL }));
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -217,7 +321,7 @@ impl Renderer {
                     attributes: &attributes,
                 })],
             },
-            primitive: wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Back), ..Default::default() },
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: Some(true),
@@ -236,6 +340,16 @@ impl Renderer {
             cache: None,
         });
         let render_layout = render_pipeline.get_bind_group_layout(0);
+        let cull_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sim-render frustum culling"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("cull.wgsl").into()),
+        });
+        let cull_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("sim-render frustum culling"), layout: None,
+            module: &cull_shader, entry_point: Some("cull"),
+            compilation_options: Default::default(), cache: None,
+        });
+        let cull_layout = cull_pipeline.get_bind_group_layout(0);
         let pack_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sim-render pack bindings"),
             entries: &[
@@ -273,7 +387,8 @@ impl Renderer {
         });
         Ok(Self {
             config, output, render_pipeline, render_layout, pack_pipeline, pack_layout,
-            meshes: batches, instances, cameras, globals, body_binding_bytes,
+            vertices, indices, draws, draw_count, indirect, cull_pipeline, cull_layout,
+            texture_pixels, texture_info, instances, cameras, globals, body_binding_bytes,
             color: Target::new(device, output, wgpu::TextureFormat::Rgba8Unorm),
             optical_depth: Target::new(device, output, wgpu::TextureFormat::R32Float),
             object_id: Target::new(device, output, wgpu::TextureFormat::R32Uint),
@@ -316,6 +431,8 @@ impl Renderer {
                     wgpu::BindGroupEntry { binding: 1, resource: self.instances.as_entire_binding() },
                     buffer_entry(2, cameras, camera_bytes),
                     wgpu::BindGroupEntry { binding: 3, resource: globals.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.texture_pixels) },
+                    wgpu::BindGroupEntry { binding: 5, resource: self.texture_info.as_entire_binding() },
                 ],
             })
         }).collect();
@@ -329,13 +446,31 @@ impl Renderer {
                 buffer_entry(3, output, self.output.total_bytes),
             ],
         });
-        Ok(RenderBindings { cameras: camera_bindings, pack })
+        let cull = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sim-render culling bindings"), layout: &self.cull_layout,
+            entries: &[
+                buffer_entry(0, states, self.body_binding_bytes),
+                wgpu::BindGroupEntry { binding: 1, resource: self.instances.as_entire_binding() },
+                buffer_entry(2, cameras, camera_bytes),
+                wgpu::BindGroupEntry { binding: 3, resource: self.draws.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.indirect.as_entire_binding() },
+            ],
+        });
+        Ok(RenderBindings { cameras: camera_bindings, pack, cull })
     }
 
     /// Record all camera draws and one texture-to-contiguous-buffer compute pass.
     /// `bindings` must have been created by this renderer. There are no per-frame
     /// host vectors, resource creations, queue writes, submissions, or readbacks.
     pub fn render(&self, encoder: &mut wgpu::CommandEncoder, bindings: &RenderBindings) {
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("sim-render spatial culling"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.cull_pipeline);
+            pass.set_bind_group(0, &bindings.cull, &[]);
+            pass.dispatch_workgroups(self.draw_count.div_ceil(64), self.output.cameras, 1);
+        }
         let background = self.config.background;
         for (camera_index, camera) in bindings.cameras.iter().enumerate() {
             let attachments = [
@@ -357,11 +492,10 @@ impl Renderer {
             });
             pass.set_pipeline(&self.render_pipeline);
             pass.set_bind_group(0, camera, &[]);
-            for mesh in &self.meshes {
-                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.index_count, 0, mesh.instances.clone());
-            }
+            pass.set_vertex_buffer(0, self.vertices.slice(..));
+            pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.multi_draw_indexed_indirect(&self.indirect,
+                camera_index as u64 * u64::from(self.draw_count) * 20, self.draw_count);
         }
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("sim-render contiguous output"),

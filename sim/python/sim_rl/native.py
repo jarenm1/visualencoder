@@ -2,10 +2,15 @@
 from __future__ import annotations
 
 import ctypes as ct
+import json
+import os
 from contextlib import contextmanager
 from pathlib import Path
 
 import torch
+
+DEFAULT_CITY = Path(__file__).resolve().parents[3] / "assets" / "city"
+TASK = "city-block-navigation-v1"
 
 
 class _CudaAllocation:
@@ -24,7 +29,7 @@ class CudaEnv:
     used after close; the environment retains their owners until its final wait.
     Vulkan shared buffers are internal: every exposed pointer is CUDA-only.
     """
-    def __init__(self, library, n=64, seed=0, width=192, height=128, style=0):
+    def __init__(self, library, n=64, seed=0, width=192, height=128, style=0, city_path=DEFAULT_CITY):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required; no CPU environment fallback")
         if n < 1 or width < 48 or height < 32 or width % 16 or height % 16:
@@ -34,9 +39,11 @@ class CudaEnv:
         self.device = torch.device("cuda:0")
         self.n, self.width, self.height, self.style = n, width, height, style
         self.library = Path(library).resolve(strict=True)
+        self.city_path = Path(city_path).resolve(strict=True)
         self.lib = ct.CDLL(str(self.library))
         declarations = {
-            "sim_env_create": ([ct.c_uint32, ct.c_uint64, ct.c_uint32, ct.c_uint32, ct.c_uint32], ct.c_void_p),
+            "sim_env_create": ([ct.c_uint32, ct.c_uint64, ct.c_uint32, ct.c_uint32, ct.c_uint32, ct.c_char_p], ct.c_void_p),
+            "sim_env_metadata": ([ct.c_void_p], ct.c_char_p),
             "sim_env_reset": ([ct.c_void_p, ct.c_uint64], ct.c_int32),
             "sim_env_step": ([ct.c_void_p, ct.c_void_p], ct.c_int32),
             "sim_env_buffer": ([ct.c_void_p, ct.c_int32], ct.c_uint64),
@@ -45,13 +52,38 @@ class CudaEnv:
             "sim_env_error": ([], ct.c_char_p),
         }
         for name, (args, result) in declarations.items():
-            function = getattr(self.lib, name)
+            try:
+                function = getattr(self.lib, name)
+            except AttributeError as error:
+                raise RuntimeError(f"city navigation requires sim_env ABI v2 symbol {name}") from error
             function.argtypes, function.restype = args, result
-        self.handle = self.lib.sim_env_create(n, seed, width, height, style)
+        self.handle = self.lib.sim_env_create(n, seed, width, height, style, os.fsencode(self.city_path))
         if not self.handle:
             raise RuntimeError(self.error())
         self._owners, self.tensors = [], []
         try:
+            raw_metadata = self.lib.sim_env_metadata(self.handle)
+            if not raw_metadata:
+                raise RuntimeError(f"native city metadata unavailable: {self.error()}")
+            self.metadata = json.loads(raw_metadata.decode("utf-8"))
+            if self.metadata.get("abi_version") != 2 or self.metadata.get("task") != TASK:
+                raise ValueError("city navigation requires sim_env ABI v2; historical gap libraries are incompatible")
+            required = ("action_count", "neutral_action", "horizon", "control_hz", "physics_hz",
+                        "city_fingerprint", "city_path", "altitude_m", "speed_m_s", "route_counts",
+                        "route_split_definition", "collision_radius_m", "goal_radius_m",
+                        "triangle_count", "bvh_node_count", "reward")
+            missing = [key for key in required if key not in self.metadata]
+            if missing:
+                raise ValueError(f"incomplete native city metadata: {missing}")
+            self.action_count = int(self.metadata["action_count"])
+            self.neutral_action = int(self.metadata["neutral_action"])
+            self.horizon = int(self.metadata["horizon"])
+            if (self.action_count, self.neutral_action, self.horizon) != (9, 0, 320):
+                raise ValueError("unsupported city-block-navigation-v1 action/horizon contract")
+            # Location is relocatable; all scene content, controls, reward and
+            # route-catalog provenance must otherwise match checkpoints exactly.
+            self.task_contract = {key: value for key, value in self.metadata.items()
+                                  if key not in ("city_path", "style", "split")}
             pointer = self.lib.sim_env_stream(self.handle)
             if not pointer:
                 raise RuntimeError(self.error())
@@ -61,7 +93,8 @@ class CudaEnv:
             self.stream.synchronize()
             specifications = [((n, 3, height, width), "<f4"), ((n, 8), "<f4"),
                               ((n,), "<f4"), ((n,), "<f4"), ((n,), "<f4"),
-                              ((n, 4), "<f4"), ((n,), "<f4"), ((n,), "<u8")]
+                              ((n, 4), "<f4"), ((n,), "<f4"), ((n,), "<u8"),
+                              ((n, 8), "<f4")]
             with self.execution():
                 for field, (shape, typestr) in enumerate(specifications):
                     address = self.lib.sim_env_buffer(self.handle, field)
@@ -75,7 +108,7 @@ class CudaEnv:
                     self._owners.append(owner)
                     self.tensors.append(view)
             (self.obs, self.proprio, self.reward, self.done, self.success,
-             self.privileged, self.collision, self.episode_counts) = self.tensors
+             self.privileged, self.collision, self.episode_counts, self.diagnostics) = self.tensors
         except BaseException:
             self.close()
             raise

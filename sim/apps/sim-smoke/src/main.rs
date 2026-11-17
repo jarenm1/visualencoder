@@ -90,8 +90,11 @@ fn main() -> Result<()> {
         near: 0.1,
         far: 100.0,
     }).collect();
-    let renderer = Renderer::new(gpu.device(), RenderConfig { width: WIDTH, height: HEIGHT, ..Default::default() },
-                                 &[MeshData::cube(), MeshData::plane()], &[cube, second_cube, ground], &cameras)?;
+    // SAFETY: startup uploads use the locked queue without retaining it.
+    let renderer = unsafe { gpu.with_queue(|queue| Renderer::new(
+        gpu.device(), queue, RenderConfig { width: WIDTH, height: HEIGHT, ..Default::default() },
+        &[MeshData::cube(), MeshData::plane()], &[cube, second_cube, ground], &cameras,
+    )) }?;
     let layout = renderer.output_layout();
     let pixels = SharedBuffer::new(gpu.clone(), layout.total_bytes, wgpu::BufferUsages::STORAGE, "RGBA depth IDs")?;
     let rgb = SharedBuffer::new(gpu.clone(), shape.rgb_bytes() as u64, wgpu::BufferUsages::STORAGE, "CUDA planar RGB")?;

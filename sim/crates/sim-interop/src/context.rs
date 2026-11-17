@@ -66,7 +66,13 @@ impl Gpu {
             format!("no NVIDIA Vulkan adapter matches CUDA ordinal {cuda_ordinal} UUID {uuid:02x?}; no fallback is permitted")
         })?;
         let limits = adapter.limits();
-        let features = wgpu::Features::empty();
+        // GPU-generated indexed draws address persistent instance ranges directly.
+        let features = wgpu::Features::INDIRECT_FIRST_INSTANCE;
+        ensure!(adapter.features().contains(features), "matched Vulkan adapter lacks indirect first-instance draws");
+        ensure!(
+            adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION),
+            "matched Vulkan adapter lacks indirect draw execution",
+        );
         let memory_hints = wgpu::MemoryHints::MemoryUsage;
         // SAFETY: handles are only queried/used to create their own logical device.
         let hal = unsafe { adapter.as_hal::<Vulkan>() }.context("matched adapter is not Vulkan")?;

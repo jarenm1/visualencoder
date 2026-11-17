@@ -20,7 +20,7 @@ class FrozenFeatures:
         self.device = device
         if self.spec in ("state", "proprio"):
             self.dim = 4 if self.spec == "state" else 0
-            self.fingerprint = f"{self.spec}-only-v1"
+            self.fingerprint = f"city-{self.spec}-only-v1"
         else:
             if self.spec != "lingbot:small" and not self.spec.startswith("run:"):
                 raise ValueError("visual arms must use lingbot:small or an actual distilled run:<dir>")

@@ -24,7 +24,8 @@ class TerminalGAETest(unittest.TestCase):
 
     def test_gru_start_discards_previous_episode_memory(self):
         torch.manual_seed(7)
-        policy = Policy(4, 8)
+        policy = Policy(4, action_count=9, hidden_size=8)
+        self.assertEqual(policy.actor.out_features, 9)
         features, proprio = torch.randn(3, 4), torch.randn(3, 8)
         old = torch.randn(3, 8)
         a = policy(features, proprio, old, torch.ones(3))

@@ -1,66 +1,81 @@
-//! Pure task geometry used by both CUDA and the CPU regression tests.
-pub const GAP_HALF_WIDTH: f32 = 0.8;
-pub const DRONE_RADIUS: f32 = 0.18;
-pub const WALL_Z: f32 = -6.0;
-pub const GOAL_Z: f32 = -12.0;
-pub const HORIZON: u32 = 150;
+//! Shared, allocation-free city task constants and route layouts.
+use bytemuck::{Pod, Zeroable};
 
-pub fn episode_gap(seed: u64, env: u32, episode: u64, style: u32) -> f32 {
-    let mut z = seed ^ (env as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        ^ episode.wrapping_mul(0xd1b5_4a32_d192_ed03)
-        ^ (style as u64).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^= z >> 31;
-    (z >> 40) as f32 * (5.0 / 16_777_216.0) - 2.5
+pub const ALTITUDE: f32 = 6.0;
+pub const SPEED: f32 = 3.0;
+pub const DRONE_RADIUS: f32 = 0.35;
+pub const PLANNING_RADIUS: f32 = 0.85;
+pub const GOAL_RADIUS: f32 = 1.0;
+pub const WAYPOINT_RADIUS: f32 = 0.25;
+pub const HORIZON: u32 = 320;
+pub const PHYSICS_HZ: u32 = 120;
+pub const SUBSTEPS: u32 = 6;
+pub const ROUTES_PER_SPLIT: usize = 128;
+pub const GRID_SPACING: f32 = 2.0;
+pub const DISTRICT_HALF_SIZE: f32 = 32.0;
+pub const MIN_ROUTE_LENGTH: f32 = 12.0;
+pub const MAX_ROUTE_LENGTH: f32 = 38.0;
+pub const CATALOG_SEEDS: [u64; 3] = [
+    0x65a4_947b_3a2d_7811, 0xb8d0_c5e4_109a_3267, 0x2f61_39ac_75e8_d403,
+];
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct Route {
+    pub first: u32,
+    pub count: u32,
+    pub length: f32,
+    pub reserved: u32,
 }
 
-/// Swept sphere against the wall's entire thickness, not just its centre plane.
-pub fn hits_wall(old_x: f32, old_z: f32, x: f32, z: f32, gap: f32) -> bool {
-    let front = WALL_Z + 0.15 + DRONE_RADIUS;
-    let back = WALL_Z - 0.15 - DRONE_RADIUS;
-    if (old_z > front && z > front) || (old_z < back && z < back) {
-        return false;
+/// xyz position and exact suffix polyline distance to final goal in metres.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct Waypoint {
+    pub position: [f32; 3],
+    pub remaining: f32,
+}
+
+pub fn mix(mut x: u64) -> u64 {
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+pub fn episode_route(seed: u64, env: u32, episode: u64, count: u32) -> u32 {
+    (mix(seed ^ (env as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ episode.wrapping_mul(0xd1b5_4a32_d192_ed03)) % count as u64) as u32
+}
+
+/// (right, forward), normalized; the public action numbering is clockwise.
+pub fn action_direction(action: i64) -> [f32; 2] {
+    const D: f32 = core::f32::consts::FRAC_1_SQRT_2;
+    match action {
+        1 => [0.0, 1.0], 2 => [D, D], 3 => [1.0, 0.0],
+        4 => [D, -D], 5 => [0.0, -1.0], 6 => [-D, -D],
+        7 => [-1.0, 0.0], 8 => [-D, D], _ => [0.0, 0.0],
     }
-    let dz = z - old_z;
-    let (mut a, mut b) = (0.0, 1.0);
-    if dz != 0.0 {
-        let t0 = (front - old_z) / dz;
-        let t1 = (back - old_z) / dz;
-        let (lo, hi) = if t0 < t1 { (t0, t1) } else { (t1, t0) };
-        if lo > a { a = lo; }
-        if hi < b { b = hi; }
-    }
-    if a > b { return false; }
-    let xa = old_x + (x - old_x) * a - gap;
-    let xb = old_x + (x - old_x) * b - gap;
-    let clearance = GAP_HALF_WIDTH - DRONE_RADIUS;
-    xa < -clearance || xa > clearance || xb < -clearance || xb > clearance
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn swept_wall_catches_tunnelling_and_side_entry() {
-        assert!(!hits_wall(0.0, -5.0, 0.0, -7.0, 0.0));
-        assert!(hits_wall(1.0, -5.0, 1.0, -7.0, 0.0));
-        assert!(hits_wall(0.0, -6.0, 0.9, -6.1, 0.0));
-        assert!(!hits_wall(2.0, -1.0, 2.0, -2.0, 0.0));
-        assert!(!hits_wall(2.0, -8.0, 2.0, -9.0, 0.0));
-        assert!(hits_wall(0.0, -5.6, 1.0, -5.8, 0.0));
-    }
-
-    #[test]
-    fn gap_rng_is_reproducible_and_episode_local() {
-        assert_eq!(episode_gap(7, 3, 9, 0), episode_gap(7, 3, 9, 0));
-        assert_ne!(episode_gap(7, 3, 9, 0), episode_gap(7, 3, 10, 0));
-        assert_ne!(episode_gap(7, 3, 9, 0), episode_gap(7, 4, 9, 0));
-        assert_ne!(episode_gap(7, 3, 9, 0), episode_gap(7, 3, 9, 1));
-        for episode in 0..1000 {
-            let gap = episode_gap(7, 3, episode, 0);
-            assert!((-2.5..2.5).contains(&gap));
+    fn commands_are_unit_and_clockwise() {
+        assert_eq!(action_direction(0), [0.0, 0.0]);
+        assert_eq!(action_direction(3), [1.0, 0.0]);
+        assert_eq!(action_direction(7), [-1.0, 0.0]);
+        for a in 1..=8 {
+            let [r, f] = action_direction(a);
+            assert!((r * r + f * f - 1.0).abs() < 1e-6);
         }
+    }
+    #[test]
+    fn route_selection_is_episode_local_and_repeatable() {
+        // Repeated routes are legal; test independent sequences, not uniqueness.
+        assert!((0..128).any(|episode|
+            episode_route(7, 2, episode, 128) != episode_route(7, 3, episode, 128)));
+        assert!((0..128).any(|episode|
+            episode_route(7, 2, episode, 128) != episode_route(8, 2, episode, 128)));
     }
 }

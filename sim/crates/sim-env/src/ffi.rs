@@ -1,4 +1,4 @@
-use std::{cell::RefCell, ffi::{CString, c_char, c_void}, panic::{AssertUnwindSafe, catch_unwind}};
+use std::{cell::RefCell, ffi::{CStr, CString, c_char, c_void}, panic::{AssertUnwindSafe, catch_unwind}, path::Path};
 use anyhow::{Result, ensure};
 use crate::Env;
 
@@ -32,9 +32,14 @@ unsafe fn environment<'a>(handle: *mut c_void) -> Result<&'a mut Env> {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn sim_env_create(n: u32, seed: u64, width: u32, height: u32, style: u32) -> *mut c_void {
+pub unsafe extern "C" fn sim_env_create(n: u32, seed: u64, width: u32, height: u32, style: u32,
+    city_path: *const c_char) -> *mut c_void {
     boundary(std::ptr::null_mut(), || {
-        Ok(Box::into_raw(Box::new(Env::new(n, seed, width, height, style)?)).cast())
+        ensure!(!city_path.is_null(), "city_path must not be null");
+        // SAFETY: caller supplies a readable, NUL-terminated UTF-8 path.
+        let path = unsafe { CStr::from_ptr(city_path) }.to_str()?;
+        ensure!(!path.is_empty(), "city_path must not be empty");
+        Ok(Box::into_raw(Box::new(Env::new(n, seed, width, height, style, Path::new(path))?)).cast())
     })
 }
 
@@ -62,6 +67,11 @@ pub unsafe extern "C" fn sim_env_buffer(handle: *mut c_void, field: i32) -> u64 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sim_env_stream(handle: *mut c_void) -> u64 {
     boundary(0, || Ok(unsafe { environment(handle)? }.stream()))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sim_env_metadata(handle: *mut c_void) -> *const c_char {
+    boundary(std::ptr::null(), || Ok(unsafe { environment(handle)? }.metadata()))
 }
 
 #[unsafe(no_mangle)]

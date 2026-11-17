@@ -7,6 +7,8 @@
 
 use bytemuck::{Pod, Zeroable};
 
+pub mod collision;
+
 /// One rigid body. The fourth lane of each non-quaternion vector is reserved zero.
 ///
 /// A zeroed allocation is not an initialized body: use [`Self::default`] or

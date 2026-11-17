@@ -16,7 +16,7 @@ mod mesh;
 mod renderer;
 
 pub use camera::{Camera, CameraGpu};
-pub use mesh::{MeshData, MeshVertex};
+pub use mesh::{BaseColorImage, BaseColorTexture, MeshData, MeshMaterial, MeshVertex, WrapMode};
 pub use renderer::{RenderBindings, Renderer};
 
 /// Surface parameters in linear RGB; the packed output is sRGB-encoded RGBA8.
@@ -44,7 +44,7 @@ impl Default for Material {
 
 /// Local mesh transform, optionally attached to a GPU body. Composition is
 /// body_translation * body_rotation * local_translation * local_rotation * scale.
-/// A mesh batch is drawn with one instanced indexed draw per camera.
+/// Mesh instances are GPU frustum-culled and drawn with indexed multi-draw.
 #[derive(Clone, Copy, Debug)]
 pub struct Instance {
     pub mesh: usize,

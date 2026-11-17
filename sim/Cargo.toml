@@ -3,12 +3,13 @@ members = [
     "crates/sim-state",
     "crates/sim-interop",
     "crates/sim-render",
+    "crates/sim-scene",
     "crates/sim-physics",
     "crates/sim-env",
     "apps/sim-smoke",
 ]
 # Ordinary host iteration never invokes the device compiler.
-default-members = ["crates/sim-state", "crates/sim-interop", "crates/sim-render"]
+default-members = ["crates/sim-state", "crates/sim-interop", "crates/sim-render", "crates/sim-scene"]
 resolver = "3"
 
 [workspace.package]
