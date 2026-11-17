@@ -126,6 +126,33 @@ Measured on ABI v4 (designed 1.5–2.5 m shapes, held-out designs; `runs/drone-p
 | `baseline` (standard distilled) | 0.894 | 0.629 | 0.861 | 7.6 px |
 | `mean` (paired consistency) | 0.897 | 0.620 | 0.856 | 7.7 px |
 
+## Bounded exploration experiment (ABI v5)
+
+`runs/drone7-mean-explore-seed0`: fresh seed-0 camera policy, TensorRT FP16 `mean` encoder, 128 envs, reference-goal refresh every 30 steps, unchanged 8–30 m training starts and adaptive curriculum, with the single capped novelty bonus above. Completed 2,007,040 steps in 1452 s (24.2 min including initialization, validation and standard test). Standard validation GPS success at 0.5M / 1M / 1.5M / 2M was 0.8% / 10.2% / 8.6% / 3.1%; `best.pt` is the 1,007,616-step checkpoint, while the predeclared 2M cohort comparison uses `last.pt`. The standard test of `best.pt` gets 7.4% fixed-goal GPS success.
+
+Paired test catalogs (seed 20002), 256 episodes per policy/cohort/GPS mode, fixed goal references and **no oracle refresh or novelty reward at evaluation**. Baseline is the previous 3,006,464-step `runs/drone6-mean-refresh-seed0/best.pt`; training budgets differ, so this is a practical checkpoint comparison, not a matched-budget causal ablation. Wilson 95% intervals:
+
+| Cohort | GPS mode | Previous success % [95%] | Exploration success % [95%] |
+|---|---|---|---|
+| Hidden, 8–30 m | available | 1.95 [0.84, 4.49] | 1.17 [0.40, 3.39] |
+| Hidden, 8–30 m | denied | 1.56 [0.61, 3.95] | 1.17 [0.40, 3.39] |
+| Far, 35–50 m | available | 4.30 [2.42, 7.53] | 0.39 [0.07, 2.18] |
+| Far, 35–50 m | denied | 3.52 [1.86, 6.55] | 0.39 [0.07, 2.18] |
+| Hidden + far | available | 0.39 [0.07, 2.18] | 0.00 [0.00, 1.48] |
+| Hidden + far | denied | 0.39 [0.07, 2.18] | 0.00 [0.00, 1.48] |
+
+Behavioral diagnostics, GPS available. Stopped-away = fraction of active episode frames at speed <0.2 m/s and >6 m from the target box; new tiles exclude the initial view:
+
+| Cohort | Previous stopped-away % | Exploration stopped-away % | Previous new tiles | Exploration new tiles |
+|---|---|---|---|---|
+| Hidden | 39.7 | 10.2 | 102.8 | 166.0 |
+| Far | 25.8 | 8.4 | 144.5 | 233.0 |
+| Hidden + far | 44.9 | 11.5 | 96.8 | 179.1 |
+
+The intended behavioral change occurred: much less stopping and more observed area. Reaching success did not improve, and far-target success fell. Do not promote this checkpoint as a navigation improvement. One seed and unequal budgets limit attribution. These district-based cohorts still contain no skyscraper targets; they test hidden/range difficulty, not skyscraper-family generalization. Full metrics: `cohorts-fixed-goal.json`.
+
+Verification: native CUDA build; 34 Python tests; 7 scene host tests (2 ignored); real GPU smoke verified initial/revisit/goal-render/terminal zero novelty, the +2 budget, finite PPO update, old-checkpoint base-contract loading, and hidden-only 35–50 m starts.
+
 ## Refreshed-goal run (ABI v5)
 
 `runs/drone6-mean-refresh-seed0`: fresh camera policy, `mean` encoder with TensorRT FP16, seed 0, 128 envs, goal refresh every 30 steps. Reward, horizon, start-distance range and curriculum settings are unchanged from v5. Requested budget was 6M steps without a wall cutoff; stopped at 5,185,536 steps after validation regressed, retaining `best.pt` from 3,006,464 steps.
