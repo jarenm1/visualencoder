@@ -141,3 +141,37 @@ class FrozenFeatures:
             env.curriculum.copy_(restore)
             cache[key] = table
         return cache[key]
+
+
+class RefreshedGoals:
+    """Simulator-supervised goal refresh, not an action controller.
+
+    Keep the last crop when the target is hidden or too small/large to recognize.
+    Reset rows immediately on autoreset, including two consecutive episodes of the same object.
+    ``step`` is called once per observation; the fixed batch schedule never reads GPU state.
+    Deployment must supply boxes from perception, not these privileged simulator bounds.
+    """
+
+    def __init__(self, env, features, table, interval):
+        self.env, self.features, self.table, self.interval = env, features, table, interval
+        self.goal = table[env.catalog_index.long()].clone()
+        self.ticks = 0
+        self.updates = torch.zeros(env.n, device=env.device, dtype=torch.long)
+
+    @torch.no_grad()
+    def step(self, starts):
+        initial = self.table[self.env.catalog_index.long()]
+        self.goal.copy_(torch.where(starts[:, None] > 0.5, initial, self.goal))
+        if self.interval and self.ticks and self.ticks % self.interval == 0:
+            p = self.env.privileged
+            x0, y0, x1, y1 = p[:, 25:29].unbind(-1)
+            boxes = torch.stack(((x0 + 1) / 2, (1 - y1) / 2,
+                                 (x1 + 1) / 2, (1 - y0) / 2), -1)
+            span = (boxes[:, 2] - boxes[:, 0]).maximum(boxes[:, 3] - boxes[:, 1])
+            valid = (p[:, 14] > 0.5) & (span >= 0.08) & (span * 1.3 <= 0.8) & (starts < 0.5)
+            crops = crop_goals(self.env.obs, square_goal_box(boxes))
+            refreshed = self.features.goal_embedding(crops).to(self.goal.dtype)
+            self.goal.copy_(torch.where(valid[:, None], refreshed, self.goal))
+            self.updates.add_(valid)
+        self.ticks += 1
+        return self.goal.float()

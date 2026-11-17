@@ -4,6 +4,7 @@ from __future__ import annotations
 import torch
 
 from .curriculum import BUCKETS, UNIFORM_WEIGHTS
+from .features import RefreshedGoals
 from .model import deterministic_action
 from .native import HOVER_ACTIONS
 from .ppo import gpu_range
@@ -49,7 +50,8 @@ def gps_pursuit(proprio, action_scales):
 
 
 @torch.no_grad()
-def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, appearance=1.0):
+def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, appearance=1.0,
+             goal_refresh_steps=0):
     """Deterministic policy (tanh of the mean) or blind heuristic over one reset of the native finite horizon.
 
     Curriculum is uniform over visibility buckets with p_no_gps = ``no_gps`` and the given
@@ -67,6 +69,7 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
     env.write_curriculum(lanes)
     goals = features.catalog_goals(env, appearance) if policy is not None and features.visual else None
     env.reset(seed)
+    goal_source = RefreshedGoals(env, features, goals, goal_refresh_steps) if goals is not None else None
     start_landed = env.diagnostics[:, 19].clamp(0, 1).clone()
     start_class = env.diagnostics[:, 14].clone()
     active = torch.ones(n, device=device)
@@ -88,7 +91,7 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
         for _ in range(env.horizon):
             if policy is not None:
                 cls, tokens = features.observe(env) if features.visual else (None, None)
-                goal = goals[env.catalog_index.long()].float() if features.visual else None
+                goal = goal_source.step(starts) if goal_source is not None else None
                 inputs, _ = policy.actor_inputs_and_features(cls, tokens, goal, env.proprio, env.privileged)
                 mean, hidden = policy.step(inputs, hidden, starts)
                 actions.copy_(deterministic_action(mean))
@@ -130,6 +133,8 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
     cells = table.cpu().tolist()
     result = summarize(n, cells, policy=heuristic or "checkpoint", horizon=env.horizon, no_gps=no_gps)
     result["appearance"] = appearance
+    result["goal_refresh_steps"] = goal_refresh_steps if goals is not None else 0
+    result["goal_box_source"] = "simulator" if goals is not None and goal_refresh_steps else None
     result["classes"] = {name: {"episodes": round(count), "success": hits / count if count else None}
                          for name, count, hits in zip(env.target_classes, *class_table.cpu().tolist())}
     return result

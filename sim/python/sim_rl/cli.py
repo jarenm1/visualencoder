@@ -89,7 +89,9 @@ def provenance(env, features, training):
 
 def training_settings(args):
     return {"curriculum": args.curriculum, "no_gps_fraction": args.no_gps_fraction,
-            "aux_coefficient": args.aux_coefficient, "appearance": args.appearance}
+            "aux_coefficient": args.aux_coefficient, "appearance": args.appearance,
+            "goal_refresh_steps": args.goal_refresh_steps,
+            "goal_box_source": "simulator" if args.goal_refresh_steps else None}
 
 
 def checkpoint(policy, metadata, steps):
@@ -124,7 +126,8 @@ def make_config(args):
                   gamma=args.gamma, gae_lambda=args.gae_lambda, clip=args.clip, entropy=args.entropy,
                   value_coefficient=args.value_coefficient, max_grad_norm=args.max_grad_norm,
                   curriculum=args.curriculum, aux_coefficient=args.aux_coefficient,
-                  no_gps_fraction=args.no_gps_fraction, appearance=args.appearance)
+                  no_gps_fraction=args.no_gps_fraction, appearance=args.appearance,
+                  goal_refresh_steps=args.goal_refresh_steps)
 
 
 def open_env(args, n, seed, style):
@@ -142,11 +145,12 @@ def check_episodes(result):
     return result
 
 
-def gps_modes(env, features, policy, seed, heuristics=True):
+def gps_modes(env, features, policy, seed, heuristics=True, goal_refresh_steps=0):
     """Policy (and optionally blind heuristics) in both GPS modes: GPS available (p_no_gps=0) and GPS denied (p_no_gps=1)."""
     results = {}
     for label, no_gps in (("gps", 0.0), ("no_gps", 1.0)):
-        results[label] = {"policy": check_episodes(evaluate(env, features, policy=policy, seed=seed, no_gps=no_gps))}
+        results[label] = {"policy": check_episodes(evaluate(
+            env, features, policy=policy, seed=seed, no_gps=no_gps, goal_refresh_steps=goal_refresh_steps))}
         if heuristics:
             results[label]["heuristics"] = {
                 name: check_episodes(evaluate(env, features, heuristic=name, seed=seed, no_gps=no_gps))
@@ -207,7 +211,7 @@ def train_command(args, started):
     run.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda:0")
     features = FrozenFeatures(args.encoder, device, args.encoder_precision)
-    budget_end = started + args.wall_seconds
+    budget_end = started + args.wall_seconds if args.wall_seconds else float("inf")
     curves = (run / "learning-curves.jsonl").open("w")
     validations = []
     best_success, best_path, last_path = -1.0, run / "best.pt", run / "last.pt"
@@ -222,7 +226,8 @@ def train_command(args, started):
         def validate():
             with validation_env.execution():
                 policy.eval()
-                result = gps_modes(validation_env, features, policy, VALIDATION_SEED, heuristics=False)
+                result = gps_modes(validation_env, features, policy, VALIDATION_SEED, heuristics=False,
+                                   goal_refresh_steps=config.goal_refresh_steps)
                 policy.train()
             result["selection_success"] = selection_success(result, config)
             return result
@@ -245,6 +250,8 @@ def train_command(args, started):
                 next_validation += args.validation_every
                 result = validate()
                 validations.append({"steps": trainer.steps, "result": result})
+                emit({"validations": validations}, run / "validation.json")
+                print(json.dumps({"validation_steps": trainer.steps, "result": result}), flush=True)
                 if result["selection_success"] > best_success:
                     best_success = result["selection_success"]
                     torch.save(checkpoint(policy, metadata, trainer.steps), best_path)
@@ -263,10 +270,13 @@ def train_command(args, started):
         with test_env.execution():
             policy = build_policy(test_env, features)
             policy.load_state_dict(saved["model"])
-            test = gps_modes(test_env, features, policy, TEST_SEED)
+            test = gps_modes(test_env, features, policy, TEST_SEED,
+                             goal_refresh_steps=config.goal_refresh_steps)
+            fixed_goal_test = (gps_modes(test_env, features, policy, TEST_SEED, heuristics=False)
+                               if config.goal_refresh_steps else None)
     elapsed = time.monotonic() - started
     final_test = {"checkpoint": "best.pt", "checkpoint_sha256": sha256(best_path),
-                  "control_mode": metadata["control_mode"], **test}
+                  "control_mode": metadata["control_mode"], **test, "fixed_goal": fixed_goal_test}
     emit(final_test, run / "final-test.json")
     summary = {
         "task": TASK, "abi_version": ABI_VERSION, "control_mode": metadata["control_mode"],
@@ -274,15 +284,20 @@ def train_command(args, started):
         "width": metadata["width"], "height": metadata["height"], "control_hz": metadata["control_hz"],
         "city_fingerprint": metadata["native_task_contract"]["city_fingerprint"],
         "steps": trainer.steps, "no_gps_fraction": args.no_gps_fraction, "aux_coefficient": args.aux_coefficient,
+        "goal_refresh_steps": config.goal_refresh_steps,
+        "goal_box_source": metadata["goal_box_source"],
+        "fixed_goal_test_success": ({label: fixed_goal_test[label]["policy"]["success"]
+                                     for label in ("gps", "no_gps")} if fixed_goal_test else None),
         "best_validation_selection_success": best_success,
         "test_success": {label: test[label]["policy"]["success"] for label in ("gps", "no_gps")},
         "test_success_wilson95": {label: test[label]["policy"]["success_wilson95"] for label in ("gps", "no_gps")},
         "elapsed_seconds_including_initialization_training_evaluation": elapsed,
-        "wall_budget_seconds": args.wall_seconds, "within_wall_budget": elapsed <= args.wall_seconds,
+        "wall_budget_seconds": args.wall_seconds or None,
+        "within_wall_budget": elapsed <= args.wall_seconds if args.wall_seconds else None,
         "compile_excluded": True, "convergence_claim": False,
     }
     emit(summary, run / "summary.json")
-    write_report(run, summary, test)
+    write_report(run, summary, final_test)
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 
@@ -296,12 +311,17 @@ def write_report(run, summary, test):
     lines = ["# City drone goal test", "", f"Task: `{summary['task']}`, ABI {summary['abi_version']}, "
              f"control `{summary['control_mode']}`, policy mode `{summary['policy_mode']}`, "
              f"steps {summary['steps']}, no-GPS fraction {summary['no_gps_fraction']}."]
+    if summary["goal_refresh_steps"]:
+        lines += ["", f"Goal refresh: every {summary['goal_refresh_steps']} steps, using simulator boxes. "
+                  "This is oracle perception, not measured LLM grounding."]
     for label, title in (("gps", "GPS available"), ("no_gps", "GPS denied")):
         section = test[label]
         lines += ["", f"## {title}", "",
                   "| arm | episodes | success [Wilson 95%] | collision | out of bounds | timeout |",
                   "|---|---|---|---|---|---|", row(summary["policy_mode"], section["policy"])]
         lines += [row(name, result) for name, result in section["heuristics"].items()]
+        if test.get("fixed_goal") is not None:
+            lines.append(row("policy, fixed initial goal", test["fixed_goal"][label]["policy"]))
         lines += ["", "Per visibility bucket (policy):", ""]
         lines += [f"- {name}: episodes {result['episodes']}, success {result.get('success')}"
                   for name, result in section["policy"]["buckets"].items()]
@@ -322,7 +342,8 @@ def eval_command(args, started):
             validate_checkpoint(saved, env, features)
             policy = build_policy(env, features)
             policy.load_state_dict(saved["model"])
-            results = gps_modes(env, features, policy, seed)
+            results = gps_modes(env, features, policy, seed,
+                                goal_refresh_steps=metadata.get("goal_refresh_steps", 0))
     payload = {"checkpoint": str(args.checkpoint), "checkpoint_sha256": sha256(args.checkpoint),
                "split": args.split, "control_mode": metadata["control_mode"], **results}
     emit(payload, args.out)
@@ -460,6 +481,9 @@ def add_learner(parser):
                         help="weight of the visibility + localization auxiliary loss (visual arms)")
     parser.add_argument("--appearance", type=float, default=DEFAULTS.appearance,
                         help="randomized appearance strength during training (0 = plain render)")
+    parser.add_argument("--goal-refresh-steps", type=int, default=DEFAULTS.goal_refresh_steps,
+                        help="refresh the goal from a visible simulator target box every N control steps "
+                             "(0 = fixed reference); no scripted actions")
     parser.add_argument("--total-steps", type=int, default=DEFAULTS.total_steps)
     parser.add_argument("--rollout-steps", type=int, default=DEFAULTS.rollout_steps)
     parser.add_argument("--sequence-length", type=int, default=DEFAULTS.sequence_length)
@@ -485,7 +509,8 @@ def parser():
     train.add_argument("--out", type=Path, required=True)
     train.add_argument("--eval-envs", type=int, default=384)
     train.add_argument("--validation-every", type=int, default=1_000_000)
-    train.add_argument("--wall-seconds", type=float, default=3600)
+    train.add_argument("--wall-seconds", type=float, default=3600,
+                       help="wall budget in seconds; 0 trains to --total-steps without a time cutoff")
     train.add_argument("--final-reserve-seconds", type=float, default=300)
     train.set_defaults(func=train_command)
 

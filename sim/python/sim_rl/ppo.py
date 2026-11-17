@@ -8,6 +8,7 @@ import torch
 from torch.profiler import record_function
 
 from .curriculum import MODES as CURRICULUM_MODES, Curriculum
+from .features import RefreshedGoals
 from .model import saliency_loss, squashed_entropy, squashed_log_prob
 from .native import HOVER_ACTIONS, PRIVILEGED_WIDTH, PROPRIO_WIDTH
 
@@ -46,6 +47,7 @@ class Config:
     aux_coefficient: float = 0.5
     no_gps_fraction: float = 0.0
     appearance: float = 1.0
+    goal_refresh_steps: int = 0
 
     def validate(self):
         if min(self.total_steps, self.rollout_steps, self.sequence_length,
@@ -63,6 +65,8 @@ class Config:
             raise ValueError("no_gps_fraction must be in [0, 1]")
         if not 0.0 <= self.appearance <= 1.0:
             raise ValueError("appearance must be in [0, 1]")
+        if self.goal_refresh_steps < 0:
+            raise ValueError("goal_refresh_steps must be non-negative")
 
 
 def terminal_gae(rewards, values, done, gamma, lam, out=None):
@@ -102,7 +106,6 @@ class Trainer:
         allocate = lambda *shape: torch.empty(shape, device=env.device)
         self.proprio = allocate(t, n, PROPRIO_WIDTH)
         self.privileged = allocate(t, n, PRIVILEGED_WIDTH)
-        self.catalog = torch.zeros((t, n), device=env.device, dtype=torch.long)
         self.starts = allocate(t, n)
         self.hidden = allocate(t, n, h)
         self.actions = allocate(t, n, env.action_dim)
@@ -118,6 +121,8 @@ class Trainer:
         if features.visual:
             patches = env.height // 16 * (env.width // 16)
             self.goals = features.catalog_goals(env, config.appearance)
+            self.goal_source = RefreshedGoals(env, features, self.goals, config.goal_refresh_steps)
+            self.rollout_goals = torch.empty((t, n, 2 * features.dim), device=env.device, dtype=torch.bfloat16)
             self.cls = allocate(t, n, features.dim)
             self.tokens = torch.empty((t, n, patches, features.dim), device=env.device, dtype=torch.bfloat16)
         else:
@@ -130,9 +135,8 @@ class Trainer:
         if self.features.visual:
             self.current_cls, self.current_tokens = self.features.observe(self.env)
 
-    def _inputs(self, cls, tokens, catalog, proprio, privileged):
-        """Returns (actor inputs, saliency logits or None); the goal is the catalog entry's crop embedding."""
-        goal = self.goals[catalog].float() if self.features.visual else None
+    def _inputs(self, cls, tokens, goal, proprio, privileged):
+        """Use the exact goal seen at collection, including any in-episode refresh."""
         return self.policy.actor_inputs_and_features(cls, tokens, goal, proprio, privileged)
 
     @torch.no_grad()
@@ -140,12 +144,16 @@ class Trainer:
         """Initialize kernels/allocator, then discard warmup physics episodes."""
         hover = self.hover.expand(self.env.n, -1).contiguous()
         for _ in range(iterations):
-            inputs, _ = self._inputs(self.current_cls, self.current_tokens, self.env.catalog_index.long(),
+            goal = self.goal_source.step(self.next_start) if self.features.visual else None
+            inputs, _ = self._inputs(self.current_cls, self.current_tokens, goal,
                                      self.env.proprio, self.env.privileged)
             self.policy.step(inputs, self.memory, self.next_start)
             self.env.step(hover)
             self._observe()
         self.env.reset(seed)
+        if self.features.visual:
+            self.goal_source.ticks = 0
+            self.goal_source.updates.zero_()
         self._observe()
         self.memory.zero_()
         self.next_start.fill_(1)
@@ -162,15 +170,16 @@ class Trainer:
             for t in range(length):
                 self.proprio[t].copy_(self.env.proprio)
                 self.privileged[t].copy_(self.env.privileged)
-                self.catalog[t].copy_(self.env.catalog_index)
                 self.starts[t].copy_(self.next_start)
                 self.hidden[t].copy_(self.memory)
                 if self.features.visual:
+                    self.rollout_goals[t].copy_(self.goal_source.step(self.next_start))
                     self.cls[t].copy_(self.current_cls)
                     self.tokens[t].copy_(self.current_tokens)
                 inputs, _ = self._inputs(self.cls[t] if self.features.visual else None,
                                          self.tokens[t] if self.features.visual else None,
-                                         self.catalog[t], self.proprio[t], self.privileged[t])
+                                         self.rollout_goals[t].float() if self.features.visual else None,
+                                         self.proprio[t], self.privileged[t])
                 mean, memory = self.policy.step(inputs, self.memory, self.next_start)
                 raw = mean + log_std.exp() * torch.randn_like(mean)
                 self.actions[t].copy_(raw)
@@ -223,7 +232,7 @@ class Trainer:
                     if self.features.visual:
                         inputs, attended = self._inputs(self.cls[times, env_ids].flatten(0, 1),
                                                         self.tokens[times, env_ids].flatten(0, 1),
-                                                        self.catalog[times, env_ids].flatten(),
+                                                        self.rollout_goals[times, env_ids].flatten(0, 1).float(),
                                                         proprio.flatten(0, 1), privileged.flatten(0, 1))
                     else:
                         inputs, attended = self._inputs(None, None, None, proprio.flatten(0, 1),

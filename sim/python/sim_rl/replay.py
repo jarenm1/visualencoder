@@ -14,7 +14,7 @@ from PIL import Image
 from .cli import (DEFAULT_LIBRARY, ROOT, TEST_SEED, TEST_STYLE, TRAIN_STYLE, VALIDATION_SEED,
                   VALIDATION_STYLE, build_policy, load_checkpoint, sha256, validate_checkpoint)
 from .curriculum import UNIFORM_WEIGHTS
-from .features import FrozenFeatures, crop_goals, precision_of, square_goal_box
+from .features import FrozenFeatures, RefreshedGoals, crop_goals, precision_of, square_goal_box
 from .model import deterministic_action, saliency_targets
 from .native import DEFAULT_CITY, PRIVILEGED_WIDTH, CudaEnv
 
@@ -140,6 +140,8 @@ def capture(args, saved, features, seed, style, no_gps_fraction, appearance, gro
                 grounded_goals, has_box, grounded_images, retargets = ground_goals(env, features, grounded)
                 goal_images = torch.where(has_box[:, None, None, None], grounded_images, goal_images)
             start_landed = env.diagnostics[:, START_LANDED_INDEX].clone()
+            refresh_steps = metadata.get("goal_refresh_steps", 0) if grounded is None else 0
+            goal_source = RefreshedGoals(env, features, goals, refresh_steps) if features.visual else None
             gps_available = env.diagnostics[:, GPS_AVAILABLE_INDEX].clone()
             index = torch.tensor(STATE_INDEX, device=device)
             outcome_width = len(OUTCOME_FIELDS)
@@ -163,7 +165,7 @@ def capture(args, saved, features, seed, style, no_gps_fraction, appearance, gro
                 if features.visual:
                     cls, patch_tokens = features.observe(env)
                     tokens[t].copy_(patch_tokens)
-                    goal = goals[env.catalog_index.long()].float()
+                    goal = goal_source.step(starts)
                     if grounded is not None:
                         goal = torch.where(has_box[:, None], grounded_goals, goal)
                 else:
@@ -195,6 +197,8 @@ def capture(args, saved, features, seed, style, no_gps_fraction, appearance, gro
                     "saliency": None if saliency is None else saliency.float().cpu().numpy(),
                     "grid": (patch_h, patch_w),
                     "native": {"control_hz": env.control_hz, "control_mode": env.control_mode,
+                               "goal_refresh_steps": refresh_steps,
+                               "goal_box_source": "simulator" if refresh_steps else None,
                                "action_names": list(env.action_names), "city_path": str(env.city_path),
                                "target_classes": list(env.target_classes), "layout_classes": list(env.layout_classes),
                                "city_fingerprint": env.metadata["city_fingerprint"]}}
@@ -343,6 +347,8 @@ def record(args):
         "control_mode": recording["native"]["control_mode"], "action_names": action_names,
         "no_gps_fraction": args.no_gps_fraction,
         "appearance": args.appearance,
+        "goal_refresh_steps": recording["native"]["goal_refresh_steps"],
+        "goal_box_source": recording["native"]["goal_box_source"],
         "frame_width": width, "frame_height": height, "video_width": width * 2, "video_height": height,
         "views": {"first_person": [0, 0, width, height], "third_person": [width, 0, width, height]},
         "encoder_map": None if recording["maps"] is None else {
