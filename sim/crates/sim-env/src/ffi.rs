@@ -44,6 +44,18 @@ pub unsafe extern "C" fn sim_env_create(n: u32, seed: u64, width: u32, height: u
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn sim_env_create_with_start_distance(n: u32, seed: u64, width: u32, height: u32,
+    style: u32, control_mode: u32, city_path: *const c_char, min_distance: f32, max_distance: f32) -> *mut c_void {
+    boundary(std::ptr::null_mut(), || {
+        ensure!(!city_path.is_null(), "city_path must not be null");
+        let path = unsafe { CStr::from_ptr(city_path) }.to_str()?;
+        ensure!(!path.is_empty(), "city_path must not be empty");
+        Ok(Box::into_raw(Box::new(Env::new_with_start_distance(n, seed, width, height, style,
+            control_mode, Path::new(path), [min_distance, max_distance])?)).cast())
+    })
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn sim_env_reset(handle: *mut c_void, seed: u64) -> i32 {
     boundary(-1, || {
         unsafe { environment(handle)? }.reset(seed)?;
@@ -79,6 +91,14 @@ pub unsafe extern "C" fn sim_env_retarget(handle: *mut c_void, targets: *const f
 pub unsafe extern "C" fn sim_env_set_free_flight(handle: *mut c_void, enabled: u32) -> i32 {
     boundary(-1, || {
         unsafe { environment(handle)? }.set_free_flight(enabled != 0);
+        Ok(0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sim_env_set_exploration(handle: *mut c_void, enabled: u32) -> i32 {
+    boundary(-1, || {
+        unsafe { environment(handle)? }.set_exploration(enabled != 0);
         Ok(0)
     })
 }

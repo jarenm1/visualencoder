@@ -11,7 +11,7 @@ pub const DIAGNOSTIC_DIM: usize = 28;
 pub const CATALOG_SIZE: usize = 65536;
 /// Floats per camera slot: view (16), view-projection (16), eye (4).
 pub const CAMERA_FLOATS: usize = 36;
-pub const FIELD_COUNT: usize = 16;
+pub const FIELD_COUNT: usize = 17;
 /// Curriculum lanes: bucket weights (3), no-GPS probability, appearance strength.
 pub const CURRICULUM_LANES: usize = 5;
 

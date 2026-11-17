@@ -91,7 +91,9 @@ def training_settings(args):
     return {"curriculum": args.curriculum, "no_gps_fraction": args.no_gps_fraction,
             "aux_coefficient": args.aux_coefficient, "appearance": args.appearance,
             "goal_refresh_steps": args.goal_refresh_steps,
-            "goal_box_source": "simulator" if args.goal_refresh_steps else None}
+            "goal_box_source": "simulator" if args.goal_refresh_steps else None,
+            "reward_augmentation": ("observed-surface-tiles/v1: 128x128 city grid, 8x6 depth samples, "
+                                    "+0.05/new tile after seed, cap +2/episode") if args.exploration else None}
 
 
 def checkpoint(policy, metadata, steps):
@@ -127,7 +129,7 @@ def make_config(args):
                   value_coefficient=args.value_coefficient, max_grad_norm=args.max_grad_norm,
                   curriculum=args.curriculum, aux_coefficient=args.aux_coefficient,
                   no_gps_fraction=args.no_gps_fraction, appearance=args.appearance,
-                  goal_refresh_steps=args.goal_refresh_steps)
+                  goal_refresh_steps=args.goal_refresh_steps, exploration=args.exploration)
 
 
 def open_env(args, n, seed, style):
@@ -286,6 +288,7 @@ def train_command(args, started):
         "steps": trainer.steps, "no_gps_fraction": args.no_gps_fraction, "aux_coefficient": args.aux_coefficient,
         "goal_refresh_steps": config.goal_refresh_steps,
         "goal_box_source": metadata["goal_box_source"],
+        "reward_augmentation": metadata["reward_augmentation"],
         "fixed_goal_test_success": ({label: fixed_goal_test[label]["policy"]["success"]
                                      for label in ("gps", "no_gps")} if fixed_goal_test else None),
         "best_validation_selection_success": best_success,
@@ -347,6 +350,11 @@ def eval_command(args, started):
     payload = {"checkpoint": str(args.checkpoint), "checkpoint_sha256": sha256(args.checkpoint),
                "split": args.split, "control_mode": metadata["control_mode"], **results}
     emit(payload, args.out)
+
+
+def cohorts_command(args, started):
+    from .cohorts import run
+    run(args)
 
 
 def probe_command(args, started):
@@ -484,6 +492,8 @@ def add_learner(parser):
     parser.add_argument("--goal-refresh-steps", type=int, default=DEFAULTS.goal_refresh_steps,
                         help="refresh the goal from a visible simulator target box every N control steps "
                              "(0 = fixed reference); no scripted actions")
+    parser.add_argument("--exploration", action="store_true",
+                        help="one bounded observed-area novelty bonus (+0.05/new tile, max +2/episode)")
     parser.add_argument("--total-steps", type=int, default=DEFAULTS.total_steps)
     parser.add_argument("--rollout-steps", type=int, default=DEFAULTS.rollout_steps)
     parser.add_argument("--sequence-length", type=int, default=DEFAULTS.sequence_length)
@@ -521,6 +531,15 @@ def parser():
     evaluation.add_argument("--eval-envs", type=int, default=384)
     evaluation.add_argument("--out", type=Path)
     evaluation.set_defaults(func=eval_command)
+
+    cohorts = commands.add_parser("eval-cohorts", help="paired fixed-goal hidden and far-target evaluations")
+    add_native(cohorts)
+    cohorts.add_argument("--checkpoint", type=Path, action="append", required=True)
+    cohorts.add_argument("--eval-envs", type=int, default=256)
+    cohorts.add_argument("--goal-refresh-steps", type=int, default=0,
+                         help="0 measures deployable fixed goals; nonzero uses oracle simulator boxes")
+    cohorts.add_argument("--out", type=Path, required=True)
+    cohorts.set_defaults(func=cohorts_command)
 
     probe = commands.add_parser("probe", help="offline goal-localization probe on frozen encoder features")
     add_native(probe)

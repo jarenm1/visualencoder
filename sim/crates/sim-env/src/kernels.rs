@@ -28,6 +28,8 @@ pub(crate) struct Config {
     /// of bounds, success is reported once without ending the episode, and there is no timeout.
     pub free_flight: u32,
     pub city_half_extent: f32,
+    /// Optional bounded training reward; coverage itself is measured in both modes.
+    pub exploration_enabled: u32,
     pub tan_half_vfov: f32,
     /// Fixed 4:3 visibility/projection aspect.
     pub aspect: f32,
@@ -75,6 +77,9 @@ pub(crate) struct EnvState {
     pub event: u32,
     /// Per-episode GPS availability, sampled at reset (0 or 1).
     pub gps_available: u32,
+    pub exploration_seeded: u32,
+    pub exploration_unique: u32,
+    pub exploration_paid: u32,
 }
 
 #[repr(C)]
@@ -106,6 +111,10 @@ pub(crate) struct Buffers {
     pub crops: *mut f32,
     /// Appearance key per camera slot: the catalog index whose appearance it renders.
     pub keys: *mut u32,
+    /// Per-env 128x128 observed surface-tile ledger, 512 words; never policy input.
+    pub exploration_seen: *mut u32,
+    /// [current unique tiles, cumulative bonus, last bonus, terminal unique tiles].
+    pub exploration: *mut f32,
 }
 
 /// Arguments of the per-pixel appearance kernel.
@@ -440,6 +449,9 @@ pub(crate) mod device {
             hold: 0,
             event: 0,
             gps_available: gps_available as u32,
+            exploration_seeded: 0,
+            exploration_unique: 0,
+            exploration_paid: 0,
         };
         let body = BodyState {
             position: pack(position),
@@ -448,6 +460,11 @@ pub(crate) mod device {
             angular_velocity: pack(rates),
         };
         unsafe {
+            let mut word = 0usize;
+            while word < 512 {
+                *buffers.exploration_seen.add(i * 512 + word) = 0;
+                word += 1;
+            }
             *buffers.bodies.add(i) = body;
             *buffers.states.add(i) = state;
         }
@@ -877,6 +894,7 @@ pub(crate) mod device {
         }
 
         unsafe {
+            *buffers.exploration.add(i * 4 + 3) = if done { st.exploration_unique as f32 } else { -1.0 };
             *buffers.rewards.add(i) = reward;
             *buffers.done.add(i) = if done { 1.0 } else { 0.0 };
             *buffers.success.add(i) = if success { 1.0 } else { 0.0 };
@@ -1022,9 +1040,82 @@ pub(crate) mod device {
         st.hold = 0;
         // A new target is a new task from here: the episode clock restarts.
         st.step = 0;
+        st.exploration_seeded = 0;
+        st.exploration_unique = 0;
+        st.exploration_paid = 0;
+        let mut word = 0usize;
+        while word < 512 {
+            unsafe { *buffers.exploration_seen.add(i * 512 + word) = 0; }
+            word += 1;
+        }
+        unsafe { *buffers.exploration.add(i * 4 + 3) = -1.0; }
         unsafe {
             *buffers.states.add(i) = st;
             observe_env(buffers, config, i);
+        }
+    }
+
+    /// Read actual observation depth only after its render. One thread owns a whole ledger,
+    /// so revisits need neither atomics nor an approximate hash. Initial/reset views seed
+    /// without payment; reference-image renders never call this kernel.
+    #[kernel]
+    pub unsafe fn coverage(buffers: Buffers, config: Config, args: ImageArgs) {
+        let i = thread::index_1d().get();
+        if i >= config.n as usize { return; }
+        let mut st = unsafe { *buffers.states.add(i) };
+        let body = unsafe { *buffers.bodies.add(i) };
+        let (off, forward, up) = camera_basis(body.rotation);
+        let eye = add(xyz(body.position), off);
+        let right = cross(forward, up);
+        let plane = args.width as usize * args.height as usize;
+        let mut newly_seen = 0u32;
+        let mut sample = 0usize;
+        while sample < 48 {
+            let x = ((sample % 8) * 2 + 1) * args.width as usize / 16;
+            let y = ((sample / 8) * 2 + 1) * args.height as usize / 12;
+            let pixel = i * plane + y * args.width as usize + x;
+            let id = unsafe { *args.rendered.add(2 * args.pixels as usize + pixel) };
+            let depth = f32::from_bits(unsafe { *args.rendered.add(args.pixels as usize + pixel) });
+            if id != 0 && depth > 0.0 && depth <= CAMERA_FAR {
+                let nx = (2.0 * (x as f32 + 0.5) / args.width as f32 - 1.0)
+                    * config.tan_half_vfov * config.aspect;
+                let ny = (1.0 - 2.0 * (y as f32 + 0.5) / args.height as f32) * config.tan_half_vfov;
+                let ray = normalize(add(forward, add(scale(right, nx), scale(up, ny))));
+                let hit = add(eye, scale(ray, depth));
+                let h = config.city_half_extent;
+                if hit[0] >= -h && hit[0] < h && hit[2] >= -h && hit[2] < h {
+                    let tx = ((hit[0] + h) * (128.0 / (2.0 * h))) as u32;
+                    let tz = ((hit[2] + h) * (128.0 / (2.0 * h))) as u32;
+                    if tx < 128 && tz < 128 {
+                        let tile = tz * 128 + tx;
+                        let address = unsafe { buffers.exploration_seen.add(i * 512 + (tile / 32) as usize) };
+                        let old = unsafe { *address };
+                        let bit = 1u32 << (tile % 32);
+                        if old & bit == 0 {
+                            unsafe { *address = old | bit; }
+                            newly_seen += 1;
+                        }
+                    }
+                }
+            }
+            sample += 1;
+        }
+        st.exploration_unique += newly_seen;
+        let terminal = unsafe { *buffers.done.add(i) > 0.5 || *buffers.success.add(i) > 0.5 };
+        let mut paid = 0u32;
+        if st.exploration_seeded != 0 && config.exploration_enabled != 0 && !terminal {
+            let remaining = 40 - st.exploration_paid;
+            paid = if newly_seen < remaining { newly_seen } else { remaining };
+        }
+        st.exploration_seeded = 1;
+        st.exploration_paid += paid;
+        let bonus = paid as f32 * 0.05;
+        unsafe {
+            *buffers.exploration.add(i * 4) = st.exploration_unique as f32;
+            *buffers.exploration.add(i * 4 + 1) = st.exploration_paid as f32 * 0.05;
+            *buffers.exploration.add(i * 4 + 2) = bonus;
+            *buffers.rewards.add(i) += bonus;
+            *buffers.states.add(i) = st;
         }
     }
 
@@ -1043,6 +1134,10 @@ pub(crate) mod device {
             *buffers.oob.add(i) = 0.0;
             *buffers.bucket.add(i) = -1.0;
             *buffers.gps_available.add(i) = -1.0;
+            *buffers.exploration.add(i * 4) = 0.0;
+            *buffers.exploration.add(i * 4 + 1) = 0.0;
+            *buffers.exploration.add(i * 4 + 2) = 0.0;
+            *buffers.exploration.add(i * 4 + 3) = -1.0;
             observe_env(buffers, config, i);
         }
     }

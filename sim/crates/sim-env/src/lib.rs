@@ -36,6 +36,7 @@ struct TaskKernels {
     goal_view: Function,
     appearance: Function,
     retarget: Function,
+    coverage: Function,
 }
 
 impl TaskKernels {
@@ -50,6 +51,7 @@ impl TaskKernels {
             goal_view: module.load_function(kernels::device::goal_view_CUDA_SIGNATURE.entry)?,
             appearance: module.load_function(kernels::device::appearance_CUDA_SIGNATURE.entry)?,
             retarget: module.load_function(kernels::device::retarget_CUDA_SIGNATURE.entry)?,
+            coverage: module.load_function(kernels::device::coverage_CUDA_SIGNATURE.entry)?,
         })
     }
 
@@ -75,6 +77,20 @@ impl TaskKernels {
         unsafe { launch_kernel_on_stream(&self.appearance, (blocks, 1, 1), (256, 1, 1), 0, stream, &mut pointers)? };
         Ok(())
     }
+
+    unsafe fn launch_coverage(&self, stream: &CudaStream, mut buffers: Buffers,
+        mut config: Config, mut image: ImageArgs) -> Result<()> {
+        let mut args = [
+            (&raw mut buffers).cast::<c_void>(),
+            (&raw mut config).cast::<c_void>(),
+            (&raw mut image).cast::<c_void>(),
+        ];
+        unsafe {
+            launch_kernel_on_stream(&self.coverage, (config.n.div_ceil(256), 1, 1),
+                (256, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
 }
 
 /// Owns all device allocations for one batch. Calls must be serialized by the
@@ -96,6 +112,7 @@ pub struct Env {
     exclusions: DeviceBuffer<u8>,
     materials: DeviceBuffer<u8>,
     keys: DeviceBuffer<u8>,
+    exploration_seen: DeviceBuffer<u8>,
     outputs: [DeviceBuffer<u8>; FIELD_COUNT],
     config: Config,
     width: u32,
@@ -109,6 +126,11 @@ pub struct Env {
 impl Env {
     pub fn new(n: u32, seed: u64, width: u32, height: u32, style: u32, control_mode: u32,
         city_path: &Path) -> Result<Self> {
+        Self::new_with_start_distance(n, seed, width, height, style, control_mode, city_path, [8.0, 30.0])
+    }
+
+    pub fn new_with_start_distance(n: u32, seed: u64, width: u32, height: u32, style: u32,
+        control_mode: u32, city_path: &Path, start_distance: [f32; 2]) -> Result<Self> {
         ensure!(n > 0, "environment count must be positive");
         ensure!(style <= 2, "style must be 0 (training), 1 (validation), or 2 (final test)");
         ensure!(control_mode == CONTROL_VELOCITY || control_mode == CONTROL_RATES,
@@ -123,7 +145,7 @@ impl Env {
         ensure!(city.nodes.len() <= u32::MAX as usize && city.triangles.len() <= u32::MAX as usize,
             "city collision index counts exceed u32");
 
-        let catalog = drone::build_catalog(&city, style, CATALOG_SIZE, seed)?;
+        let catalog = drone::build_catalog_with_start_distance(&city, style, CATALOG_SIZE, seed, start_distance)?;
         ensure!(catalog.episodes.len() == CATALOG_SIZE, "catalog size mismatch");
         let district = drone::district(style, city.half_extent);
 
@@ -179,6 +201,7 @@ impl Env {
         let rgb_bytes = count * 3 * height as usize * width as usize * 4;
         let states = allocate(count * size_of::<EnvState>())?;
         let keys = allocate(count * 4)?;
+        let exploration_seen = allocate(count * 512 * 4)?;
         let outputs: [DeviceBuffer<u8>; FIELD_COUNT] = [
             allocate(rgb_bytes)?,
             allocate(count * SENSOR_DIM * 4)?,
@@ -195,6 +218,7 @@ impl Env {
             allocate(count * 4)?,
             allocate(count * 4)?,
             allocate(count * 4)?,
+            allocate(count * 4 * 4)?,
             allocate(count * 4 * 4)?,
         ];
 
@@ -215,6 +239,7 @@ impl Env {
             landable_height: city.landable.height,
             free_flight: 0,
             city_half_extent: city.half_extent,
+            exploration_enabled: 0,
             tan_half_vfov: (dynamics::CAMERA_VFOV_RAD * 0.5).tan(),
             aspect: CAMERA_ASPECT,
             projection_x: projection[0],
@@ -238,6 +263,7 @@ impl Env {
             exclusions,
             materials,
             keys,
+            exploration_seen,
             outputs,
             config,
             width,
@@ -277,6 +303,8 @@ impl Env {
             gps_available: self.outputs[14].cu_deviceptr() as *mut f32,
             crops: self.outputs[15].cu_deviceptr() as *mut f32,
             keys: self.keys.cu_deviceptr() as *mut u32,
+            exploration_seen: self.exploration_seen.cu_deviceptr() as *mut u32,
+            exploration: self.outputs[16].cu_deviceptr() as *mut f32,
         }
     }
 
@@ -297,7 +325,7 @@ impl Env {
         self.cycle("city reset ownership", |kernels, stream, buffers, config| unsafe {
             kernels.launch(&kernels.reset, stream, buffers, config, None)
         })?;
-        self.render_into(0)
+        self.render_into(0, true)
     }
 
     /// Steps all environments with `actions` (n * 4 float32 on stream()).
@@ -314,7 +342,7 @@ impl Env {
             kernels.launch(&kernels.finish, stream, buffers, config, None)?;
             kernels.launch(&kernels.observe, stream, buffers, config, None)
         })?;
-        self.render_into(0)
+        self.render_into(0, true)
     }
 
     /// Renders the goal reference views of catalog entries `first .. first + n` (clamped to the
@@ -326,11 +354,11 @@ impl Env {
         self.cycle("city goal views", |kernels, stream, buffers, config| unsafe {
             kernels.launch(&kernels.goal_view, stream, buffers, config, Some((&raw mut first).cast()))
         })?;
-        self.render_into(10)?;
+        self.render_into(10, false)?;
         self.cycle("city observation restore", |kernels, stream, buffers, config| unsafe {
             kernels.launch(&kernels.observe, stream, buffers, config, None)
         })?;
-        self.render_into(0)
+        self.render_into(0, false)
     }
 
     /// Replaces current-episode targets: `targets` is a device pointer to n x 8 float32 rows
@@ -345,7 +373,7 @@ impl Env {
         self.cycle("city retarget", |kernels, stream, buffers, config| unsafe {
             kernels.launch(&kernels.retarget, stream, buffers, config, Some((&raw mut targets).cast()))
         })?;
-        self.render_into(0)
+        self.render_into(0, true)
     }
 
     /// Free flight for interactive use (never training): only the city edge and a 100 m ceiling are
@@ -354,9 +382,15 @@ impl Env {
         self.config.free_flight = enabled as u32;
     }
 
+    /// Optional training-only reward augmentation. Base task observations/actions stay unchanged.
+    /// Checkpoints record this flag separately from the base task contract.
+    pub fn set_exploration(&mut self, enabled: bool) {
+        self.config.exploration_enabled = enabled as u32;
+    }
+
     /// Renders every camera slot, then applies the randomized appearance into `field`
     /// (0: observation, 10: goal views).
-    fn render_into(&mut self, field: usize) -> Result<()> {
+    fn render_into(&mut self, field: usize, track_coverage: bool) -> Result<()> {
         let mut encoder = self.gpu.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("city rendered observation"),
         });
@@ -374,8 +408,16 @@ impl Env {
             mesh_count: self.mesh_count,
             frame: self.frame,
         };
+        let buffers = self.buffers();
+        let config = self.config;
         unsafe {
-            self.exchange.cycle(encoder, || self.kernels.launch_appearance(self.gpu.cuda_stream(), args))?;
+            self.exchange.cycle(encoder, || {
+                self.kernels.launch_appearance(self.gpu.cuda_stream(), args)?;
+                if track_coverage {
+                    self.kernels.launch_coverage(self.gpu.cuda_stream(), buffers, config, args)?;
+                }
+                Ok(())
+            })?;
         }
         Ok(())
     }
@@ -535,6 +577,9 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, district: &drone::D
             {"index": 13, "name": "oob", "dtype": "float32", "shape": ["n"]},
             {"index": 14, "name": "gps_available", "dtype": "float32", "shape": ["n"]},
             {"index": 15, "name": "goal_crops", "dtype": "float32", "shape": ["n", 4]},
+            {"index": 16, "name": "exploration", "dtype": "float32", "shape": ["n", 4],
+             "layout": ["current unique observed tiles", "current cumulative novelty reward",
+                        "last-step novelty reward", "ended episode unique observed tiles"]},
         ],
     });
     // Flat keys consumed by learner/replay checks (inserted after the macro to

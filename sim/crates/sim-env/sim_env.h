@@ -52,7 +52,10 @@ enum sim_env_field {
     SIM_ENV_FIELD_GPS_AVAILABLE = 14,
     /* float32 [n, 4]: normalized goal crops [x0, y0, x1, y1] written by sim_env_render_goals(). */
     SIM_ENV_FIELD_GOAL_CROPS = 15,
-    SIM_ENV_FIELD_COUNT = 16
+    /* float32 [n, 4]: unique observed tiles, cumulative novelty bonus,
+     * last-step novelty bonus, ended-episode unique observed tiles. Not actor input. */
+    SIM_ENV_FIELD_EXPLORATION = 16,
+    SIM_ENV_FIELD_COUNT = 17
 };
 
 /* Creates an environment batch of n drones.
@@ -62,6 +65,12 @@ enum sim_env_field {
  * Returns NULL on failure. */
 void *sim_env_create(uint32_t n, uint64_t seed, uint32_t width, uint32_t height,
                      uint32_t style, uint32_t control_mode, const char *city_path);
+
+/* Same task with a different catalog start-box-distance range (metres), for far-target cohorts.
+ * min_distance > 6, max_distance > min_distance, both finite. */
+void *sim_env_create_with_start_distance(uint32_t n, uint64_t seed, uint32_t width, uint32_t height,
+                     uint32_t style, uint32_t control_mode, const char *city_path,
+                     float min_distance, float max_distance);
 
 /* Null-terminated UTF-8 JSON describing layouts, dynamics and sign conventions.
  * Owned by the environment; valid until sim_env_destroy(). */
@@ -91,6 +100,11 @@ int sim_env_retarget(void *env, const float *targets);
  * edge and a 100 m ceiling, reports success once without ending the episode, and disables the
  * timeout. Takes effect on the next step. */
 int sim_env_set_free_flight(void *env, uint32_t enabled);
+
+/* Training-only optional novelty reward: +0.05 per new observed world tile after the initial
+ * view, at most +2 per episode. Disabled by default; coverage metrics are measured regardless.
+ * Existing base task metadata is unchanged; callers must record augmentation in run provenance. */
+int sim_env_set_exploration(void *env, uint32_t enabled);
 
 /* Device pointer to field storage (see enum), or 0 on error. */
 uint64_t sim_env_buffer(void *env, int32_t field);

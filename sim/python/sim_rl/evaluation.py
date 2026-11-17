@@ -51,7 +51,7 @@ def gps_pursuit(proprio, action_scales):
 
 @torch.no_grad()
 def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, appearance=1.0,
-             goal_refresh_steps=0):
+             goal_refresh_steps=0, bucket_weights=UNIFORM_WEIGHTS):
     """Deterministic policy (tanh of the mean) or blind heuristic over one reset of the native finite horizon.
 
     Curriculum is uniform over visibility buckets with p_no_gps = ``no_gps`` and the given
@@ -65,13 +65,20 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
     if policy is not None and policy.mode != ("visual" if features.visual else features.spec):
         raise ValueError("policy mode differs from the frozen feature arm")
     n, device = env.n, env.device
-    lanes = torch.tensor(UNIFORM_WEIGHTS + (no_gps, appearance), device=device, dtype=torch.float32)
+    if len(bucket_weights) != 3 or min(bucket_weights) < 0 or sum(bucket_weights) <= 0:
+        raise ValueError("bucket_weights must contain three nonnegative weights with positive sum")
+    env.set_exploration(False)  # Compare task success/base return, never intrinsic reward.
+    lanes = torch.tensor(tuple(bucket_weights) + (no_gps, appearance), device=device, dtype=torch.float32)
     env.write_curriculum(lanes)
     goals = features.catalog_goals(env, appearance) if policy is not None and features.visual else None
     env.reset(seed)
     goal_source = RefreshedGoals(env, features, goals, goal_refresh_steps) if goals is not None else None
     start_landed = env.diagnostics[:, 19].clamp(0, 1).clone()
     start_class = env.diagnostics[:, 14].clone()
+    initial_coverage = env.exploration[:, 0].clone()
+    initial_distance = env.diagnostics[:, 20].clone()
+    observed_tiles = torch.zeros(n, device=device)
+    stationary_away = torch.zeros(n, device=device)
     active = torch.ones(n, device=device)
     completed = torch.zeros(n, device=device)
     success = torch.zeros(n, device=device)
@@ -89,6 +96,8 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
         policy.eval()
     with gpu_range("sim.evaluate"):
         for _ in range(env.horizon):
+            speed = env.diagnostics[:, 10:13].square().sum(-1).sqrt()
+            stationary_away.add_(active * ((speed < 0.2) & (env.privileged[:, 3] * 32 > 6)).float())
             if policy is not None:
                 cls, tokens = features.observe(env) if features.visual else (None, None)
                 goal = goal_source.step(starts) if goal_source is not None else None
@@ -110,6 +119,7 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
             collision.add_(finished * env.collision * (1 - env.success))
             out_of_bounds.add_(finished * env.out_of_bounds * (1 - env.success) * (1 - env.collision))
             bucket.add_(finished * env.ended_bucket)
+            observed_tiles.add_(finished * env.exploration[:, 3])
             active.mul_(1 - env.done)
             starts.copy_(env.done)
     timeout = completed - success - collision - out_of_bounds
@@ -135,6 +145,13 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
     result["appearance"] = appearance
     result["goal_refresh_steps"] = goal_refresh_steps if goals is not None else 0
     result["goal_box_source"] = "simulator" if goals is not None and goal_refresh_steps else None
+    result["bucket_weights"] = list(bucket_weights)
+    result["start_box_distance_m"] = {"min": float(initial_distance.min()), "max": float(initial_distance.max()),
+                                    "mean": float(initial_distance.mean())}
+    result["mean_observed_tiles"] = float(observed_tiles.mean())
+    result["mean_new_observed_tiles"] = float((observed_tiles - initial_coverage).mean())
+    result["stationary_away_fraction"] = float(stationary_away.sum() / steps.sum().clamp_min(1))
+    result["novelty_reward_enabled"] = False
     result["classes"] = {name: {"episodes": round(count), "success": hits / count if count else None}
                          for name, count, hits in zip(env.target_classes, *class_table.cpu().tolist())}
     return result

@@ -166,6 +166,7 @@ struct Ctx<'a> {
     district: District,
     seed: u64,
     style: u32,
+    start_distance: [f32; 2],
 }
 
 /// A roll-free or body camera: eye and orthonormal forward/up/right.
@@ -189,11 +190,20 @@ impl View {
 /// Builds the seeded catalogue of `size` candidates for one split. Errors if any bucket
 /// holds fewer than 512 episodes or a candidate cannot be placed.
 pub fn build_catalog(scene: &CityScene, style: u32, size: usize, seed: u64) -> Result<Catalog> {
+    build_catalog_with_start_distance(scene, style, size, seed, START_BOX_DISTANCE)
+}
+
+/// Same seeded task with a configurable start-distance cohort; reference views are unchanged.
+pub fn build_catalog_with_start_distance(scene: &CityScene, style: u32, size: usize, seed: u64,
+    start_distance: [f32; 2]) -> Result<Catalog> {
+    ensure!(start_distance[0].is_finite() && start_distance[1].is_finite()
+        && start_distance[0] > drone::STANDOFF_MAX && start_distance[1] > start_distance[0],
+        "start distance must be finite, increasing, and outside the standoff band");
     ensure!(style < 3, "style must be 0, 1 or 2, got {style}");
     ensure!(size >= MIN_CANDIDATES, "catalog needs at least {MIN_CANDIDATES} candidates, got {size}");
     let district = district(style, scene.half_extent);
     let pools = target_pools(scene, &district)?;
-    let ctx = Ctx { scene, pools, district, seed, style };
+    let ctx = Ctx { scene, pools, district, seed, style, start_distance };
     let candidates = generate(&ctx, size)?;
     let (episodes, bucket_ranges, counts) = finalize(candidates, MIN_BUCKET)?;
     let rules = rules(scene, &ctx, size, counts, &episodes);
@@ -246,10 +256,10 @@ fn attempt(ctx: &Ctx, object: u32, rng: &mut Rng) -> Option<Candidate> {
     let landed = rng.unit() < 0.5;
     let start_y = if landed { plane + drone::RADIUS } else { plane + rng.range(FLYING_HEIGHT[0], FLYING_HEIGHT[1]) };
     let bearing = rng.range(0.0, core::f32::consts::TAU);
-    let reach = rng.range(radius + START_BOX_DISTANCE[0], radius + START_BOX_DISTANCE[1]);
+    let reach = rng.range(radius + ctx.start_distance[0], radius + ctx.start_distance[1]);
     let start = Vec3::new(center.x + reach * bearing.cos(), start_y, center.z + reach * bearing.sin());
     let distance = box_distance(start.to_array(), center.to_array(), half.to_array());
-    if !(START_BOX_DISTANCE[0]..=START_BOX_DISTANCE[1]).contains(&distance)
+    if !(ctx.start_distance[0]..=ctx.start_distance[1]).contains(&distance)
         || !ctx.district.contains([start.x, start.z], DISTRICT_MARGIN) {
         return None;
     }
@@ -483,7 +493,7 @@ fn rules(scene: &CityScene, ctx: &Ctx, size: usize, counts: [usize; BUCKETS], ep
             "tilt_max_rad": START_TILT_RAD,
             "speed_max_mps": START_SPEED,
             "rate_max_rps": START_RATE,
-            "box_distance_m": START_BOX_DISTANCE,
+            "box_distance_m": ctx.start_distance,
             "flying_thrust": "hover",
         },
         "target": {

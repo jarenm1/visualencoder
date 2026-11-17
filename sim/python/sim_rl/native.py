@@ -20,8 +20,8 @@ CONTROL_MODES = {"velocity": 0, "rates": 1}
 HOVER_ACTIONS = {"velocity": (0.0, 0.0, 0.0, 0.0), "rates": (-0.2, 0.0, 0.0, 0.0)}
 # Fields: 0 obs, 1 proprio, 2 reward, 3 done, 4 success, 5 privileged, 6 collision,
 # 7 episodes, 8 diagnostics, 9 catalog index, 10 goal views, 11 curriculum (writable),
-# 12 ended bucket, 13 out_of_bounds, 14 ended gps_available, 15 goal crops.
-FIELD_COUNT = 16
+# 12 ended bucket, 13 out_of_bounds, 14 ended gps_available, 15 goal crops, 16 exploration metrics.
+FIELD_COUNT = 17
 DIAGNOSTICS_WIDTH = 28
 CURRICULUM_WIDTH = 5  # w_visible, w_partial, w_hidden, p_no_gps, appearance strength
 PROPRIO_WIDTH = 19
@@ -48,7 +48,8 @@ class CudaEnv:
     used after close; the environment retains their owners until its final wait.
     Vulkan shared buffers are internal: every exposed pointer is CUDA-only.
     """
-    def __init__(self, library, n, seed, width, height, style, control_mode, city_path=DEFAULT_CITY):
+    def __init__(self, library, n, seed, width, height, style, control_mode, city_path=DEFAULT_CITY,
+                 start_distance=None):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required; no CPU environment fallback")
         if n < 1 or width < 48 or height < 32 or width % 16 or height % 16:
@@ -74,6 +75,9 @@ class CudaEnv:
             "sim_env_render_goals": ([ct.c_void_p, ct.c_uint32], ct.c_int32),
             "sim_env_retarget": ([ct.c_void_p, ct.c_void_p], ct.c_int32),
             "sim_env_set_free_flight": ([ct.c_void_p, ct.c_uint32], ct.c_int32),
+            "sim_env_set_exploration": ([ct.c_void_p, ct.c_uint32], ct.c_int32),
+            "sim_env_create_with_start_distance": ([ct.c_uint32, ct.c_uint64, ct.c_uint32, ct.c_uint32,
+                ct.c_uint32, ct.c_uint32, ct.c_char_p, ct.c_float, ct.c_float], ct.c_void_p),
             "sim_env_destroy": ([ct.c_void_p], None),
             "sim_env_error": ([], ct.c_char_p),
         }
@@ -83,8 +87,11 @@ class CudaEnv:
             except AttributeError as error:
                 raise RuntimeError(f"city navigation requires sim_env ABI v5 symbol {name}") from error
             function.argtypes, function.restype = args, result
-        self.handle = self.lib.sim_env_create(n, seed, width, height, style, CONTROL_MODES[control_mode],
-                                              os.fsencode(self.city_path))
+        create_args = (n, seed, width, height, style, CONTROL_MODES[control_mode], os.fsencode(self.city_path))
+        if start_distance is None:
+            self.handle = self.lib.sim_env_create(*create_args)
+        else:
+            self.handle = self.lib.sim_env_create_with_start_distance(*create_args, *start_distance)
         if not self.handle:
             raise RuntimeError(self.error())
         self._owners, self.tensors = [], []
@@ -143,6 +150,7 @@ class CudaEnv:
                 ((n,), "<f4"),                         # 13 out_of_bounds
                 ((n,), "<f4"),                         # 14 ended gps_available
                 ((n, 4), "<f4"),                       # 15 goal crops
+                ((n, 4), "<f4"),                       # 16 exploration metrics, never actor input
             ]
             with self.execution():
                 for field, (shape, typestr) in enumerate(specifications):
@@ -158,7 +166,8 @@ class CudaEnv:
                     self.tensors.append(view)
             (self.obs, self.proprio, self.reward, self.done, self.success, self.privileged,
              self.collision, self.episode_counts, self.diagnostics, self.catalog_index, self.goal_views,
-             self.curriculum, self.ended_bucket, self.out_of_bounds, self.ended_gps, self.goal_crops) = self.tensors
+             self.curriculum, self.ended_bucket, self.out_of_bounds, self.ended_gps, self.goal_crops,
+             self.exploration) = self.tensors
         except BaseException:
             self.close()
             raise
@@ -213,6 +222,12 @@ class CudaEnv:
         """Interactive free flight (never training): only the city edge and a 100 m ceiling end a
         flight, success is reported once without ending the episode, and there is no timeout."""
         if self.lib.sim_env_set_free_flight(self.handle, int(bool(enabled))) != 0:
+            raise RuntimeError(self.error())
+
+    def set_exploration(self, enabled):
+        """Toggle the bounded training reward, without changing policy inputs or base task rules."""
+        self._check_stream()
+        if self.lib.sim_env_set_exploration(self.handle, int(bool(enabled))) != 0:
             raise RuntimeError(self.error())
 
     def write_curriculum(self, lanes):
