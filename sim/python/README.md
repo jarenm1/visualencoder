@@ -116,6 +116,22 @@ Measured on ABI v4 (designed 1.5–2.5 m shapes, held-out designs; `runs/drone-p
 | `baseline` (standard distilled) | 0.894 | 0.629 | 0.861 | 7.6 px |
 | `mean` (paired consistency) | 0.897 | 0.620 | 0.856 | 7.7 px |
 
+## ABI v5 results (city-object targets)
+
+Camera + `mean` encoder (bf16), velocity control, seed 0, 128 envs, 2.54M steps in the 3300 s budget (49.5 min incl. startup, validation and test; `runs/drone5-mean-seed0`). Held-out test district, 256 episodes per GPS mode, uniform visibility buckets, appearance randomization on; Wilson 95% intervals.
+
+| Actor | GPS success | Visible / partial / hidden | No-GPS success | Crash (GPS) | Out of bounds | Timeout |
+|---|---|---|---|---|---|---|
+| Camera + `mean` encoder | 0.070 [0.045, 0.108] | 0.12 / 0.06 / 0.02 | 0.078 [0.051, 0.118] | 0.46 | 0.12 | 0.35 |
+| Scripted GPS pursuit | 0.070 | — | 0.000 | 0.64 | — | — |
+| Hover / random | 0.000 / 0.000 | — | 0.000 / 0.000 | 0.00 / 0.16 | — | — |
+
+By class (GPS): buildings 0.086, vegetation 0.096, vehicles 0.059, props 0.033. Validation success rose 0.031 → 0.055 → 0.086 at 1.0M / 2.0M / 2.54M steps, so the run stopped at its budget, not a plateau. Training-episode success reached 0.36, but the adaptive curriculum never left 85% visible starts (promotion needs 0.7 visible success), while evaluation draws the buckets uniformly. With GPS the camera policy only ties the scripted pursuit; without GPS it keeps 0.078 where the pursuit scores 0, so its target finding is visual. Crashes are the dominant failure. No spinning remains: a 1M-step replay had no frames at full yaw rate (v4 failures: 82–98%).
+
+Earlier v5 attempts, kept for the record: the Gaussian entropy bonus drove saturated bang-bang actions (entropy 3.7 → 4.1, success → 0); single-patch anchor labels and bird's-eye, full-frame goal crops kept localization near chance (offline within-one-patch 0.38; box-region labels and drone-like crops reach peak-on-target 0.58 offline, 0.85–0.9 in training); and an all-or-nothing hold bonus left the policy circling found targets at ~2.6 m/s (`runs/drone5-mean-seed0-binaryhold`, partial).
+
+Live play: `nix develop --command nix develop path:sim --command .venv/bin/python sim/python/live.py --checkpoint runs/drone5-mean-seed0/best.pt [--gemma]` serves http://127.0.0.1:8790/: the policy flies one held-out episode in real time; drag a box around any object (or type an instruction with `--gemma`) to make it the goal and, when it matches a city object, the scored target, with a fresh 15 s clock. Boxes of objects that project partly behind the camera cannot be matched, so very close objects fall back to whatever lies behind them.
+
 ## ABI v4 results (designed targets; superseded task)
 
 Velocity control, one seed, held-out test split. 256 episodes per GPS mode, uniform visibility buckets; Wilson 95% intervals. Wall times include initialization, training and evaluation on an RTX 5070 Ti shared with an unrelated GPU workload (not controlled). The camera arm stopped at its wall budget with fewer steps than the controls.
