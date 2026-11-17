@@ -7,7 +7,7 @@ from .cli import (TEST_SEED, TEST_STYLE, build_policy, check_episodes, emit, loa
                   sha256, validate_checkpoint)
 from .curriculum import UNIFORM_WEIGHTS
 from .evaluation import evaluate
-from .features import FrozenFeatures, precision_of
+from .features import checkpoint_features
 from .native import TASK, CudaEnv
 
 
@@ -16,7 +16,15 @@ def run(args):
     checkpoints += [(str(path), load_checkpoint(path, for_task_transfer=True), True)
                     for path in args.baseline_checkpoint]
     first = checkpoints[0][1]['metadata']
-    features = FrozenFeatures(first['encoder'], torch.device('cuda:0'), precision_of(first['preprocessing']))
+    # Checkpoints may differ in goal representation (a patch-goal policy against a global-goal baseline).
+    arms: dict[tuple, Any] = {}
+    features_of = {}
+    for name, saved, _ in checkpoints:
+        meta = saved['metadata']
+        key = (meta['encoder'], meta['preprocessing'], meta.get('goal', 'global'))
+        if key not in arms:
+            arms[key] = checkpoint_features(meta, torch.device('cuda:0'))
+        features_of[name] = arms[key]
     results: dict[str, dict[str, Any]] = {name: {'sha256': sha256(name), 'selected_steps': saved['metadata']['steps'],
                       'source_task': saved['metadata']['task'], 'evaluation_task': TASK,
                       'explicit_task_transfer': transfer, 'cohorts': {}}
@@ -28,6 +36,7 @@ def run(args):
                      first['control_mode'], args.city, start_distance=distance) as env:
             with env.execution():
                 for name, saved, transfer in checkpoints:
+                    features = features_of[name]
                     validate_checkpoint(saved, env, features, for_task_transfer=transfer)
                     policy = build_policy(env, features)
                     policy.load_state_dict(saved['model'])

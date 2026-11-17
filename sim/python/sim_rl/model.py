@@ -71,12 +71,17 @@ class TargetSaliency(nn.Module):
         self.global_projection = _orthogonal(nn.Linear(7 * token_dim, GLOBAL), math.sqrt(2))
         self.register_buffer("ndc", patch_centres(grid_h, grid_w, torch.device("cpu")).clone(), persistent=False)
 
+    def scores(self, goal, cls, tokens):
+        """Patch logits [n, P] and the "not in view" logit [n, 1] for a goal vector [n, G]."""
+        patch = self.saliency(tokens).squeeze(-1) + (self.token_rank(tokens) * self.goal_rank(goal).unsqueeze(1)).sum(-1)
+        return patch, self.absent(torch.cat((cls.float(), goal), dim=-1))
+
     def forward(self, goal, cls, tokens):
-        """goal [n, G], cls [n, D], tokens [n, P, D] -> (features [n, 196], logits [n, P+1])."""
+        """goal [n, G] (or [n, 1+K, D] for PatchMatchSaliency), cls [n, D], tokens [n, P, D]
+        -> (features [n, 196], logits [n, P+1])."""
         tokens = tokens.float()
         n, _, dim = tokens.shape
-        patch = self.saliency(tokens).squeeze(-1) + (self.token_rank(tokens) * self.goal_rank(goal).unsqueeze(1)).sum(-1)
-        absent = self.absent(torch.cat((cls.float(), goal), dim=-1))
+        patch, absent = self.scores(goal.float(), cls.float(), tokens)
         logits = torch.cat((patch, absent), dim=-1)
         in_view = 1 - logits.softmax(-1)[:, -1:]
         where = patch.softmax(-1)
@@ -87,6 +92,48 @@ class TargetSaliency(nn.Module):
         context = self.global_projection(torch.cat((cls.float().unsqueeze(1), pooled), dim=1).flatten(1))
         features = torch.cat((expected, patch.amax(-1, keepdim=True), in_view, pooled_value, context), dim=-1)
         return features, logits
+
+
+GOAL_POOL = (6, 8)               # goal-crop patch grid kept for matching (48 tokens of the 15x20)
+
+
+def goal_tokens(cls, patches, grid_h, grid_w, pool=GOAL_POOL):
+    """Goal-crop tokens for PatchMatchSaliency: [n, 1+K, D] = goal CLS, then its patch grid pooled
+    to ``pool`` (the crop is a resized object view, so pooling keeps parts, not background)."""
+    n, _, dim = patches.shape
+    grid = patches.float().transpose(1, 2).reshape(n, dim, grid_h, grid_w)
+    pooled = F.adaptive_avg_pool2d(grid, pool).flatten(2).transpose(1, 2)
+    return torch.cat((cls.float().unsqueeze(1), pooled), dim=1)
+
+
+class PatchMatchSaliency(TargetSaliency):
+    """TargetSaliency whose goal term matches every frame patch against every goal-crop patch.
+
+    A single goal vector (CLS + mean patch) cannot keep the parts that separate look-alike objects
+    (a van from a sedan of the same colour). Here frame and goal patches share a learned rank-64
+    projection; a frame patch scores by its soft-max cosine similarity to the goal's patches
+    (temperature learned), added to the goal-free linear term. The "not in view" logit also sees the
+    best match, so absence is judged by "nothing here matches", not by global appearance alone.
+    Same features and logits as TargetSaliency; the goal is ``goal_tokens`` output [n, 1+K, D].
+    """
+
+    def __init__(self, token_dim, grid_h, grid_w):
+        super().__init__(token_dim, 2 * token_dim, grid_h, grid_w)
+        del self.goal_rank
+        self.log_scale = nn.Parameter(torch.tensor(math.log(10.0)))
+        self.absent = nn.Sequential(_orthogonal(nn.Linear(2 * token_dim + 2, HIDDEN), math.sqrt(2)), nn.Tanh(),
+                                    _orthogonal(nn.Linear(HIDDEN, 1), 0.01))
+
+    def scores(self, goal, cls, tokens):
+        goal = goal.reshape(goal.shape[0], -1, tokens.shape[-1])   # flat policy goal -> [n, 1+K, D]
+        query = F.normalize(self.token_rank(tokens), dim=-1)
+        key = F.normalize(self.token_rank(goal[:, 1:]), dim=-1)
+        scale = self.log_scale.exp()
+        similarity = torch.einsum("npr,nkr->npk", query, key) * scale
+        match = (similarity.logsumexp(-1) - math.log(key.shape[1])) / scale   # soft max cosine, [-1, 1]
+        patch = self.saliency(tokens).squeeze(-1) + scale * match
+        evidence = torch.stack((match.amax(-1), match.mean(-1)), dim=-1)
+        return patch, self.absent(torch.cat((cls, goal[:, 0], evidence), dim=-1))
 
 
 def saliency_targets(privileged, grid_h, grid_w):
@@ -130,12 +177,17 @@ class ActorCritic(nn.Module):
     The critic always sees privileged + proprioception (asymmetric training).
     """
 
-    def __init__(self, mode, token_dim, goal_dim, grid_h, grid_w, action_dim=4):
+    def __init__(self, mode, token_dim, goal_dim, grid_h, grid_w, action_dim=4, goal="global"):
         super().__init__()
         if mode not in MODES:
             raise ValueError(f"unknown policy mode {mode}")
         self.mode, self.action_dim, self.hidden_size = mode, action_dim, HIDDEN
-        self.attention = TargetSaliency(token_dim, goal_dim, grid_h, grid_w) if mode == "visual" else None
+        if mode != "visual":
+            self.attention = None
+        elif goal == "patch":
+            self.attention = PatchMatchSaliency(token_dim, grid_h, grid_w)
+        else:
+            self.attention = TargetSaliency(token_dim, goal_dim, grid_h, grid_w)
         width = {"visual": VISUAL_WIDTH + PROPRIO_WIDTH, "state": PRIVILEGED_WIDTH + PROPRIO_WIDTH,
                  "hint": PROPRIO_WIDTH}[mode]
         self.trunk = nn.Sequential(_orthogonal(nn.Linear(width, HIDDEN), math.sqrt(2)),

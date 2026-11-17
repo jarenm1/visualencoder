@@ -22,9 +22,10 @@ def _fixture(directory: str):
                        "dynamics": {"velocity_scales": [4.0, 2.0, 1.5]},
                        "sensors": {"proprio_width": 19}, "privileged": {"width": 29},
                        "success": {"hold_steps": 90}, "reward": {"timeout": -10.0}})
-    features = SimpleNamespace(visual=True, spec="mean", dim=64, fingerprint="frozen-encoder",
+    features = SimpleNamespace(visual=True, spec="mean", dim=64, fingerprint="frozen-encoder", goal="global",
                                preprocessing={"engine": "tensorrt", "precision": "fp16"})
     recorded: dict[str, Any] = deepcopy(native_provenance(env, features))
+    del recorded["goal"]  # v2 checkpoints predate the goal-representation key
     recorded.update(task="city-drone-goal-v2", abi_version=5)
     recorded["native_task_contract"].update(
         task="city-drone-goal-v2", abi_version=5,

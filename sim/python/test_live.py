@@ -25,7 +25,7 @@ class LiveDiagnosticsTest(unittest.TestCase):
         pilot.lock = threading.Lock()
         pilot.frame_id = 0
         pilot.paused, pilot.error, pilot.last_outcome = False, None, None
-        pilot.goal_info = {'source': 'old crop', 'scored': True, 'revision': 1}
+        pilot.goal_info = {'source': 'old crop', 'revision': 1}
         pilot.goal_started = time.monotonic()
         pilot.object_info = {7: {'asset': 'tower', 'object_index': 7},
                              8: {'asset': 'house', 'object_index': 8}}
@@ -36,12 +36,10 @@ class LiveDiagnosticsTest(unittest.TestCase):
     def test_patch_agreement_uses_y_up_and_requires_comparable_ground_truth(self):
         pilot = self.pilot()
         d, p = pilot.env.diagnostics[0].numpy(), pilot.env.privileged[0].numpy()
-        for peak, belief, visible, scored, expected in (
-                (0, .9, 1, True, True), (299, .9, 1, True, False),
-                (0, .2, 1, True, None), (0, .9, 0, True, None), (0, .9, 1, False, None)):
-            with self.subTest(peak=peak, belief=belief, visible=visible, scored=scored):
+        for peak, belief, visible, expected in (
+                (0, .9, 1, True), (299, .9, 1, False), (0, .2, 1, None), (0, .9, 0, None)):
+            with self.subTest(peak=peak, belief=belief, visible=visible):
                 p[14] = visible
-                pilot.goal_info['scored'] = scored
                 pilot.publish(b'frame', p, d, peak, belief, None)
                 self.assertIs(pilot.status['saliency']['on_target'], expected)
                 self.assertEqual(pilot.status['target']['asset'], 'tower')
@@ -63,7 +61,7 @@ class LiveDiagnosticsTest(unittest.TestCase):
             pilot.env.diagnostics[0, 27] = 8
 
         def next_goal():
-            pilot.goal_info = {'source': 'new crop', 'scored': True, 'revision': 2}
+            pilot.goal_info = {'source': 'new crop', 'revision': 2}
 
         pilot.env.step = step
         pilot.catalog_goal = next_goal

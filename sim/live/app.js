@@ -53,7 +53,7 @@ function drawOverlay() {
       ctx.fillText("policy", Math.min(w - 42, (peak % columns) * w / columns),
                    Math.max(12, Math.floor(peak / columns) * h / rows - 4));
     }
-    if (state.target.visible && state.goal.scored) {
+    if (state.target.visible) {
       const [bx0, by0, bx1, by1] = state.target.box;
       ctx.strokeStyle = "rgba(255,255,255,0.9)";
       ctx.lineWidth = 1.5;
@@ -94,10 +94,10 @@ function drawMap() {
     mapCtx.fillRect(px(ox - hx), pz(oz - hz), 2 * hx * s, 2 * hz * s);
   }
   const t = state.target;
-  mapCtx.strokeStyle = state.goal.scored ? "#e6e6e6" : "#555";
+  mapCtx.strokeStyle = "#e6e6e6";
   mapCtx.lineWidth = 1.5;
   mapCtx.strokeRect(px(t.center[0] - t.half[0]), pz(t.center[2] - t.half[2]), 2 * t.half[0] * s, 2 * t.half[2] * s);
-  mapCtx.strokeStyle = state.goal.scored ? "rgba(230,230,230,0.25)" : "#333";
+  mapCtx.strokeStyle = "rgba(230,230,230,0.25)";
   mapCtx.beginPath();
   mapCtx.arc(px(t.center[0]), pz(t.center[2]), (Math.max(t.half[0], t.half[2]) + 6) * s, 0, 2 * Math.PI);
   mapCtx.stroke();
@@ -142,17 +142,16 @@ async function poll() {
     $("goal-detail").textContent = `Goal: ${goal.source} · ${match} · crop age ${goal.age_s.toFixed(1)} s`;
     const dimensions = target.half.map((v) => (2 * v).toFixed(1)).join(" × ");
     const visibility = target.visible ? "anchor visible" : target.in_frustum ? "anchor occluded" : "anchor outside view";
-    $("target-detail").textContent = `${goal.scored ? "Simulator GT" : "UNMATCHED GOAL — old, unrelated simulator target"}: ` +
+    $("target-detail").textContent = `Simulator GT: ` +
       `${target.asset} #${target.object_index} · ${target.class} · ${dimensions} m · ${visibility}`;
     const agreement = prediction.on_target == null ? "not comparable" : prediction.on_target ? "on GT box" : "OFF GT box";
     $("perception-detail").textContent = `Policy: P(target in view) ${Math.round(prediction.in_view * 100)}% · ` +
       `predicted patch ${agreement} (patch-in-box check, not object identity)`;
-    const distance = goal.scored
-      ? `distance to box ${state.distance_m.toFixed(1)} m (selected at ${goal.distance_at_selection_m.toFixed(1)} m)`
-      : "goal distance/hold unavailable; no simulator match";
+    const distance =
+      `distance to box ${state.distance_m.toFixed(1)} m (selected at ${goal.distance_at_selection_m.toFixed(1)} m)`;
     $("status").textContent = (state.error ? `${state.error} · ` : "") +
       `${distance} · ${state.speed_mps.toFixed(1)} m/s · alt ${state.altitude_m.toFixed(1)} m` +
-      (goal.scored ? ` · hold ${state.hold >= 1 ? "complete" : `${Math.round(state.hold * 100)}%`}` : "") +
+      ` · hold ${state.hold >= 1 ? "complete" : `${Math.round(state.hold * 100)}%`}` +
       (state.last_outcome ? ` · last outcome: ${state.last_outcome}` : "");
     const checkpoint = state.checkpoint;
     $("checkpoint-detail").textContent = `${(checkpoint.steps / 1e6).toFixed(2)}M checkpoint · ` +

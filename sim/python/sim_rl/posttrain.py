@@ -31,7 +31,7 @@ from visenc.distill import cosine_loss
 from visenc.models import Student, load_encoder, load_lingbot, save_backbone
 
 from .cli import emit, load_checkpoint, sha256
-from .model import TargetSaliency, saliency_loss, saliency_targets
+from .model import GOAL_POOL, PatchMatchSaliency, TargetSaliency, goal_tokens, saliency_loss, saliency_targets
 
 GRID = (15, 20)
 TOKEN_CHUNK = 128
@@ -250,58 +250,74 @@ def save(student, saliency, out):
 
 @torch.no_grad()
 def encode_all(encoder, data, device):
-    """Frozen encoder pass: (cls float [N,D], tokens bf16 [N,P,D], goals float [N,2D]) on the GPU."""
-    cls_rows, token_rows = [], []
+    """Frozen encoder pass on the GPU: cls float [N,D], tokens bf16 [N,P,D], and per unique goal crop
+    a goal vector float [U,2D] and goal tokens bf16 [U,1+K,D]; rows map through ``data.goal_index``."""
+    cls_all = tokens_all = None
     for begin in range(0, len(data), TOKEN_CHUNK):
         ids = torch.arange(begin, min(begin + TOKEN_CHUNK, len(data)))
         frames = data.images[ids].to(device).float().div_(255)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             cls, tokens = encode(encoder, frames)
-        cls_rows.append(cls.float())
-        token_rows.append(tokens.to(torch.bfloat16))
-    goal_rows = []
+        if tokens_all is None:   # preallocate: concatenating chunks would double peak memory (ViT-L)
+            cls_all = torch.empty((len(data), cls.shape[-1]), device=device)
+            tokens_all = torch.empty((len(data), *tokens.shape[1:]), dtype=torch.bfloat16, device=device)
+        cls_all[begin:begin + len(ids)] = cls.float()
+        tokens_all[begin:begin + len(ids)] = tokens.to(torch.bfloat16)
+    vectors, matches = [], []
     for begin in range(0, len(data.goal_images), TOKEN_CHUNK):
         goals = data.goal_images[begin:begin + TOKEN_CHUNK].to(device).float().div_(255)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            goal_rows.append(goal_embedding(encoder, goals).float())
-    goals = torch.cat(goal_rows)[data.goal_index.to(device)]
-    return torch.cat(cls_rows), torch.cat(token_rows), goals
+            cls, patches = encode(encoder, goals)
+        vectors.append(torch.cat((cls, patches.mean(1)), dim=-1).float())
+        matches.append(goal_tokens(cls, patches, *GRID).to(torch.bfloat16))
+    return cls_all, tokens_all, torch.cat(vectors), torch.cat(matches)
 
 
 def confusion_probe(args):
     device = torch.device("cuda:0")
     train = Mined(args.mined / "train", limit=args.train_frames)
     test = Mined(args.held_out / "test")
+    train_goal, test_goal = train.goal_index.to(device), test.goal_index.to(device)
     results = {}
     for spec in args.encoders:
-        torch.manual_seed(args.seed)
         encoder = load_encoder(spec).to(device).eval().requires_grad_(False)
-        cls, tokens, goals = encode_all(encoder, train, device)
+        cls, tokens, vectors, matches = encode_all(encoder, train, device)   # one split resident at a time
+        dim, heads = tokens.shape[-1], {}
         privileged = train.privileged.to(device)
-        saliency = TargetSaliency(tokens.shape[-1], goals.shape[-1], *GRID).to(device)
-        optimizer = torch.optim.Adam(saliency.parameters(), lr=args.learning_rate, weight_decay=1e-4)
-        order_generator = torch.Generator(device=device).manual_seed(args.seed)
-        for _ in range(args.epochs):
-            order = torch.randperm(len(train), device=device, generator=order_generator)
-            for begin in range(0, len(train), args.batch_size):
-                ids = order[begin:begin + args.batch_size]
-                _, logits = saliency(goals[ids], cls[ids], tokens[ids])
-                loss, _ = saliency_loss(logits, privileged[ids], *GRID)
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
-        del cls, tokens, goals
-        cls, tokens, goals = encode_all(encoder, test, device)
-        tally = Tally(device)
-        with torch.no_grad():
-            for begin in range(0, len(test), 256):
-                ids = torch.arange(begin, min(begin + 256, len(test)), device=device)
-                _, logits = saliency(goals[ids], cls[ids], tokens[ids])
-                tally.add(logits, test.privileged[ids.cpu()].to(device), test.kind[ids.cpu()].to(device) > 0)
-        results[spec] = {"dim": int(tokens.shape[-1]), "test": tally.result()}
-        print(json.dumps({spec: results[spec]}), flush=True)
-        del encoder, cls, tokens, goals, saliency
+        for head in args.heads:
+            torch.manual_seed(args.seed)
+            heads[head] = saliency = (TargetSaliency(dim, 2 * dim, *GRID) if head == "global"
+                                      else PatchMatchSaliency(dim, *GRID)).to(device)
+            optimizer = torch.optim.Adam(saliency.parameters(), lr=args.learning_rate, weight_decay=1e-4)
+            order_generator = torch.Generator(device=device).manual_seed(args.seed)
+            for _ in range(args.epochs):
+                order = torch.randperm(len(train), device=device, generator=order_generator)
+                for begin in range(0, len(train), args.batch_size):
+                    ids = order[begin:begin + args.batch_size]
+                    goal = vectors[train_goal[ids]] if head == "global" else matches[train_goal[ids]]
+                    _, logits = saliency(goal, cls[ids], tokens[ids])
+                    loss, _ = saliency_loss(logits, privileged[ids], *GRID)
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    optimizer.step()
+            del optimizer
+        del cls, tokens, vectors, matches, privileged
+        torch.cuda.empty_cache()
+        cls, tokens, vectors, matches = encode_all(encoder, test, device)
+        del encoder
+        for head, saliency in heads.items():
+            tally = Tally(device)
+            with torch.no_grad():
+                for begin in range(0, len(test), 256):
+                    ids = torch.arange(begin, min(begin + 256, len(test)), device=device)
+                    goal = vectors[test_goal[ids]] if head == "global" else matches[test_goal[ids]]
+                    _, logits = saliency(goal, cls[ids], tokens[ids])
+                    tally.add(logits, test.privileged[ids.cpu()].to(device), test.kind[ids.cpu()].to(device) > 0)
+            results.setdefault(spec, {"dim": int(dim)})[head] = tally.result()
+            print(json.dumps({spec: {head: results[spec][head]}}), flush=True)
+        del cls, tokens, vectors, matches, heads
         torch.cuda.empty_cache()
     emit({"mined": str(args.mined), "held_out": str(args.held_out), "train_frames": len(train),
           "test_frames": len(test), "epochs": args.epochs, "batch_size": args.batch_size,
-          "learning_rate": args.learning_rate, "seed": args.seed, "encoders": results}, args.out)
+          "learning_rate": args.learning_rate, "seed": args.seed, "goal_pool": list(GOAL_POOL),
+          "encoders": results}, args.out)

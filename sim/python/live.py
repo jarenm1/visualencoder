@@ -1,8 +1,8 @@
 """Live drone: the trained policy flies in real time in free flight; steer it from a browser.
 
 Drag a box around any object in the drone's view (the operator tap) or, with --gemma, type an
-instruction that Gemma 4 grounds to a box in the current frame. The box becomes the goal crop and,
-when it matches a city object, the scored target. Free flight: the whole city is open (only its
+instruction that Gemma 4 grounds to a box in the current frame. The box becomes the goal crop and
+the scored target (the city object it frames; boxes framing none are rejected). Free flight: the whole city is open (only its
 edge and a 100 m ceiling end a flight), success is reported without ending the flight and there
 is no timeout; a crash restarts in a fresh held-out episode with its catalog goal.
 
@@ -35,7 +35,7 @@ from gemma_goal import MATCH_IOU, iou, project_boxes, start_camera  # noqa: E402
 from sim_rl.cli import (DEFAULT_LIBRARY, TEST_STYLE, build_policy, load_checkpoint,  # noqa: E402
                         validate_checkpoint)
 from sim_rl.curriculum import UNIFORM_WEIGHTS  # noqa: E402
-from sim_rl.features import FrozenFeatures, crop_goals, precision_of, square_goal_box  # noqa: E402
+from sim_rl.features import checkpoint_features, crop_goals, square_goal_box  # noqa: E402
 from sim_rl.model import deterministic_action  # noqa: E402
 from sim_rl.native import CudaEnv  # noqa: E402
 
@@ -61,7 +61,7 @@ class Pilot:
         meta = saved["metadata"]
         self.checkpoint = {"path": str(args.checkpoint), "steps": meta["steps"], "live_goal_refresh": False}
         self.device = torch.device("cuda:0")
-        self.features = FrozenFeatures(meta["encoder"], self.device, precision_of(meta["preprocessing"]))
+        self.features = checkpoint_features(meta, self.device)
         self.env = CudaEnv(DEFAULT_LIBRARY, 1, args.seed, meta["width"], meta["height"], TEST_STYLE, meta["control_mode"])
         self.hz, self.appearance = args.hz, args.appearance
         layout = json.loads((self.env.city_path / "layout.json").read_text())
@@ -113,9 +113,9 @@ class Pilot:
         """Goal = the current episode's catalog goal crop (what the drone was asked to find)."""
         self.env.render_goals(int(self.env.catalog_index[0]))
         crop = crop_goals(self.env.goal_views[:1], self.env.goal_crops[:1])
-        self.set_goal(crop, "catalog goal", scored=True)
+        self.set_goal(crop, "catalog goal")
 
-    def set_goal(self, crop, source, scored, box=None, match_iou=None):
+    def set_goal(self, crop, source, box=None, match_iou=None):
         self.goal = self.features.goal_embedding(crop)
         self.starts.fill_(1)
         self.goal_revision += 1
@@ -124,12 +124,13 @@ class Pilot:
         distance = float(np.linalg.norm(np.maximum(np.abs(d[:3] - d[3:6]) - d[24:27], 0)))
         with self.lock:
             self.goal_image = jpeg(crop[0])
-            self.goal_info = {"source": source, "scored": scored, "box": box,
-                              "revision": self.goal_revision, "match_iou": match_iou,
-                              "distance_at_selection_m": round(distance, 2) if scored else None}
+            self.goal_info = {"source": source, "box": box, "revision": self.goal_revision,
+                              "match_iou": match_iou, "distance_at_selection_m": round(distance, 2)}
 
     def box_goal(self, box, source):
-        """Crop the current frame at a normalized box; retarget to the city object it frames."""
+        """Crop the current frame at a normalized box and retarget to the city object it frames.
+        A box that frames no city object is rejected: keeping the old target would give the policy
+        GPS to one object and an image of another."""
         square = square_goal_box(torch.tensor([box], device=self.device))
         crop = crop_goals(self.env.obs.clone(), square)
         diagnostics = self.env.diagnostics.cpu().numpy().astype(float)
@@ -138,14 +139,13 @@ class Pilot:
         overlap = iou(np.array(box), project_boxes(eye[0], forward[0], up[0], self.objects["center"],
                                                    self.objects["half"], camera))
         best = int(overlap.argmax())
-        matched = overlap[best] >= MATCH_IOU
-        if matched:
-            row = [*self.objects["center"][best], float(self.objects["index"][best]), *self.objects["half"][best],
-                   float(self.env.layout_classes.index(self.objects["class"][best]))]
-            self.retarget = torch.tensor([row], device=self.device, dtype=torch.float32)
-            self.env.retarget(self.retarget)
-        label = f"{source}: {self.objects['asset'][best]}" if matched else f"{source}: no city object matched"
-        self.set_goal(crop, label, scored=bool(matched), box=box, match_iou=round(float(overlap[best]), 3))
+        if overlap[best] < MATCH_IOU:
+            raise RuntimeError(f"{source}: box frames no city object (best IoU {overlap[best]:.2f} < {MATCH_IOU})")
+        row = [*self.objects["center"][best], float(self.objects["index"][best]), *self.objects["half"][best],
+               float(self.env.layout_classes.index(self.objects["class"][best]))]
+        self.retarget = torch.tensor([row], device=self.device, dtype=torch.float32)
+        self.env.retarget(self.retarget)
+        self.set_goal(crop, f"{source}: {self.objects['asset'][best]}", box=box, match_iou=round(float(overlap[best]), 3))
 
     def instruct(self, text):
         if self.gemma is None:
@@ -214,8 +214,7 @@ class Pilot:
         px = 2 * (peak % columns + 0.5) / columns - 1
         py = 1 - 2 * (peak // columns + 0.5) / rows
         x0, y0, x1, y1 = privileged[25:29]
-        on_target = (bool(x0 <= px <= x1 and y0 <= py <= y1)
-                     if self.goal_info["scored"] and visible and in_view > 0.5 else None)
+        on_target = bool(x0 <= px <= x1 and y0 <= py <= y1) if visible and in_view > 0.5 else None
         with self.lock:
             self.frame, self.frame_id = frame, self.frame_id + 1
             if outcome is not None:

@@ -122,7 +122,7 @@ class Trainer:
             patches = env.height // 16 * (env.width // 16)
             self.goals = features.catalog_goals(env, config.appearance)
             self.goal_source = RefreshedGoals(env, features, self.goals, config.goal_refresh_steps)
-            self.rollout_goals = torch.empty((t, n, 2 * features.dim), device=env.device, dtype=torch.bfloat16)
+            self.rollout_goals = torch.empty((t, n, features.goal_dim), device=env.device, dtype=torch.bfloat16)
             self.cls = allocate(t, n, features.dim)
             self.tokens = torch.empty((t, n, patches, features.dim), device=env.device, dtype=torch.bfloat16)
         else:

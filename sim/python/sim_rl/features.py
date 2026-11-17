@@ -8,6 +8,8 @@ import torch.nn.functional as F
 
 from visenc.models import load_encoder
 
+from .model import GOAL_POOL, goal_tokens
+
 ARMS = {"pretrained": "lingbot:small", "baseline": "run:runs/baseline", "mean": "run:runs/mean",
         "state": "state", "hint": "hint"}
 # Recorded in checkpoints; each string fixes the encoder numerics the policy was trained on.
@@ -16,6 +18,9 @@ PREPROCESSING = {
     "fp16": "native-NCHW-float01/ImageNet/fp16-tensorrt/CLS+patch-grid16/token-LayerNorm/v3",
 }
 PRECISIONS = tuple(PREPROCESSING)
+# Goal representation the policy compares against the frame: "global" = concat(CLS, mean patch)
+# [2D]; "patch" = CLS + the goal crop's patch grid pooled to GOAL_POOL, flattened [(1+K)*D].
+GOALS = ("global", "patch")
 
 
 def precision_of(preprocessing):
@@ -54,13 +59,17 @@ class FrozenFeatures:
 
     ``precision`` selects the inference path: ``bf16`` is the torch.compile'd encoder under bf16
     autocast (the numerics of every pre-TensorRT checkpoint); ``fp16`` is a TensorRT FP16 engine.
+    ``goal`` selects the goal representation (GOALS).
     """
 
-    def __init__(self, spec, device, precision):
+    def __init__(self, spec, device, precision, goal="global"):
+        if goal not in GOALS:
+            raise ValueError(f"unknown goal representation {goal!r}")
         self.spec = ARMS.get(spec, spec)
         self.device = device
         self.precision = precision
         self.preprocessing = PREPROCESSING[precision]
+        self.goal = goal
         self.encoder = None
         self.dim = 0
         if self.spec in ("state", "hint"):
@@ -110,17 +119,23 @@ class FrozenFeatures:
         """Encode the current env.obs; the only visual pass per control step."""
         return self.encode(env.obs)
 
+    @property
+    def goal_dim(self):
+        return (2 if self.goal == "global" else 1 + GOAL_POOL[0] * GOAL_POOL[1]) * self.dim
+
     @torch.no_grad()
     def goal_embedding(self, images):
-        """Goal embedding [m, 2D] = concat(CLS, mean patch token) of goal images [m,3,H,W]."""
+        """Goal embedding [m, goal_dim] of goal images [m,3,H,W] (see GOALS)."""
         if self.encoder is None:
             raise ValueError("goal embeddings require a visual arm")
         cls, patches = self.encode(images)
-        return torch.cat((cls, patches.float().mean(1)), dim=-1)
+        if self.goal == "global":
+            return torch.cat((cls, patches.float().mean(1)), dim=-1)
+        return goal_tokens(cls, patches, images.shape[2] // 16, images.shape[3] // 16).flatten(1)
 
     @torch.no_grad()
     def catalog_goals(self, env, appearance):
-        """bf16 [catalog_size, 2D] goal embedding per catalog entry, built once per env, encoder and
+        """bf16 [catalog_size, goal_dim] goal embedding per catalog entry, built once per env, encoder and
         appearance strength.
 
         Startup work outside collection: the env renders each entry's goal reference view (with that
@@ -128,11 +143,11 @@ class FrozenFeatures:
         and encoded. Episodes look up their row by ``env.catalog_index``.
         """
         cache = env.__dict__.setdefault("goal_tables", {})
-        key = (self.fingerprint, float(appearance))
+        key = (self.fingerprint, self.goal, float(appearance))
         if key not in cache:
             restore = env.curriculum.clone()
             env.curriculum[4] = appearance
-            table = torch.empty((env.catalog_size, 2 * self.dim), device=env.device, dtype=torch.bfloat16)
+            table = torch.empty((env.catalog_size, self.goal_dim), device=env.device, dtype=torch.bfloat16)
             for first in range(0, env.catalog_size, env.n):
                 count = min(env.n, env.catalog_size - first)
                 env.render_goals(first)
@@ -141,6 +156,12 @@ class FrozenFeatures:
             env.curriculum.copy_(restore)
             cache[key] = table
         return cache[key]
+
+
+def checkpoint_features(metadata, device):
+    """The frozen features a checkpoint was trained with (checkpoints before ``goal`` used "global")."""
+    return FrozenFeatures(metadata["encoder"], device, precision_of(metadata["preprocessing"]),
+                          metadata.get("goal", "global"))
 
 
 class RefreshedGoals:

@@ -133,8 +133,9 @@ def run_instruction(server, instruction):
         sim_python("sim/python/gemma_goal.py", "ground", "--out", str(work), "--instruction", instruction,
                    "--model", live["model"], timeout=1800)
         grounded = json.loads((work / "boxes.json").read_text())
-        if grounded["found"] == 0:
-            raise RuntimeError(f"Gemma found nothing matching \"{instruction}\" in {grounded['num_envs']} start views")
+        if grounded["matched"] == 0:
+            raise RuntimeError(f"Gemma's boxes for \"{instruction}\" matched no city object in "
+                               f"{grounded['num_envs']} start views ({grounded['found']} boxed)")
         server.report(state="flying", instruction=instruction, found=grounded["found"], matched=grounded["matched"])
         sim_python("sim/python/replay.py", "--checkpoint", str(live["checkpoint"]), "--out", str(out),
                    "--num-envs", str(live["num_envs"]), "--split", "test", "--goal-boxes", str(work / "boxes.json"),

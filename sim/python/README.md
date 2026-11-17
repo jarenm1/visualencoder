@@ -151,23 +151,34 @@ Held-out test (7,680 samples, separate district). Visible = peak patch on the ta
 | `mean` + post-trained head | 0.650 | 0.836 | 0.743 |
 | post-trained encoder + head | 0.641 | 0.833 | 0.737 |
 
-Confusion probe (`train.py confusion-probe`; fresh head per frozen encoder, same 8,192 mined training frames, same seed and schedule, same test set):
+Confusion probe (`train.py confusion-probe`; fresh head per frozen encoder, same 8,192 mined training frames, same seed and schedule, same test set). `global` = the policy's head (goal = one CLS + mean-patch vector); `patch` = `PatchMatchSaliency` (goal = CLS + the goal crop's patch grid pooled to 6×8; each frame patch scores by its soft-max cosine match to the goal patches, and "not in view" sees the best match). Visible on target / absent correct / score:
 
-| Encoder | Visible on target | Absent correct | Score |
-|---|---|---|---|
-| `lingbot:small` (off the shelf) | 0.490 | 0.850 | 0.670 |
-| `lingbot:large` (teacher) | 0.540 | 0.817 | 0.679 |
-| `baseline` (standard distillation) | 0.607 | 0.819 | 0.713 |
-| `mean` (paired consistency) | 0.632 | 0.828 | 0.730 |
-| `mean` post-trained (4 blocks) | 0.624 | 0.766 | 0.695 |
+| Encoder | `global` head | `patch` head |
+|---|---|---|
+| `lingbot:small` (off the shelf) | 0.493 / 0.844 / 0.668 | 0.621 / 0.932 / 0.776 |
+| `lingbot:large` (teacher) | 0.538 / 0.833 / 0.685 | 0.741 / 0.896 / 0.819 |
+| `baseline` (standard distillation) | 0.610 / 0.811 / 0.711 | 0.722 / 0.915 / 0.819 |
+| `mean` (paired consistency) | 0.624 / 0.836 / 0.730 | 0.706 / 0.915 / 0.810 |
+| `mean` post-trained (4 blocks), first run | 0.624 / 0.766 / 0.695 | — |
 
 UAVid retention (`visenc real-eval`, 7 val sequences): post-trained vs `mean` sim→real mIoU 0.511 vs 0.516, car AUROC 0.860 vs 0.903, car AP 0.533 vs 0.604 (wide intervals).
 
 Findings:
 - Most mined failures were the policy head's **calibration**, not the encoder: it reported the target in view when it was not. Retraining the head on mined frames moves absent-correct 0.45 → 0.84; visible localization barely moves (0.645 → 0.650).
 - **Encoder post-training added nothing** with this recipe: the joint result matches head-only, the frozen-probe score drops, and real car metrics drop. Not adopted.
-- **Both distilled students already beat their teacher** at goal localization in the city (0.730 / 0.713 vs 0.679; visible on-target 0.632 / 0.607 vs 0.540). Paper-relevant, single seed, no intervals; frames within an episode are correlated.
-- Visible localization plateaus near 0.63–0.65 across encoders and heads. A likely limit is the goal representation: one 768-d vector (CLS + mean patch) cannot keep the details that separate look-alike objects. Next lever: patch-level goal matching in the head, not more encoder tuning.
+- **The goal representation was the bottleneck.** Patch matching lifts every encoder by 0.08–0.13 score, raising both visible localization and absent rejection. The policy now uses it (`--goal patch`, the default).
+- With the single-vector goal, both distilled students looked better than their teacher (0.730 / 0.711 vs 0.685). **With patch matching that gap closes** (teacher 0.819 = `baseline` 0.819 ≥ `mean` 0.810; teacher best at visible on-target, 0.741). The earlier "student beats teacher" reading came from the students' summary vector, not finer discrimination. Single seed, no intervals; frames within an episode are correlated.
+
+### Gemma grounding benchmark
+
+`gemma_goal.py bench --mined runs/mined-drone6/eval-set/test`: 150 held-out frames with the target visible plus 50 without. Each frame gets "Fly to the <asset name>." for its true target (e.g. "Fly to the van.", "Fly to the building."); boxes are scored against the simulator's projected target box (`runs/gemma-bench/bench-x1.json`). Gemma 4 E4B-it, 320×240, 0.8 s per answer:
+
+| Visible: boxed | Visible: IoU ≥ 0.3 | Mean IoU | Absent: false box |
+|---|---|---|---|
+| 127 / 150 | 94 / 150 | 0.38 | 29 / 50 |
+
+By family, hits are cars 41/49, buildings and trees 49/81, street props 4/20 (lights and planters, often < 2% of the frame). Box centres are unbiased (mean offset +0.02, −0.01), so image coordinates are read correctly; boxes are ~0.55× the truth area because the truth is the whole object's projected bounds, including occluded parts. A 2× upscale changed nothing (94 / 150, 30 / 50 false). Misses are mostly another instance of the named class ("the building" with several in view, "the large tree"), and when the target is out of view Gemma still boxes a look-alike 58% of the time: one-frame grounding cannot say "not here".
+
 
 
 ## Sustained-hold experiment (ABI v6)
@@ -270,7 +281,7 @@ Earlier v5 attempts, kept for the record: the Gaussian entropy bonus drove satur
 
 Live play: `nix develop --command nix develop path:sim --command .venv/bin/python sim/python/live.py --checkpoint runs/drone8-mean-hold-seed0/best.pt [--gemma]` serves http://127.0.0.1:8790/. Drag a box or type an instruction with `--gemma` to supply a goal crop. Free flight ignores district bounds, timeouts and success termination; a crash or leaving the city/100 m ceiling restarts. No automatic goal refresh runs in live play.
 
-Live diagnostics: white camera outline = simulator target box (only when its anchor is visible and the selected goal is scored); red patch = the policy's localization guess, drawn when P(in-view) exceeds 0.5; thumbnail = actual goal image. Blue map marker = drone. The panel shows goal source/age, geometric box-match IoU, simulator asset/object ID/class/dimensions, selection/current box distance, anchor visibility, policy P(in-view), patch-in-GT-box agreement and checkpoint. An unmatched selection explicitly labels the old simulator target as unrelated and hides its white camera outline; its distance is not presented as goal progress. IoU and patch-in-box agreement do not establish semantic object identity. Ground truth is diagnostic only, never an added input to the visual actor.
+Live diagnostics: white camera outline = simulator target box (when its anchor is visible); red patch = the policy's localization guess, drawn when P(in-view) exceeds 0.5; thumbnail = actual goal image. Blue map marker = drone. The panel shows goal source/age, geometric box-match IoU, simulator asset/object ID/class/dimensions, selection/current box distance, anchor visibility, policy P(in-view), patch-in-GT-box agreement and checkpoint. A box (drawn or from Gemma) that frames no city object is rejected and the previous goal stays. IoU and patch-in-box agreement do not establish semantic object identity. Ground truth is diagnostic only, never an added input to the visual actor.
 
 Skyscraper coverage limitation: applying the current district/object-pool rules to `assets/city/layout.json` yields 27 eligible skyscraper instances in training, zero in validation and zero in test. Eligibility is before start/reference-view rejection; it does not measure actual catalog frequency. The reported aggregate held-out success therefore does not evaluate skyscraper navigation, especially distant live selections outside the 8–30 m training-start range.
 
@@ -311,7 +322,7 @@ Format `sim-drone-ppo-v3`. A checkpoint records task/ABI, controls, encoder fing
 
 Replay export (`sim_rl.replay`, entry `sim/python/replay.py --checkpoint ... --out ... --num-envs 32 --split test`) writes format `sim-city-replay-v3`: a manifest (including `control_mode`, `action_names`, `no_gps_fraction`, `appearance`, and per environment `gps_available`, `target_class`, layout `object` and the goal crop `env-XXX-goal.png`) plus per-environment states (pose, target box centre and half extents, catalog index, target class and object, clock, landed, and the anchor labels) and transitions (`action_names` followed by `reward, done, success, collision, out_of_bounds`), trimmed to the first done frame. `--target-class NAME` keeps episodes whose target has that layout class. The site shows the goal crop beside the controls.
 
-Language goals by grounding (`sim/python/gemma_goal.py`): `frames` renders the first-person start frames of a fresh held-out batch; `ground --instruction TEXT` asks Gemma 4 to box the instructed object in each frame and matches the box to the target-class city object whose projected bounding box overlaps it most (IoU ≥ 0.3; occlusion is not modelled). `replay.py --goal-boxes DIR/boxes.json` then flies those episodes: the goal is the crop of the start frame at Gemma's box (the crop an operator tap would give) and the native `retarget` call makes success score the matched object; unmatched boxes still steer the policy but the episode keeps its catalog target (`grounding.scored = false`).
+Language goals by grounding (`sim/python/gemma_goal.py`): `frames` renders the first-person start frames of a fresh held-out batch; `ground --instruction TEXT` asks Gemma 4 to box the instructed object in each frame and matches the box to the target-class city object whose projected bounding box overlaps it most (IoU ≥ 0.3; occlusion is not modelled). `replay.py --goal-boxes DIR/boxes.json` then flies the matched episodes: the goal is the crop of the start frame at Gemma's box (the crop an operator tap would give) and the native `retarget` call points GPS and success at the matched object. Boxes matching no city object are not flown (they would give the policy GPS to one object and an image of another). `bench` scores grounding on mined frames with known targets (see "Gemma grounding benchmark").
 
 Typed goals in the replay site: start the server inside the root dev shell with `nix develop --command .venv/bin/python sim/replay/serve.py --data <recording> --live [--checkpoint runs/drone8-mean-hold-seed0/best.pt]`. Each instruction runs frames → ground → record on `--live-envs` (default 32) held-out environments with a fresh random seed and switches the page to the recording; episodes where Gemma boxed nothing are dropped. Recordings have their own `/replay/<recording>/` URLs.
 

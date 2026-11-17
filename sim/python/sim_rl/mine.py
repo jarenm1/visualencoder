@@ -23,7 +23,7 @@ import torch
 from .cli import (TEST_SEED, TEST_STYLE, TRAIN_STYLE, VALIDATION_SEED, VALIDATION_STYLE, build_policy,
                   emit, load_checkpoint, sha256, validate_checkpoint)
 from .curriculum import UNIFORM_WEIGHTS
-from .features import FrozenFeatures, crop_goals, precision_of
+from .features import checkpoint_features, crop_goals
 from .model import deterministic_action, saliency_targets
 from .native import CudaEnv
 
@@ -121,7 +121,7 @@ def mine_split(args, saved, features, split):
 def run(args):
     saved = load_checkpoint(args.checkpoint, for_task_transfer=args.allow_task_transfer)
     metadata = saved["metadata"]
-    features = FrozenFeatures(metadata["encoder"], torch.device("cuda:0"), precision_of(metadata["preprocessing"]))
+    features = checkpoint_features(metadata, torch.device("cuda:0"))
     args.out.mkdir(parents=True, exist_ok=True)
     splits = [mine_split(args, saved, features, split) for split in args.splits]
     payload = {"checkpoint": str(args.checkpoint), "checkpoint_sha256": sha256(args.checkpoint),

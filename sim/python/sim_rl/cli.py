@@ -12,7 +12,7 @@ import torch
 
 from .curriculum import MODES as CURRICULUM_MODES
 from .evaluation import evaluate, heuristics_for
-from .features import ARMS, PRECISIONS, FrozenFeatures, precision_of
+from .features import ARMS, GOALS, PRECISIONS, FrozenFeatures, checkpoint_features
 from .model import ActorCritic
 from .native import ABI_VERSION, CONTROL_MODES, DEFAULT_CITY, HOVER_ACTIONS, TASK, CudaEnv
 from .ppo import BUCKET_WIDTH, LOSS_NAMES, LOSS_WIDTH, RESULT_WIDTH, ROLLOUT_WIDTH, Config, Trainer
@@ -29,7 +29,7 @@ MIN_EPISODES = 256
 DEFAULTS = Config()
 DEFAULT_ENCODERS = "pretrained,baseline,mean"
 ACTOR_INPUTS = {
-    "visual": "target-saliency(frozen CLS + patch tokens, catalog goal-crop embedding) + proprio(19)",
+    "visual": "target-saliency(frozen CLS + patch tokens, goal-crop embedding: global or patch) + proprio(19)",
     "state": "privileged(29) + proprio(19)",
     "hint": "proprio(19)",
 }
@@ -37,7 +37,9 @@ CRITIC_INPUTS = "privileged(29) + proprio(19)"
 # Recorded and compared on load; the library hash is provenance only (rebuilds keep the contract).
 CHECKED_KEYS = ("task", "abi_version", "action_dim", "horizon", "control_hz", "control_mode",
                 "width", "height", "policy_mode", "encoder", "feature_dim", "encoder_fingerprint",
-                "preprocessing", "native_task_contract")
+                "preprocessing", "goal", "native_task_contract")
+# Values of keys added after earlier checkpoints were written.
+UNRECORDED = {"goal": "global"}
 LOSS_AT = ROLLOUT_WIDTH
 BUCKET_AT = LOSS_AT + LOSS_WIDTH
 USED_AT = BUCKET_AT + BUCKET_WIDTH
@@ -65,8 +67,8 @@ def mode_of(features):
 
 def build_policy(env, features):
     """Visual arms attend over the frozen patch grid; the grid is height//16 x width//16."""
-    return ActorCritic(mode_of(features), features.dim, 2 * features.dim,
-                       env.height // 16, env.width // 16, env.action_dim).to(env.device)
+    return ActorCritic(mode_of(features), features.dim, features.goal_dim,
+                       env.height // 16, env.width // 16, env.action_dim, features.goal).to(env.device)
 
 
 def native_provenance(env, features):
@@ -77,7 +79,7 @@ def native_provenance(env, features):
         "control_mode": env.control_mode, "catalog_size": env.catalog_size,
         "width": env.width, "height": env.height,
         "policy_mode": mode, "encoder": features.spec, "feature_dim": features.dim,
-        "encoder_fingerprint": features.fingerprint, "preprocessing": features.preprocessing,
+        "encoder_fingerprint": features.fingerprint, "preprocessing": features.preprocessing, "goal": features.goal,
         "actor_inputs": ACTOR_INPUTS[mode], "critic_inputs": CRITIC_INPUTS,
         "native_task_contract": env.task_contract, "native_library_sha256": sha256(env.library),
     }
@@ -129,9 +131,9 @@ def validate_checkpoint(saved, env, features, *, for_task_transfer=False):
     for key in CHECKED_KEYS:
         if transfer and key in {"task", "abi_version", "native_task_contract"}:
             continue
-        if recorded.get(key) != expected[key]:
+        if recorded.get(key, UNRECORDED.get(key)) != expected[key]:
             raise ValueError(f"checkpoint {key} differs from the native/feature configuration: "
-                             f"recorded {recorded.get(key)!r}, current {expected[key]!r}")
+                             f"recorded {recorded.get(key, UNRECORDED.get(key))!r}, current {expected[key]!r}")
 
 
 def make_config(args):
@@ -225,7 +227,7 @@ def train_command(args, started):
     run = args.out
     run.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda:0")
-    features = FrozenFeatures(args.encoder, device, args.encoder_precision)
+    features = FrozenFeatures(args.encoder, device, args.encoder_precision, args.goal)
     budget_end = started + args.wall_seconds if args.wall_seconds else float("inf")
     curves = (run / "learning-curves.jsonl").open("w")
     validations = []
@@ -350,7 +352,7 @@ def eval_command(args, started):
     saved = load_checkpoint(args.checkpoint)
     metadata = saved["metadata"]
     device = torch.device("cuda:0")
-    features = FrozenFeatures(metadata["encoder"], device, precision_of(metadata["preprocessing"]))
+    features = checkpoint_features(metadata, device)
     seed, style = (VALIDATION_SEED, VALIDATION_STYLE) if args.split == "validation" else (TEST_SEED, TEST_STYLE)
     with open_env_checkpoint(args, metadata, seed, style) as env:
         with env.execution():
@@ -426,7 +428,7 @@ def benchmark_command(args, started):
     rows = []
     for n in args.batch_sizes:
         seed_all(args.seed)
-        features = FrozenFeatures(args.encoder, torch.device("cuda:0"), args.encoder_precision)
+        features = FrozenFeatures(args.encoder, torch.device("cuda:0"), args.encoder_precision, args.goal)
         config = make_config(args)
         with open_env(args, n, args.seed, TRAIN_STYLE) as env:
             with env.execution():
@@ -448,7 +450,7 @@ def benchmark_command(args, started):
 
 def profile_command(args, started):
     seed_all(args.seed)
-    features = FrozenFeatures(args.encoder, torch.device("cuda:0"), args.encoder_precision)
+    features = FrozenFeatures(args.encoder, torch.device("cuda:0"), args.encoder_precision, args.goal)
     config = make_config(args)
     with open_env(args, args.num_envs, args.seed, TRAIN_STYLE) as env:
         with env.execution():
@@ -461,7 +463,7 @@ def profile_command(args, started):
 
 def memory_check_command(args, started):
     seed_all(args.seed)
-    features = FrozenFeatures(args.encoder, torch.device("cuda:0"), args.encoder_precision)
+    features = FrozenFeatures(args.encoder, torch.device("cuda:0"), args.encoder_precision, args.goal)
     config = make_config(args)
     allocated = []
     with open_env(args, args.num_envs, args.seed, TRAIN_STYLE) as env:
@@ -507,6 +509,9 @@ def add_precision(parser):
 
 def add_learner(parser):
     parser.add_argument("--encoder", default="mean", help=f"arm: {', '.join(ARMS)} or run:<dir>")
+    parser.add_argument("--goal", choices=GOALS, default="patch",
+                        help="goal representation: patch (goal-crop patches matched against frame patches) "
+                             "or global (one CLS + mean-patch vector; earlier checkpoints)")
     add_precision(parser)
     parser.add_argument("--curriculum", choices=CURRICULUM_MODES, default="adaptive")
     parser.add_argument("--num-envs", type=int, default=128)
@@ -600,6 +605,8 @@ def parser():
     confusion.add_argument("--encoders", nargs="+", required=True, help="visenc encoder specs, e.g. run:runs/mean")
     confusion.add_argument("--mined", type=Path, required=True)
     confusion.add_argument("--held-out", type=Path, required=True, help="mine output holding test/")
+    confusion.add_argument("--heads", nargs="+", choices=("global", "patch"), default=["global", "patch"],
+                           help="global: goal vector (policy head); patch: patch-by-patch goal matching")
     confusion.add_argument("--train-frames", type=int, default=8192)
     confusion.add_argument("--epochs", type=int, default=20)
     confusion.add_argument("--batch-size", type=int, default=128)

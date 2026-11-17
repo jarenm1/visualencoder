@@ -14,7 +14,7 @@ from PIL import Image
 from .cli import (DEFAULT_LIBRARY, ROOT, TEST_SEED, TEST_STYLE, TRAIN_STYLE, VALIDATION_SEED,
                   VALIDATION_STYLE, build_policy, load_checkpoint, sha256, validate_checkpoint)
 from .curriculum import UNIFORM_WEIGHTS
-from .features import FrozenFeatures, RefreshedGoals, crop_goals, precision_of, square_goal_box
+from .features import RefreshedGoals, checkpoint_features, crop_goals, square_goal_box
 from .model import deterministic_action, saliency_targets
 from .native import DEFAULT_CITY, PRIVILEGED_WIDTH, CudaEnv
 
@@ -88,21 +88,22 @@ def ground_goals(env, features, grounded):
     """Override goals with crops of the start frame at language-model boxes (see gemma_goal.py).
 
     Returns (goal embeddings [n, 2D], has_box [n] bool, goal crops uint8 [n,H,W,3] or None,
-    retarget rows [n, 8]). Matched boxes retarget the env so success scores that object; unmatched
-    boxes still steer the policy but keep the catalog target. Call right after reset.
+    retarget rows [n, 8]). Only boxes matched to a city object count: the env is retargeted to that
+    object, so GPS, the goal crop and success all name the same object. Unmatched boxes are dropped:
+    flying them would give the policy GPS to the catalog target and an image of something else.
+    Call right after reset.
     """
     n = env.n
     boxes = torch.zeros((n, 4), device=env.device)
     has_box = torch.zeros(n, dtype=torch.bool, device=env.device)
     targets = torch.full((n, 8), -1.0, device=env.device)
     for entry in grounded["boxes"]:
-        if entry["box"] is None:
+        if entry["object"] is None:
             continue
         boxes[entry["env"]] = torch.tensor(entry["box"])
         has_box[entry["env"]] = True
-        if entry["object"] is not None:
-            targets[entry["env"]] = torch.tensor([*entry["center"], entry["object"], *entry["half"],
-                                                  env.layout_classes.index(entry["object_class"])])
+        targets[entry["env"]] = torch.tensor([*entry["center"], entry["object"], *entry["half"],
+                                              env.layout_classes.index(entry["object_class"])])
     crops = crop_goals(env.obs.clone(), square_goal_box(boxes))
     goals = features.goal_embedding(crops) if features.visual else None
     images = (crops.clamp(0, 1) * 255).round().to(torch.uint8).permute(0, 2, 3, 1)
@@ -254,7 +255,7 @@ def record(args):
         raise FileExistsError(f"refusing to overwrite replay: {args.out}")
     saved = load_checkpoint(args.checkpoint)
     metadata = saved["metadata"]
-    features = FrozenFeatures(metadata["encoder"], torch.device("cuda:0"), precision_of(metadata["preprocessing"]))
+    features = checkpoint_features(metadata, torch.device("cuda:0"))
     styles = {"train": TRAIN_STYLE, "validation": VALIDATION_STYLE, "test": TEST_STYLE}
     seeds = {"train": 0, "validation": VALIDATION_SEED, "test": TEST_SEED}
     seed = seeds[args.split] if args.seed is None else args.seed
@@ -294,7 +295,7 @@ def record(args):
         grounding = None
         if grounded is not None:
             grounding = next(entry for entry in grounded["boxes"] if entry["env"] == index)
-            if grounding["box"] is None:
+            if grounding["object"] is None:
                 continue
         final = transitions[length - 1, index]
         outcome = ("success" if final[6] else "collision" if final[7]
@@ -311,11 +312,9 @@ def record(args):
             "gps_available": bool(recording["gps_available"][index] > 0.5),
             "target_class": target_class, "object": int(episode[0, COLUMN["object"]]),
             "goal": f"{basename}-goal.png",
-            # Language-grounded goal: the box, and whether success scores the boxed object
-            # (matched) or still the catalog target (unmatched).
+            # Language-grounded goal: Gemma's box and the city object it matched (the scored target).
             "grounding": None if grounding is None else {
-                key: grounding.get(key) for key in ("box", "object", "object_class", "asset", "iou", "answer")}
-                | {"scored": grounding["object"] is not None},
+                key: grounding.get(key) for key in ("box", "object", "object_class", "asset", "iou", "answer")},
             "video": f"{basename}.mp4", "states": episode.tolist(),
             "transitions": transitions[:length, index].tolist(),
         }

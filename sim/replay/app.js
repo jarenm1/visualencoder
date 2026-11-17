@@ -199,7 +199,7 @@ function chooseEnvironment(index) {
   goal.hidden = false;
   goal.src = replayUrl(env.goal);
   goal.alt = goal.title = env.grounding
-    ? `Gemma box: ${env.grounding.asset ?? "unmatched"}${env.grounding.scored ? "" : " (not scored)"}`
+    ? `Gemma box: ${env.grounding.asset}`
     : `Goal crop: ${env.target_class}`;
 
   const source = document.createElement("video");

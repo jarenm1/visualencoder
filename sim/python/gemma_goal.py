@@ -184,17 +184,85 @@ def ground(args):
     print(json.dumps({"instruction": instruction, "found": found, "matched": matched}), flush=True)
 
 
+def object_phrase(asset):
+    """Plain noun phrase for a layout asset: 'cars:sedan-sports' -> 'sports sedan',
+    'suburban:building-type-c' -> 'building', 'nature:stone_largeB' -> 'large stone'."""
+    words = [re.sub(r"[A-Z]$", "", word) for word in re.split(r"[-_]", asset.split(":")[-1])]
+    words = [word for word in words if len(word) > 1 and word != "type"]
+    return " ".join(reversed(words)) if len(words) > 1 else words[0]
+
+
+def bench(args):
+    """Grounding benchmark on mined held-out frames with known targets (sim_rl.mine output).
+
+    Each frame gets the instruction "Fly to the <asset phrase>." for its catalog target. Visible
+    targets score IoU with the true projected box (hit: IoU >= MATCH_IOU) and the box's centre/size
+    bias, which exposes coordinate-frame errors; hidden targets score whether Gemma answers []."""
+    from transformers import AutoProcessor
+    data = Path(args.mined)
+    images = np.load(data / "images.npy", mmap_mode="r")
+    privileged, diagnostics = np.load(data / "privileged.npy"), np.load(data / "diagnostics.npy")
+    layout = json.loads((ROOT / "assets/city/layout.json").read_text())["objects"]
+    rng = np.random.default_rng(args.seed or 0)
+    visible = privileged[:, 14] > 0.5
+    chosen = np.concatenate((rng.choice(np.flatnonzero(visible), args.visible, replace=False),
+                             rng.choice(np.flatnonzero(~visible), args.absent, replace=False)))
+    processor = AutoProcessor.from_pretrained(args.model)
+    model = load_gemma(args.model)
+    rows = []
+    for index in chosen:
+        asset = layout[int(diagnostics[index, 27])]["asset"]
+        instruction = f"Fly to the {object_phrase(asset)}."
+        image = Image.fromarray(np.ascontiguousarray(images[index].transpose(1, 2, 0)))
+        if args.upscale > 1:
+            image = image.resize((image.width * args.upscale, image.height * args.upscale), Image.LANCZOS)
+        box, answer, latency = detect(model, processor, image, instruction)
+        row = {"frame": int(index), "asset": asset, "instruction": instruction, "visible": bool(visible[index]),
+               "box": box, "answer": answer, "latency_s": round(latency, 3)}
+        if visible[index]:
+            x0, y0, x1, y1 = privileged[index, 25:29]
+            truth = np.array([(x0 + 1) / 2, (1 - y1) / 2, (x1 + 1) / 2, (1 - y0) / 2])
+            row["truth"] = truth.round(4).tolist()
+            if box is not None:
+                b = np.array(box)
+                row["iou"] = float(iou(truth, b[None])[0])
+                row["centre_offset"] = (((b[:2] + b[2:]) - (truth[:2] + truth[2:])) / 2).round(4).tolist()
+                area = lambda r: max((r[2] - r[0]) * (r[3] - r[1]), 1e-6)
+                row["log_area_ratio"] = float(np.log(area(b) / area(truth)))
+        rows.append(row)
+        print(json.dumps({k: row.get(k) for k in ("frame", "instruction", "visible", "box", "iou")}), flush=True)
+    seen = [row for row in rows if row["visible"]]
+    boxed = [row for row in seen if row["box"] is not None]
+    absent = [row for row in rows if not row["visible"]]
+    mean = lambda values: float(np.mean(values)) if values else None
+    summary = {"model": args.model, "mined": str(data), "upscale": args.upscale, "match_iou": MATCH_IOU,
+               "visible": len(seen), "visible_boxed": len(boxed),
+               "visible_hit": sum(row["iou"] >= MATCH_IOU for row in boxed),
+               "visible_mean_iou": mean([row.get("iou", 0.0) for row in seen]),
+               "centre_offset_mean": np.mean([row["centre_offset"] for row in boxed], 0).round(4).tolist() if boxed else None,
+               "log_area_ratio_mean": mean([row["log_area_ratio"] for row in boxed]),
+               "absent": len(absent), "absent_false_box": sum(row["box"] is not None for row in absent),
+               "latency_s_mean": mean([row["latency_s"] for row in rows]), "rows": rows}
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / f"bench-x{args.upscale}.json").write_text(json.dumps(summary, indent=1) + "\n")
+    print(json.dumps({k: v for k, v in summary.items() if k != "rows"}), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("stage", choices=("frames", "ground"))
+    parser.add_argument("stage", choices=("frames", "ground", "bench"))
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--model", default="google/gemma-4-E4B-it")
     parser.add_argument("--num-envs", type=int, default=32)
     parser.add_argument("--seed", type=int, help="held-out reset seed (default: the test seed)")
     parser.add_argument("--appearance", type=float, default=1.0)
     parser.add_argument("--instruction", help="free-text goal for the ground stage")
+    parser.add_argument("--mined", help="bench: a mined split directory (sim_rl.mine), e.g. runs/mined-drone6/eval-set/test")
+    parser.add_argument("--visible", type=int, default=150, help="bench: frames with the target visible")
+    parser.add_argument("--absent", type=int, default=50, help="bench: frames with the target not visible")
+    parser.add_argument("--upscale", type=int, default=1, help="bench: integer upscale of the 320x240 frame")
     args = parser.parse_args()
-    {"frames": frames, "ground": ground}[args.stage](args)
+    {"frames": frames, "ground": ground, "bench": bench}[args.stage](args)
 
 
 if __name__ == "__main__":
