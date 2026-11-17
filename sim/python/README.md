@@ -128,6 +128,15 @@ Measured on ABI v4 (designed 1.5–2.5 m shapes, held-out designs; `runs/drone-p
 | `baseline` (standard distilled) | 0.894 | 0.629 | 0.861 | 7.6 px |
 | `mean` (paired consistency) | 0.897 | 0.620 | 0.856 | 7.7 px |
 
+## Planned: failure mining and perception post-train (not yet run)
+
+1. Simple reward: `(d_prev − d) + 0.1·in_zone − 1·crash/OOB`, γ ≈ 0.997 for the 15 s horizon; sweep the three coefficients.
+2. Wrong-target mining: a frozen policy in large env batches flags frames whose high-confidence saliency peak or approach lands on a non-target object (renderer object IDs), then snapshots sim state, frame, goal crop and distractor ID.
+3. Perception post-train: hard-negative (target vs. mined distractor) training of `TargetSaliency`, optionally LoRA on the last ViT blocks anchored to the frozen encoder.
+4. RL restarts from a fraction of mined states.
+
+**Paper comparison (encoder study):** run step 3 identically for `pretrained`, `baseline` and `mean`, using the same mined failure set. Report before vs. after post-train on held-out mined confusions and the localization probe, plus out-of-domain retention (real-image segmentation, the paper's existing metrics), so the study shows whether hard-negative post-training helps each encoder equally and whether it costs appearance robustness. The mined set comes from one policy's failures, so report the mining policy and keep the evaluation confusions held out (different districts and seeds).
+
 ## Sustained-hold experiment (ABI v6)
 
 `runs/drone8-mean-hold-seed0`: fresh seed-0 visual policy, frozen TensorRT FP16 `mean` encoder, 128 envs, oracle goal-box refresh every 30 steps, unchanged flight limits, PPO settings, 8–30 m starts and adaptive curriculum. Completed 2,007,040 steps in 1371 s (22.9 min including initialization, validation and standard test). Validation selected `best.pt` at 1,007,616 steps; `last.pt` retains the full-budget policy.
