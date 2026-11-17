@@ -128,6 +128,48 @@ Measured on ABI v4 (designed 1.5–2.5 m shapes, held-out designs; `runs/drone-p
 | `baseline` (standard distilled) | 0.894 | 0.629 | 0.861 | 7.6 px |
 | `mean` (paired consistency) | 0.897 | 0.620 | 0.856 | 7.7 px |
 
+## Sustained-hold experiment (ABI v6)
+
+`runs/drone8-mean-hold-seed0`: fresh seed-0 visual policy, frozen TensorRT FP16 `mean` encoder, 128 envs, oracle goal-box refresh every 30 steps, unchanged flight limits, PPO settings, 8–30 m starts and adaptive curriculum. Completed 2,007,040 steps in 1371 s (22.9 min including initialization, validation and standard test). Validation selected `best.pt` at 1,007,616 steps; `last.pt` retains the full-budget policy.
+
+Scores require the new final-3-second hold, not ABI v5's early 0.5-second arrival. Validation uses oracle simulator boxes, not Gemma:
+
+| Training steps | GPS success % | No-GPS success % |
+|---|---|---|
+| 507,904 | 0.39 | 0.00 |
+| 1,007,616 | 6.25 | 6.25 |
+| 1,507,328 | 2.34 | 3.52 |
+| 2,007,040 | 3.12 | 3.52 |
+
+The complete standard test, with refreshed-box and fixed-goal modes, is in `final-test.json`. Paired fixed-goal results use the selected policy and explicitly transfer both previous visual policies into the new task, preserving their encoder/observation/control contracts. Different selected training budgets and one seed make this a practical checkpoint comparison, not a causal reward ablation.
+
+Paired fixed-goal test, 256 episodes per cell. All policies use the same new success rule. Percentages below are observed rates; Wilson intervals and complete diagnostics are in `cohorts-fixed-goal.json`.
+
+| Cohort | GPS mode | Previous non-exploration, 3.01M | Exploration, 2.01M | New hold, selected 1.01M |
+|---|---|---|---|---|
+| Standard, 8–30 m | available | 10.94% | 1.17% | 2.73% |
+| Standard, 8–30 m | denied | 8.59% | 0.39% | 2.73% |
+| Hidden, 8–30 m | available | 1.95% | 0.39% | 0.78% |
+| Hidden, 8–30 m | denied | 1.17% | 0.39% | 0.78% |
+| Far, 35–50 m | available | 2.34% | 0.00% | 0.39% |
+| Far, 35–50 m | denied | 0.39% | 0.00% | 0.00% |
+| Hidden + far | available | 0.00% | 0.00% | 0.00% |
+| Hidden + far | denied | 0.00% | 0.00% | 0.00% |
+
+Standard-cohort GPS behavior. Arrival means a 0.5 s hold; held-frame fraction and ever-lost-hold rate are conditional on arrival. A policy may lose the hold, reacquire it, and still succeed at the deadline.
+
+| Policy | Arrived / 256 | Post-arrival held frames | Ever lost hold | Stopped-away frames | Crash |
+|---|---|---|---|---|---|
+| Previous non-exploration | 30 | 94.7% | 6.7% | 26.9% | 38.7% |
+| Exploration | 12 | 60.2% | 58.3% | 7.9% | 35.5% |
+| New hold | 15 | 49.1% | 73.3% | 37.8% | 21.1% |
+
+This retrain is **not a navigation or stopping improvement over the previous non-exploration policy**. It crashes less but stops away from the target more, and its post-arrival holding is worse. The small success increase over exploration is not evidence of a reliable fix. Hidden/far navigation remains poor, and these held-out cohorts still contain no skyscraper targets. Keep the previous non-exploration policy as the comparison baseline; retain this run's validation-selected `best.pt` for experimenting, not promotion.
+
+The standalone standard test and separate paired invocation differed by one successful episode per GPS mode; the table reports the paired invocation. Do not infer a precise improvement from differences of a few episodes.
+
+Verification: native CUDA build; 23 passing scene/state host tests (2 additional scene tests ignored); 34 existing Python tests and two task-transfer regressions; real 2,048-transition visual PPO collect/update with finite losses; 64 native hover episodes all timed out at step 450 with the failure penalty. The live trial was opened in a browser and its checkpoint/3-second criterion labels visually checked.
+
 ## Bounded exploration experiment (ABI v5)
 
 `runs/drone7-mean-explore-seed0` (historical ABI v5): fresh seed-0 camera policy, TensorRT FP16 `mean` encoder, 128 envs, reference-goal refresh every 30 steps, unchanged 8–30 m training starts and adaptive curriculum. The removed novelty reward paid +0.05 per newly observed tile after the initial view, capped at +2 per episode. Completed 2,007,040 steps in 1452 s (24.2 min including initialization, validation and standard test). Standard validation GPS success at 0.5M / 1M / 1.5M / 2M was 0.8% / 10.2% / 8.6% / 3.1%; `best.pt` is the 1,007,616-step checkpoint, while the predeclared 2M cohort comparison uses `last.pt`. Standard fixed-goal test success of `best.pt` was 7.4%.
