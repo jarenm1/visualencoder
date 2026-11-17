@@ -1,18 +1,28 @@
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; background: #1c1c1c; color: #bdbdbd; font: 13px/1.4 system-ui, sans-serif; }
 main { min-height: 100%; display: flex; flex-direction: column; justify-content: center; gap: 12px; padding: 24px; max-width: 1200px; margin: 0 auto; }
-.views { display: flex; gap: 12px; align-items: flex-start; }
-.camera { position: relative; flex: 4 1 0; aspect-ratio: 4 / 3; background: #111; }
+.views { display: grid; grid-template-columns: minmax(0, 4fr) minmax(0, 3fr); gap: 12px; align-items: start; }
+.camera { position: relative; min-width: 0; width: 100%; aspect-ratio: 4 / 3; background: #111; }
 .camera img, .camera canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 #overlay { cursor: crosshair; }
-#map { flex: 3 1 0; width: 100%; aspect-ratio: 1; background: #151515; }
-.controls { display: flex; align-items: center; gap: 6px; }
+#map { min-width: 0; width: 100%; height: auto; aspect-ratio: 1; background: #151515; }
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 button { width: 32px; height: 32px; padding: 7px; border: 0; border-radius: 4px; background: transparent; color: #bdbdbd; cursor: pointer; flex: none; }
 button:hover { background: #2c2c2c; color: #e6e6e6; }
 svg { width: 100%; height: 100%; display: block; fill: currentColor; }
 #goal { width: 43px; height: 32px; border-radius: 4px; object-fit: cover; flex: none; background: #111; }
-#instruct { flex: 1; display: flex; }
+#instruct { flex: 1; min-width: 120px; display: flex; }
 #instruct[hidden] { display: none; }
-#instruction { flex: 1; height: 32px; padding: 0 10px; border: 1px solid #333; border-radius: 4px; background: #151515; color: #d6d6d6; font: inherit; }
+#instruction { flex: 1; min-width: 0; width: 100%; height: 32px; padding: 0 10px; border: 1px solid #333; border-radius: 4px; background: #151515; color: #d6d6d6; font: inherit; }
 #instruction::placeholder { color: #6a6a6a; }
-#status { flex: 2; color: #8f8f8f; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+#status { font-variant-numeric: tabular-nums; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; color: #999; font-size: 12px; }
+.truth-key { color: #eee; }
+.policy-key { color: #ff7777; }
+.diagnostics { display: grid; gap: 4px; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+#checkpoint-detail { color: #888; font-size: 12px; }
+@media (max-width: 700px) {
+  main { padding: 12px; justify-content: flex-start; }
+  .views { grid-template-columns: minmax(0, 1fr); }
+  #map { width: 100%; max-height: 280px; object-fit: contain; }
+}

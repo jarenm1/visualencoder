@@ -59,6 +59,7 @@ class Pilot:
     def __init__(self, args):
         saved = load_checkpoint(args.checkpoint)
         meta = saved["metadata"]
+        self.checkpoint = {"path": str(args.checkpoint), "steps": meta["steps"], "live_goal_refresh": False}
         self.device = torch.device("cuda:0")
         self.features = FrozenFeatures(meta["encoder"], self.device, precision_of(meta["preprocessing"]))
         self.env = CudaEnv(DEFAULT_LIBRARY, 1, args.seed, meta["width"], meta["height"], TEST_STYLE, meta["control_mode"])
@@ -70,6 +71,8 @@ class Pilot:
         self.objects = {"index": np.array(targets), "center": (lo + hi) / 2, "half": (hi - lo) / 2,
                         "class": [layout["objects"][i]["class"] for i in targets],
                         "asset": [layout["objects"][i]["asset"] for i in targets]}
+        self.object_info = {i: {"asset": layout["objects"][i]["asset"],
+                                "object_index": i} for i in targets}
         district = self.env.metadata["district"]
         # Free flight spans the whole city; the held-out district (where episodes start) is outlined.
         self.map = {"district": [*district["min"], *district["max"]],
@@ -86,6 +89,7 @@ class Pilot:
         self.frame, self.goal_image, self.frame_id = b"", b"", 0
         self.status = {"message": "starting"}
         self.paused, self.error, self.last_outcome = False, None, None
+        self.goal_revision = 0
         # Kept alive while native reads it on the stream (retarget is asynchronous).
         self.retarget = None
         with self.env.execution():
@@ -111,12 +115,18 @@ class Pilot:
         crop = crop_goals(self.env.goal_views[:1], self.env.goal_crops[:1])
         self.set_goal(crop, "catalog goal", scored=True)
 
-    def set_goal(self, crop, source, scored, box=None):
+    def set_goal(self, crop, source, scored, box=None, match_iou=None):
         self.goal = self.features.goal_embedding(crop)
         self.starts.fill_(1)
+        self.goal_revision += 1
+        self.goal_started = time.monotonic()
+        d = self.env.diagnostics[0].cpu().numpy()
+        distance = float(np.linalg.norm(np.maximum(np.abs(d[:3] - d[3:6]) - d[24:27], 0)))
         with self.lock:
             self.goal_image = jpeg(crop[0])
-            self.goal_info = {"source": source, "scored": scored, "box": box}
+            self.goal_info = {"source": source, "scored": scored, "box": box,
+                              "revision": self.goal_revision, "match_iou": match_iou,
+                              "distance_at_selection_m": round(distance, 2) if scored else None}
 
     def box_goal(self, box, source):
         """Crop the current frame at a normalized box; retarget to the city object it frames."""
@@ -135,7 +145,7 @@ class Pilot:
             self.retarget = torch.tensor([row], device=self.device, dtype=torch.float32)
             self.env.retarget(self.retarget)
         label = f"{source}: {self.objects['asset'][best]}" if matched else f"{source}: no city object matched"
-        self.set_goal(crop, label, scored=bool(matched), box=box)
+        self.set_goal(crop, label, scored=bool(matched), box=box, match_iou=round(float(overlap[best]), 3))
 
     def instruct(self, text):
         if self.gemma is None:
@@ -189,15 +199,23 @@ class Pilot:
             outcome = "success"   # free flight: reported once, the drone keeps holding there
         if bool(self.env.done[0] > 0.5):
             outcome = "collision" if bool(self.env.collision[0] > 0.5) else "left the city"
-            # Native autoreset already started the next held-out episode; adopt its catalog goal.
-            self.catalog_goal()
         self.publish(frame, privileged, diagnostics, peak, in_view, outcome, action[0].tolist())
+        if bool(self.env.done[0] > 0.5):
+            # Publish the pre-action frame with its own goal before adopting the reset episode.
+            self.catalog_goal()
 
     def publish(self, frame, privileged, diagnostics, peak, in_view, outcome, action=None):
         p, c, h = diagnostics[0:3], diagnostics[3:6], diagnostics[24:27]
         distance = float(np.linalg.norm(np.maximum(np.abs(p - c) - h, 0)))
         q = diagnostics[6:10]
         forward = np.array([2 * (q[0] * q[2] + q[3] * q[1]), 0.0, 1 - 2 * (q[0] ** 2 + q[1] ** 2)]) * -1
+        visible = bool(privileged[14] > 0.5)
+        rows, columns = self.env.height // 16, self.env.width // 16
+        px = 2 * (peak % columns + 0.5) / columns - 1
+        py = 1 - 2 * (peak // columns + 0.5) / rows
+        x0, y0, x1, y1 = privileged[25:29]
+        on_target = (bool(x0 <= px <= x1 and y0 <= py <= y1)
+                     if self.goal_info["scored"] and visible and in_view > 0.5 else None)
         with self.lock:
             self.frame, self.frame_id = frame, self.frame_id + 1
             if outcome is not None:
@@ -206,14 +224,18 @@ class Pilot:
                 "frame": self.frame_id, "paused": self.paused, "error": self.error,
                 "position": p.round(2).tolist(), "heading": [float(forward[0]), float(forward[2])],
                 "target": {"center": c.round(2).tolist(), "half": h.round(2).tolist(),
-                           "class": self.env.layout_classes[int(diagnostics[14])], "visible": bool(privileged[14] > 0.5),
+                           **self.object_info[int(diagnostics[27])],
+                           "class": self.env.layout_classes[int(diagnostics[14])], "visible": visible,
+                           "in_frustum": bool(privileged[20] > 0.5),
                            "box": privileged[25:29].round(3).tolist()},
                 "distance_m": round(distance, 2), "speed_mps": round(float(np.linalg.norm(diagnostics[10:13])), 2),
                 "altitude_m": round(float(p[1]), 2), "hold": round(float(privileged[24]), 2),
                 "clock_s": round(float(diagnostics[17]) / self.env.control_hz, 1),
-                "saliency": {"peak": peak, "in_view": round(in_view, 3), "grid": [self.env.height // 16, self.env.width // 16]},
+                "saliency": {"peak": peak, "in_view": round(in_view, 3),
+                             "grid": [rows, columns], "on_target": on_target},
                 "action": None if action is None else [round(a, 2) for a in action],
-                "goal": self.goal_info, "last_outcome": self.last_outcome,
+                "goal": {**self.goal_info, "age_s": round(time.monotonic() - self.goal_started, 1)},
+                "checkpoint": self.checkpoint, "last_outcome": self.last_outcome,
                 "gemma": self.gemma is not None,
             }
 

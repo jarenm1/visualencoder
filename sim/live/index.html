@@ -24,8 +24,19 @@
       <form id="instruct" hidden>
         <input id="instruction" type="text" maxlength="300" autocomplete="off" placeholder="Fly to the red car" aria-label="Instruction">
       </form>
-      <span id="status" aria-live="polite"></span>
     </div>
+    <div class="legend">
+      <span class="truth-key">White: simulator ground truth</span>
+      <span class="policy-key">Red: policy's predicted patch</span>
+      <span>Thumbnail: actual goal crop · Blue on map: drone</span>
+    </div>
+    <section class="diagnostics" aria-label="Target diagnostics">
+      <div id="goal-detail"></div>
+      <div id="target-detail"></div>
+      <div id="perception-detail"></div>
+      <div id="status" aria-live="polite"></div>
+      <div id="checkpoint-detail"></div>
+    </section>
   </main>
 </body>
 </html>

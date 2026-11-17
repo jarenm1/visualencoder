@@ -48,12 +48,20 @@ function drawOverlay() {
       ctx.strokeStyle = "rgba(255,70,70,0.95)";
       ctx.lineWidth = 2;
       ctx.strokeRect((peak % columns) * w / columns, Math.floor(peak / columns) * h / rows, w / columns, h / rows);
+      ctx.fillStyle = "rgba(255,100,100,0.95)";
+      ctx.font = "12px system-ui";
+      ctx.fillText("policy", Math.min(w - 42, (peak % columns) * w / columns),
+                   Math.max(12, Math.floor(peak / columns) * h / rows - 4));
     }
-    if (state.target.visible) {
+    if (state.target.visible && state.goal.scored) {
       const [bx0, by0, bx1, by1] = state.target.box;
-      ctx.strokeStyle = state.goal && state.goal.scored ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.35)";
+      ctx.strokeStyle = "rgba(255,255,255,0.9)";
       ctx.lineWidth = 1.5;
       ctx.strokeRect((bx0 + 1) / 2 * w, (1 - by1) / 2 * h, (bx1 - bx0) / 2 * w, (by1 - by0) / 2 * h);
+      ctx.fillStyle = "#fff";
+      ctx.font = "12px system-ui";
+      ctx.fillText(`GT #${state.target.object_index}`, Math.max(0, (bx0 + 1) / 2 * w),
+                   Math.max(12, (1 - by1) / 2 * h - 4));
     }
   }
   if (drag) {
@@ -86,10 +94,10 @@ function drawMap() {
     mapCtx.fillRect(px(ox - hx), pz(oz - hz), 2 * hx * s, 2 * hz * s);
   }
   const t = state.target;
-  mapCtx.strokeStyle = "#e6e6e6";
+  mapCtx.strokeStyle = state.goal.scored ? "#e6e6e6" : "#555";
   mapCtx.lineWidth = 1.5;
   mapCtx.strokeRect(px(t.center[0] - t.half[0]), pz(t.center[2] - t.half[2]), 2 * t.half[0] * s, 2 * t.half[2] * s);
-  mapCtx.strokeStyle = "rgba(230,230,230,0.25)";
+  mapCtx.strokeStyle = state.goal.scored ? "rgba(230,230,230,0.25)" : "#333";
   mapCtx.beginPath();
   mapCtx.arc(px(t.center[0]), pz(t.center[2]), (Math.max(t.half[0], t.half[2]) + 6) * s, 0, 2 * Math.PI);
   mapCtx.stroke();
@@ -112,7 +120,7 @@ function drawMap() {
   mapCtx.stroke();
 }
 
-let goalSource = null;
+let goalRevision = null;
 async function poll() {
   try {
     const previous = state;
@@ -124,13 +132,32 @@ async function poll() {
     $("pause-icon").setAttribute("d", state.paused ? "M4 2.5v11L13 8z" : "M4 2.5h3v11H4zM9 2.5h3v11H9z");
     $("instruct").hidden = !state.gemma;
     const goal = state.goal || {};
-    if (goal.source !== goalSource) { goalSource = goal.source; $("goal").src = `/goal.jpg?${Date.now()}`; }
+    if (goal.revision !== goalRevision) {
+      goalRevision = goal.revision;
+      $("goal").src = `/goal.jpg?${goalRevision}`;
+    }
     $("goal").title = goal.source || "";
-    $("status").textContent = state.error
-      ? state.error
-      : `${goal.source}${goal.scored ? "" : " (unscored)"} · ${state.target.class} ${state.distance_m.toFixed(1)} m · ` +
-        `${state.speed_mps.toFixed(1)} m/s · alt ${state.altitude_m.toFixed(1)} m · hold ${Math.round(state.hold * 100)}% · ` +
-        `${state.clock_s.toFixed(1)} s` + (state.last_outcome ? ` · last: ${state.last_outcome}` : "");
+    const target = state.target, prediction = state.saliency;
+    const match = goal.match_iou == null ? "catalog reference" : `box match IoU ${goal.match_iou.toFixed(2)}`;
+    $("goal-detail").textContent = `Goal: ${goal.source} · ${match} · crop age ${goal.age_s.toFixed(1)} s`;
+    const dimensions = target.half.map((v) => (2 * v).toFixed(1)).join(" × ");
+    const visibility = target.visible ? "anchor visible" : target.in_frustum ? "anchor occluded" : "anchor outside view";
+    $("target-detail").textContent = `${goal.scored ? "Simulator GT" : "UNMATCHED GOAL — old, unrelated simulator target"}: ` +
+      `${target.asset} #${target.object_index} · ${target.class} · ${dimensions} m · ${visibility}`;
+    const agreement = prediction.on_target == null ? "not comparable" : prediction.on_target ? "on GT box" : "OFF GT box";
+    $("perception-detail").textContent = `Policy: P(target in view) ${Math.round(prediction.in_view * 100)}% · ` +
+      `predicted patch ${agreement} (patch-in-box check, not object identity)`;
+    const distance = goal.scored
+      ? `distance to box ${state.distance_m.toFixed(1)} m (selected at ${goal.distance_at_selection_m.toFixed(1)} m)`
+      : "goal distance/hold unavailable; no simulator match";
+    $("status").textContent = (state.error ? `${state.error} · ` : "") +
+      `${distance} · ${state.speed_mps.toFixed(1)} m/s · alt ${state.altitude_m.toFixed(1)} m` +
+      (goal.scored ? ` · hold ${state.hold >= 1 ? "complete" : `${Math.round(state.hold * 100)}%`}` : "") +
+      (state.last_outcome ? ` · last outcome: ${state.last_outcome}` : "");
+    const checkpoint = state.checkpoint;
+    $("checkpoint-detail").textContent = `${(checkpoint.steps / 1e6).toFixed(2)}M checkpoint · ` +
+      `fixed live goal (no automatic refresh) · ${checkpoint.path}`;
+    $("checkpoint-detail").textContent += " · success = within 6 m of box, <1 m/s, facing for 0.5 s";
     drawMap();
   } catch (_) { /* server restarting */ }
   setTimeout(poll, 100);
