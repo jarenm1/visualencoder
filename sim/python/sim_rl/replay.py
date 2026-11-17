@@ -14,7 +14,7 @@ from PIL import Image
 from .cli import (DEFAULT_LIBRARY, ROOT, TEST_SEED, TEST_STYLE, TRAIN_STYLE, VALIDATION_SEED,
                   VALIDATION_STYLE, build_policy, load_checkpoint, sha256, validate_checkpoint)
 from .curriculum import UNIFORM_WEIGHTS
-from .features import FrozenFeatures, crop_goals, precision_of
+from .features import FrozenFeatures, crop_goals, precision_of, square_goal_box
 from .model import deterministic_action, saliency_targets
 from .native import DEFAULT_CITY, PRIVILEGED_WIDTH, CudaEnv
 
@@ -103,7 +103,7 @@ def ground_goals(env, features, grounded):
         if entry["object"] is not None:
             targets[entry["env"]] = torch.tensor([*entry["center"], entry["object"], *entry["half"],
                                                   env.layout_classes.index(entry["object_class"])])
-    crops = crop_goals(env.obs.clone(), boxes)
+    crops = crop_goals(env.obs.clone(), square_goal_box(boxes))
     goals = features.goal_embedding(crops) if features.visual else None
     images = (crops.clamp(0, 1) * 255).round().to(torch.uint8).permute(0, 2, 3, 1)
     env.retarget(targets)

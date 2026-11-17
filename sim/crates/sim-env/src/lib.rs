@@ -459,7 +459,7 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, district: &drone::D
         "landing": {"max_speed_mps": dynamics::LANDING_SPEED, "max_tilt_rad": dynamics::LANDING_TILT_RAD},
         "ceiling_m": dynamics::CEILING,
         "reward": {
-            "terms": "(max(d_prev, 3) - max(d_box, 3)) - 0.01 - 0.02*|a - a_prev|^2/4 - 0.005*|w_b|^2/3.5^2 - 0.02*(w_yaw/1.5)^2 + 0.1*holding + 10*success - 10*crash - 5*oob",
+            "terms": "(max(d_prev, 3) - max(d_box, 3)) - 0.01 - 0.02*|a - a_prev|^2/4 - 0.005*|w_b|^2/3.5^2 - 0.02*(w_yaw/1.5)^2 + 0.1*near*clamp(1 - speed/3, 0, 1) + 10*success - 10*crash - 5*oob; near = within 6 m of the box and facing it",
             "done": "crash || oob || success || step >= horizon; no bootstrap",
         },
         "sensors": {

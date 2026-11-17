@@ -154,7 +154,11 @@ pub(crate) mod device {
     const RATE_COST: f32 = 0.005;
     /// Yaw spinning is the dominant failure of the v4 policy; it costs 0.02 per step at full rate.
     const YAW_COST: f32 = 0.02;
+    /// Per-step standoff bonus while within STANDOFF_MAX and facing the target, scaled from 1 at
+    /// rest to 0 at BRAKE_SPEED: a gradient toward stopping before the first full hold succeeds
+    /// (an all-or-nothing hold bonus left v5 policies circling targets at ~2.6 m/s).
     const HOLD_REWARD: f32 = 0.1;
+    const BRAKE_SPEED: f32 = 3.0;
     const SUCCESS_REWARD: f32 = 10.0;
     const CRASH_PENALTY: f32 = 10.0;
     const OOB_PENALTY: f32 = 5.0;
@@ -822,7 +826,8 @@ pub(crate) mod device {
         let oob = st.event & EVENT_OOB != 0;
         let (eye_off, cam_forward, cam_up) = camera_basis(body.rotation);
         let (_, _, facing) = unsafe { anchor_view(buffers, config, add(p, eye_off), cam_forward, cam_up, center, half) };
-        let holding = !crash && !oob && d <= STANDOFF_MAX && speed <= HOLD_SPEED && facing;
+        let near = !crash && !oob && d <= STANDOFF_MAX && facing;
+        let holding = near && speed <= HOLD_SPEED;
         st.hold = if holding { st.hold + 1 } else { 0 };
         let success = st.hold >= HOLD_STEPS;
         let done = crash || oob || success || st.step >= HORIZON;
@@ -839,8 +844,8 @@ pub(crate) mod device {
         let effective = maxf(d, STANDOFF_NEAR);
         let mut reward = (st.previous_distance - effective) - TIME_COST - SMOOTHNESS_COST * da2 / 4.0
             - RATE_COST * rate_sq / (MAX_RATES[0] * MAX_RATES[0]) - YAW_COST * yaw * yaw;
-        if holding {
-            reward += HOLD_REWARD;
+        if near {
+            reward += HOLD_REWARD * clampf(1.0 - speed / BRAKE_SPEED, 0.0, 1.0);
         }
         if success {
             reward += SUCCESS_REWARD;
@@ -996,6 +1001,8 @@ pub(crate) mod device {
         st.initial_distance = distance;
         st.previous_distance = maxf(distance, STANDOFF_NEAR);
         st.hold = 0;
+        // A new target is a new task from here: the episode clock restarts.
+        st.step = 0;
         unsafe {
             *buffers.states.add(i) = st;
             observe_env(buffers, config, i);

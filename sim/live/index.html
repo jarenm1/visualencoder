@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Live drone</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <div class="views">
+      <div class="camera">
+        <img id="stream" src="/stream" alt="Drone camera" width="640" height="480">
+        <canvas id="overlay" width="640" height="480" aria-label="Drag a box around an object to fly there"></canvas>
+      </div>
+      <canvas id="map" width="480" height="480" aria-label="Overhead map"></canvas>
+    </div>
+    <div class="controls">
+      <button id="pause" type="button" aria-label="Pause"><svg viewBox="0 0 16 16"><path id="pause-icon" d="M4 2.5h3v11H4zM9 2.5h3v11H9z"/></svg></button>
+      <button id="new" type="button" aria-label="New episode"><svg viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.5-3.5M13 2.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></button>
+      <button id="catalog" type="button" aria-label="Back to the episode's own goal"><svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="8" cy="8" r="1.8"/></svg></button>
+      <img id="goal" src="/goal.jpg" alt="Current goal crop" width="43" height="32">
+      <form id="instruct" hidden>
+        <input id="instruction" type="text" maxlength="300" autocomplete="off" placeholder="Fly to the red car" aria-label="Instruction">
+      </form>
+      <span id="status" aria-live="polite"></span>
+    </div>
+  </main>
+</body>
+</html>

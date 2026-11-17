@@ -38,6 +38,17 @@ def crop_goals(images, crops):
     return F.grid_sample(images, grid, mode="bilinear", padding_mode="border", align_corners=False)
 
 
+def square_goal_box(boxes, margin=0.15):
+    """Arbitrary normalized boxes [m,4] -> goal crops shaped like catalog goals: grown by ``margin``
+    per side, squared in normalized units (4:3 in pixels, so the resize keeps the aspect), and
+    shifted inside the frame. Operator drags and detector boxes go through this before cropping."""
+    x0, y0, x1, y1 = boxes.unbind(-1)
+    side = ((x1 - x0).maximum(y1 - y0) * (1 + 2 * margin)).clamp(0.05, 1.0)
+    left = ((x0 + x1 - side) / 2).clamp(min=0.0).minimum(1 - side)
+    top = ((y0 + y1 - side) / 2).clamp(min=0.0).minimum(1 - side)
+    return torch.stack((left, top, left + side, top + side), -1)
+
+
 class FrozenFeatures:
     """Visual arms own a frozen encoder; ``state`` and ``hint`` arms own none.
 
