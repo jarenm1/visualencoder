@@ -1,6 +1,7 @@
 """Goal-conditioned continuous actor-critic for the quadrotor visual-goal task."""
 from __future__ import annotations
 
+import functools
 import math
 
 import torch
@@ -19,8 +20,18 @@ HIDDEN = 256
 INITIAL_LOG_STD = -0.5
 # expected NDC (2), peak patch logit (1), P(in view) (1), pooled value, global projection
 VISUAL_WIDTH = 2 + 1 + 1 + VALUE + GLOBAL   # 196
-# Privileged lanes used by the auxiliary localization target.
-VISIBLE_LANE, NDC_LANES = 14, slice(18, 20)
+# Privileged lanes used by the auxiliary localization target: anchor visibility, anchor NDC,
+# and the target box's screen bounds [x_min, y_min, x_max, y_max] (NDC, y up).
+VISIBLE_LANE, NDC_LANES, BOX_LANES = 14, slice(18, 20), slice(25, 29)
+
+
+@functools.cache
+def patch_centres(grid_h, grid_w, device):
+    """Row-major patch-centre NDC [P, 2] (x right, y up; matches privileged lanes 18-19 and 25-28)."""
+    rows, columns = torch.meshgrid(torch.arange(grid_h, device=device), torch.arange(grid_w, device=device),
+                                   indexing="ij")
+    return torch.stack(((columns.reshape(-1) + 0.5) / grid_w * 2 - 1,
+                        1 - (rows.reshape(-1) + 0.5) / grid_h * 2), dim=-1).float()
 
 
 def _orthogonal(layer, gain):
@@ -58,11 +69,7 @@ class TargetSaliency(nn.Module):
                                     _orthogonal(nn.Linear(HIDDEN, 1), 0.01))
         self.value = _orthogonal(nn.Linear(token_dim, VALUE), math.sqrt(2))
         self.global_projection = _orthogonal(nn.Linear(7 * token_dim, GLOBAL), math.sqrt(2))
-        rows, columns = torch.meshgrid(torch.arange(grid_h), torch.arange(grid_w), indexing="ij")
-        # Row-major patch order; NDC x right, y up (matches privileged lanes 18-19).
-        ndc = torch.stack(((columns.reshape(-1) + 0.5) / grid_w * 2 - 1,
-                           1 - (rows.reshape(-1) + 0.5) / grid_h * 2), dim=-1)
-        self.register_buffer("ndc", ndc.float(), persistent=False)
+        self.register_buffer("ndc", patch_centres(grid_h, grid_w, torch.device("cpu")).clone(), persistent=False)
 
     def forward(self, goal, cls, tokens):
         """goal [n, G], cls [n, D], tokens [n, P, D] -> (features [n, 196], logits [n, P+1])."""
@@ -83,26 +90,39 @@ class TargetSaliency(nn.Module):
 
 
 def saliency_targets(privileged, grid_h, grid_w):
-    """Class per frame: the patch containing the visible target centre, else P (not in view)."""
+    """Soft target over P+1 classes per frame: uniform over the patches on the visible target (centre
+    inside the box projection, plus the anchor patch), else all mass on P (not in view).
+    Returns (target [N, P+1], visible [N] bool, on_target [N, P] bool)."""
     visible = privileged[..., VISIBLE_LANE] > 0.5
+    centres = patch_centres(grid_h, grid_w, privileged.device)
+    box = privileged[..., BOX_LANES]
+    x, y = centres[:, 0], centres[:, 1]
+    inside = ((x >= box[:, 0:1]) & (x <= box[:, 2:3]) & (y >= box[:, 1:2]) & (y <= box[:, 3:4]))
     column = ((privileged[..., 18] + 1) / 2 * grid_w).floor().clamp(0, grid_w - 1)
     row = ((1 - privileged[..., 19]) / 2 * grid_h).floor().clamp(0, grid_h - 1)
-    patch = (row * grid_w + column).long()
-    return torch.where(visible, patch, torch.full_like(patch, grid_h * grid_w)), visible
+    anchor = F.one_hot((row * grid_w + column).long(), grid_h * grid_w).bool()
+    on_target = (inside | anchor) & visible.unsqueeze(-1)
+    mass = on_target.float() / on_target.sum(-1, keepdim=True).clamp_min(1)
+    return torch.cat((mass, (~visible).float().unsqueeze(-1)), dim=-1), visible, on_target
 
 
 def saliency_loss(logits, privileged, grid_h, grid_w):
-    """Cross-entropy over P+1 classes, and exact-patch accuracy on visible frames (detached)."""
-    target, visible = saliency_targets(privileged, grid_h, grid_w)
-    loss = F.cross_entropy(logits, target)
+    """Soft cross-entropy over P+1 classes, and the fraction of visible frames whose peak patch
+    lies on the target (detached)."""
+    target, visible, on_target = saliency_targets(privileged, grid_h, grid_w)
+    loss = -(target * logits.log_softmax(-1)).sum(-1).mean()
     with torch.no_grad():
-        hits = (logits[:, :-1].argmax(-1) == target).float() * visible.float()
-        accuracy = hits.sum() / visible.float().sum().clamp_min(1.0)
+        hits = on_target.gather(1, logits[:, :-1].argmax(-1, keepdim=True)).squeeze(-1) & visible
+        accuracy = hits.float().sum() / visible.float().sum().clamp_min(1.0)
     return loss, accuracy
 
 
 class ActorCritic(nn.Module):
-    """Gaussian actor (GRU) over one of three information modes, plus a privileged critic.
+    """Tanh-squashed Gaussian actor (GRU) over one of three information modes, plus a privileged critic.
+
+    The Gaussian lives in pre-squash space; commands are tanh(raw) so they stay in [-1, 1] without
+    clipping. (Clipping an unbounded mean removed the gradient once the mean left the box, which
+    left the v4 policy pinned at full yaw rate.)
 
     visual: target saliency over frozen tokens + proprioception (+ saliency auxiliary loss).
     state:  privileged + proprioception (no vision).
@@ -163,6 +183,22 @@ def gaussian_log_prob(mean, log_std, actions):
     return (-0.5 * scaled.square() - log_std - 0.5 * LOG_TWO_PI).sum(-1)
 
 
-def gaussian_entropy(log_std):
-    """Entropy of the diagonal Gaussian (state-independent, so a scalar)."""
-    return (log_std + 0.5 * (1 + LOG_TWO_PI)).sum()
+def squashed_log_prob(mean, log_std, raw):
+    """Log-density of action tanh(raw) when raw ~ N(mean, exp(log_std)); stable tanh Jacobian."""
+    jacobian = 2 * (math.log(2) - raw - F.softplus(-2 * raw))
+    return gaussian_log_prob(mean, log_std, raw) - jacobian.sum(-1)
+
+
+def squashed_entropy(mean, log_std):
+    """Reparameterized one-sample estimate of the tanh-Gaussian entropy, averaged over the batch.
+
+    Unlike the pre-squash Gaussian entropy it is bounded: widening the Gaussian past saturation
+    lowers it, so the bonus cannot drive the policy into bang-bang noise.
+    """
+    raw = mean + log_std.exp() * torch.randn_like(mean)
+    return -squashed_log_prob(mean, log_std, raw).mean()
+
+
+def deterministic_action(mean):
+    """Evaluation command: the squashed mean."""
+    return torch.tanh(mean)

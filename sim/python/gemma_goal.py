@@ -1,15 +1,18 @@
-"""Gemma 4 picks the drone's goal from an instruction; the frozen policy flies to it.
+"""Language goals by grounding: Gemma 4 boxes the instructed object in the drone's first frame.
 
-No training. Separate processes so Gemma and the simulator never share the GPU:
-  dump     render the held-out split's goal reference images             (sim shell)
-  pick     Gemma 4 chooses one reference image per scripted instruction  (any shell)
-  resolve  Gemma 4 chooses one reference image for --instruction TEXT    (any shell; used by the replay site)
-  fly      roll out the trained policy with Gemma's chosen goals          (sim shell)
+No training. The policy's goal is the crop of the start frame at Gemma's box, the same crop an
+operator tap would give; the env scores the city object that box matches. Separate processes
+so Gemma and the simulator never share the GPU:
 
-    nix develop path:sim --command .venv/bin/python sim/python/gemma_goal.py dump --out runs/gemma-goal
-    .venv/bin/python sim/python/gemma_goal.py pick --out runs/gemma-goal
-    nix develop path:sim --command .venv/bin/python sim/python/gemma_goal.py fly --out runs/gemma-goal \
-        --checkpoint runs/drone4-mean-seed0/best.pt
+  frames  reset a held-out batch and save each env's first-person start frame   (sim shell)
+  ground  Gemma 4 boxes the instructed object in each frame and the box is
+          matched to the city object whose projected bounding box overlaps it most   (sim shell)
+
+then `sim/python/replay.py --goal-boxes DIR/boxes.json` flies and records those episodes.
+
+    nix develop path:sim --command .venv/bin/python sim/python/gemma_goal.py frames --out runs/gemma-ground
+    nix develop path:sim --command .venv/bin/python sim/python/gemma_goal.py ground --out runs/gemma-ground \
+        --instruction "fly to the tallest building"
 """
 from __future__ import annotations
 
@@ -20,43 +23,87 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "sim/python"), str(ROOT / "src")]
 
-# sim-scene PALETTE order; odd variants carry a checker pattern.
-COLORS = ["red", "blue", "yellow", "green", "white", "purple", "orange", "teal"]
-SHAPE_ANALOGY = {"sphere": "a ball", "cube": "a box", "cylinder": "a can", "cone": "a traffic cone",
-                 "octahedron": "a diamond", "torus": "a donut"}
+# A box counts as a city object when their image boxes overlap at least this much.
+MATCH_IOU = 0.3
+INSTRUCTION_LIMIT = 300
 
 
-def describe(name):
-    shape, variant = name.rsplit("-", 1)
-    variant = int(variant)
-    pattern = "checkered " if variant % 2 == 1 else ""
-    color = COLORS[variant]
-    return {
-        "full": f"Fly to the {pattern}{color} {shape}.",
-        "color": f"Go to the {color} one.",
-        "riddle": f"Find the {pattern}{color} object that is shaped like {SHAPE_ANALOGY[shape]}.",
-    }
+def rotate(q, v):
+    """Rotate vectors v [..., 3] by unit quaternions q [..., 4] (xyzw)."""
+    u, w = q[..., :3], q[..., 3:]
+    t = 2 * np.cross(u, v)
+    return v + w * t + np.cross(u, t)
 
 
-def dump(args):
-    from sim_rl.cli import TEST_SEED, TEST_STYLE
+def start_camera(diagnostics, metadata):
+    """Eye, forward, up of each env's body camera from diagnostics (position 0-2, quaternion 6-9)."""
+    camera = metadata["camera"]
+    tilt = camera["uptilt_rad"]
+    q = diagnostics[:, 6:10]
+    forward = rotate(q, np.array([0.0, np.sin(tilt), -np.cos(tilt)]))
+    up = rotate(q, np.array([0.0, np.cos(tilt), np.sin(tilt)]))
+    eye = diagnostics[:, 0:3] + rotate(q, np.array(camera["offset_body_m"]))
+    return eye, forward, up
+
+
+def project_boxes(eye, forward, up, centers, halves, camera):
+    """Normalized image boxes [k, 4] (x0, y0, x1, y1, top-left origin) of world AABBs seen from one
+    camera; NaN rows for boxes with a corner behind the near plane or wholly outside the frame."""
+    right = np.cross(forward, up)
+    half_tan = np.tan(camera["vertical_fov_rad"] / 2)
+    signs = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)], dtype=float)
+    corners = centers[:, None] + signs[None] * halves[:, None]
+    d = corners - eye
+    depth = d @ forward
+    x = (d @ right) / (depth * half_tan * camera["aspect"])
+    y = (d @ up) / (depth * half_tan)
+    u, v = 0.5 * (x + 1), 0.5 * (1 - y)
+    boxes = np.stack((u.min(1), v.min(1), u.max(1), v.max(1)), -1)
+    valid = (depth > camera["near_m"]).all(1) & (boxes[:, 2] > 0) & (boxes[:, 0] < 1) & (boxes[:, 3] > 0) & (boxes[:, 1] < 1)
+    boxes = boxes.clip(0, 1)
+    boxes[~valid] = np.nan
+    return boxes
+
+
+def iou(box, boxes):
+    x0, y0 = np.maximum(box[0], boxes[:, 0]), np.maximum(box[1], boxes[:, 1])
+    x1, y1 = np.minimum(box[2], boxes[:, 2]), np.minimum(box[3], boxes[:, 3])
+    inter = np.clip(x1 - x0, 0, None) * np.clip(y1 - y0, 0, None)
+    area = lambda b: (b[..., 2] - b[..., 0]) * (b[..., 3] - b[..., 1])
+    return np.nan_to_num(inter / (area(box) + area(boxes) - inter + 1e-9), nan=0.0)
+
+
+def frames(args):
+    """Save start frames and cameras of a fresh held-out batch (same seed/envs replay later)."""
+    from sim_rl.cli import DEFAULT_LIBRARY, TEST_SEED, TEST_STYLE
+    from sim_rl.curriculum import UNIFORM_WEIGHTS
     from sim_rl.native import CudaEnv
     args.out.mkdir(parents=True, exist_ok=True)
-    with CudaEnv(ROOT / ".sim-target/training/libsim_env.so", 1, TEST_SEED, 320, 240, TEST_STYLE, "velocity") as env:
-        with env.execution():
-            images = (env.goal_images.clamp(0, 1) * 255).round().to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
-        names = [d["name"] for d in env.metadata["designs"]]
+    seed = TEST_SEED if args.seed is None else args.seed
+    with CudaEnv(DEFAULT_LIBRARY, args.num_envs, seed, 320, 240, TEST_STYLE, "velocity") as env, env.execution():
+        env.write_curriculum(torch.tensor(UNIFORM_WEIGHTS + (0.0, args.appearance), device=env.device))
+        env.reset(seed)
+        images = (env.obs.clamp(0, 1) * 255).round().to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
+        diagnostics = env.diagnostics.cpu().numpy().astype(float)
+        metadata, layout = env.metadata, json.loads((env.city_path / "layout.json").read_text())
+    eye, forward, up = start_camera(diagnostics, metadata)
     for index, image in enumerate(images):
-        Image.fromarray(image).save(args.out / f"goal-{index}.png")
-    (args.out / "designs.json").write_text(json.dumps(
-        [{"index": i, "name": n, "instructions": describe(n)} for i, n in enumerate(names)], indent=2) + "\n")
-    print(f"wrote {len(names)} goal images and instructions to {args.out}")
+        Image.fromarray(image).save(args.out / f"frame-{index:03d}.png")
+    targets = [i for i, o in enumerate(layout["objects"]) if o["class"] in metadata["target_classes"]]
+    record = {"seed": seed, "num_envs": args.num_envs, "split": "test", "appearance": args.appearance,
+              "camera": metadata["camera"], "targets": targets,
+              "envs": [{"env": i, "eye": eye[i].tolist(), "forward": forward[i].tolist(), "up": up[i].tolist(),
+                        "catalog": int(diagnostics[i, 16]), "object": int(diagnostics[i, 27])}
+                       for i in range(args.num_envs)]}
+    (args.out / "frames.json").write_text(json.dumps(record) + "\n")
+    print(f"wrote {args.num_envs} start frames (seed {seed}) to {args.out}")
 
 
 def load_gemma(model_id):
@@ -77,143 +124,77 @@ def load_gemma(model_id):
     return model.eval()
 
 
-def choose(model, processor, images, instruction, allow_none=False):
-    """Gemma picks one reference image for the instruction -> (index or None, raw answer, seconds).
-
-    allow_none lets Gemma answer 0 when no option matches (free-text use); the scripted
-    experiment always names one of the options.
-    """
-    content = []
-    for option, image in enumerate(images, start=1):
-        content += [{"type": "text", "text": f"Option {option}:"}, {"type": "image", "image": image}]
-    decline = " If no option matches the instruction, answer 0." if allow_none else ""
-    content.append({"type": "text", "text":
-                    f"These are reference images of possible targets for a drone. Instruction: \"{instruction}\" "
-                    f"Which option is the target?{decline} Answer with only the option number."})
+def detect(model, processor, image, instruction):
+    """Gemma's box for the instructed object -> (normalized [x0, y0, x1, y1] or None, raw answer, seconds)."""
+    prompt = (f"A drone receives the instruction: \"{instruction}\". Find the object it should fly to in this "
+              "drone camera image. Output a JSON list with that one object as {\"box_2d\": [ymin, xmin, ymax, xmax] "
+              "normalized to 0-1000, \"label\": name}. Output [] if it is not visible.")
+    content = [{"type": "image", "image": image}, {"type": "text", "text": prompt}]
     inputs = processor.apply_chat_template([{"role": "user", "content": content}], tokenize=True, return_dict=True,
                                            return_tensors="pt", add_generation_prompt=True).to("cuda")
     start = time.monotonic()
     with torch.no_grad():
-        output = model.generate(**inputs, max_new_tokens=8, do_sample=False)
+        output = model.generate(**inputs, max_new_tokens=96, do_sample=False)
     latency = time.monotonic() - start
     text = processor.decode(output[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True).strip()
-    match = re.search(r"\d+", text)
-    chosen = int(match.group()) - 1 if match and 1 <= int(match.group()) <= len(images) else None
-    return chosen, text, latency
+    match = re.search(r"\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]", text)
+    if not match:
+        return None, text, latency
+    y0, x0, y1, x1 = (min(max(int(v) / 1000, 0.0), 1.0) for v in match.groups())
+    box = [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)]
+    return (box if box[2] - box[0] > 0.01 and box[3] - box[1] > 0.01 else None), text, latency
 
 
-def library(out):
-    designs = json.loads((out / "designs.json").read_text())
-    return designs, [Image.open(out / f"goal-{d['index']}.png").convert("RGB") for d in designs]
-
-
-def pick(args):
+def ground(args):
+    """Box the instructed object in every saved start frame and match each box to a city object."""
     from transformers import AutoProcessor
-    designs, images = library(args.out)
+    instruction = args.instruction.strip() if args.instruction else ""
+    if not 0 < len(instruction) <= INSTRUCTION_LIMIT:
+        raise SystemExit(f"instruction must be 1-{INSTRUCTION_LIMIT} characters")
+    record = json.loads((args.out / "frames.json").read_text())
+    layout = json.loads((ROOT / "assets/city/layout.json").read_text())["objects"]
+    targets = np.array(record["targets"])
+    lo = np.array([layout[i]["min"] for i in targets], dtype=float)
+    hi = np.array([layout[i]["max"] for i in targets], dtype=float)
+    centers, halves = (lo + hi) / 2, (hi - lo) / 2
     processor = AutoProcessor.from_pretrained(args.model)
     model = load_gemma(args.model)
-    picks, records = {}, []
-    for design in designs:
-        for style, instruction in design["instructions"].items():
-            chosen, text, latency = choose(model, processor, images, instruction)
-            picks.setdefault(style, {})[design["index"]] = chosen
-            records.append({"design": design["index"], "name": design["name"], "style": style,
-                            "instruction": instruction, "answer": text, "chosen": chosen,
-                            "correct": chosen == design["index"], "latency_s": round(latency, 3)})
-            print(json.dumps(records[-1]), flush=True)
-    accuracy = {style: sum(r["correct"] for r in records if r["style"] == style) / len(designs) for style in picks}
-    (args.out / "picks.json").write_text(json.dumps({"model": args.model, "accuracy": accuracy, "picks": picks,
-                                                     "records": records}, indent=2) + "\n")
-    print("accuracy", accuracy)
-
-
-def resolve(args):
-    """One free-text instruction -> one JSON line {design, name, answer, latency_s} on stdout."""
-    from transformers import AutoProcessor
-    if not args.instruction or len(args.instruction) > 300:
-        raise SystemExit("instruction must be 1-300 characters")
-    designs, images = library(args.out)
-    processor = AutoProcessor.from_pretrained(args.model)
-    chosen, text, latency = choose(load_gemma(args.model), processor, images, args.instruction, allow_none=True)
-    print(json.dumps({"instruction": args.instruction, "model": args.model, "design": chosen,
-                      "name": None if chosen is None else designs[chosen]["name"], "answer": text,
-                      "latency_s": round(latency, 3)}), flush=True)
-
-
-@torch.no_grad()
-def rollout(env, features, policy, goal_of, seed, weights):
-    from sim_rl.curriculum import UNIFORM_WEIGHTS  # noqa: F401  (weights passed explicitly)
-    env.write_curriculum(torch.tensor(weights, device=env.device, dtype=torch.float32))
-    env.reset(seed)
-    n = env.n
-    hidden = torch.zeros((n, policy.hidden_size), device=env.device)
-    starts = torch.ones(n, device=env.device)
-    finished = torch.zeros(n, dtype=torch.bool, device=env.device)
-    success = torch.zeros(n, device=env.device)
-    designs = torch.full((n,), -1, dtype=torch.long, device=env.device)
-    for _ in range(env.horizon):
-        designs = torch.where(finished | (designs >= 0), designs, env.design.long())
-        cls, tokens = features.observe(env)
-        inputs, _ = policy.actor_inputs_and_features(cls, tokens, goal_of(env.design.long()), env.proprio, env.privileged)
-        mean, hidden = policy.step(inputs, hidden, starts)
-        env.step(mean.clamp(-1, 1).contiguous())
-        newly = (env.done > 0.5) & ~finished
-        success = torch.where(newly, env.success, success)
-        finished |= newly
-        starts.copy_(env.done)
-    torch.cuda.synchronize()
-    return success.cpu().numpy(), designs.cpu().numpy()
-
-
-def fly(args):
-    from sim_rl.cli import TEST_SEED, TEST_STYLE, build_policy, load_checkpoint, validate_checkpoint
-    from sim_rl.curriculum import UNIFORM_WEIGHTS
-    from sim_rl.features import FrozenFeatures
-    from sim_rl.native import CudaEnv
-    from sim_rl.stats import wilson
-    chosen = json.loads((args.out / "picks.json").read_text())
-    saved = load_checkpoint(args.checkpoint)
-    meta = saved["metadata"]
-    features = FrozenFeatures(meta["encoder"], torch.device("cuda:0"))
-    results = {}
-    with CudaEnv(ROOT / ".sim-target/training/libsim_env.so", args.num_envs, TEST_SEED, meta["width"], meta["height"],
-                 TEST_STYLE, meta["control_mode"]) as env, env.execution():
-        validate_checkpoint(saved, env, features)
-        policy = build_policy(env, features)
-        policy.load_state_dict(saved["model"])
-        policy.eval()
-        table = features.goal_table(env.goal_images)
-        k = table.shape[0]
-        conditions = {"oracle_goal": torch.arange(k, device=env.device)}
-        for style, mapping in chosen["picks"].items():
-            # An unparseable answer gives no goal: zero vector, recorded as a miss.
-            conditions[f"gemma_{style}"] = torch.tensor([mapping[str(i)] if mapping[str(i)] is not None else -1
-                                                         for i in range(k)], device=env.device)
-        weights = UNIFORM_WEIGHTS + (0.0,)
-        for name, index in conditions.items():
-            def goal_of(design, index=index):
-                selected = index[design]
-                goals = table[selected.clamp_min(0)]
-                return torch.where((selected >= 0).unsqueeze(-1), goals, torch.zeros_like(goals))
-            success, _ = rollout(env, features, policy, goal_of, TEST_SEED, weights)
-            hits = int(success.sum())
-            results[name] = {"episodes": len(success), "success": hits / len(success),
-                             "success_wilson95": wilson(hits, len(success))}
-            print(name, json.dumps(results[name]), flush=True)
-    (args.out / "flight.json").write_text(json.dumps({"checkpoint": str(args.checkpoint), "pick_accuracy": chosen["accuracy"],
-                                                      "results": results}, indent=2) + "\n")
+    boxes = []
+    for env in record["envs"]:
+        image = Image.open(args.out / f"frame-{env['env']:03d}.png").convert("RGB")
+        box, answer, latency = detect(model, processor, image, instruction)
+        entry = {"env": env["env"], "box": box, "answer": answer, "latency_s": round(latency, 3), "object": None}
+        if box is not None:
+            projected = project_boxes(np.array(env["eye"]), np.array(env["forward"]), np.array(env["up"]),
+                                      centers, halves, record["camera"])
+            overlap = iou(np.array(box), projected)
+            best = int(overlap.argmax())
+            if overlap[best] >= MATCH_IOU:
+                index = int(targets[best])
+                entry.update(object=index, object_class=layout[index]["class"], asset=layout[index]["asset"],
+                             iou=round(float(overlap[best]), 3), center=centers[best].tolist(), half=halves[best].tolist())
+        boxes.append(entry)
+        print(json.dumps({k: entry[k] for k in ("env", "box", "object", "latency_s")}), flush=True)
+    found = sum(entry["box"] is not None for entry in boxes)
+    matched = sum(entry["object"] is not None for entry in boxes)
+    summary = {"instruction": instruction, "model": args.model, "seed": record["seed"], "num_envs": record["num_envs"],
+               "split": record["split"], "appearance": record["appearance"], "found": found, "matched": matched,
+               "match_iou": MATCH_IOU, "boxes": boxes}
+    (args.out / "boxes.json").write_text(json.dumps(summary, indent=1) + "\n")
+    print(json.dumps({"instruction": instruction, "found": found, "matched": matched}), flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("stage", choices=("dump", "pick", "resolve", "fly"))
+    parser.add_argument("stage", choices=("frames", "ground"))
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--model", default="google/gemma-4-E4B-it")
-    parser.add_argument("--checkpoint", type=Path, default=ROOT / "runs/drone4-mean-seed0/best.pt")
-    parser.add_argument("--num-envs", type=int, default=256)
-    parser.add_argument("--instruction", help="free-text goal for the resolve stage")
+    parser.add_argument("--num-envs", type=int, default=32)
+    parser.add_argument("--seed", type=int, help="held-out reset seed (default: the test seed)")
+    parser.add_argument("--appearance", type=float, default=1.0)
+    parser.add_argument("--instruction", help="free-text goal for the ground stage")
     args = parser.parse_args()
-    {"dump": dump, "pick": pick, "resolve": resolve, "fly": fly}[args.stage](args)
+    {"frames": frames, "ground": ground}[args.stage](args)
 
 
 if __name__ == "__main__":

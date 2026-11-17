@@ -60,6 +60,22 @@ pub unsafe extern "C" fn sim_env_step(handle: *mut c_void, actions: *const f32) 
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn sim_env_render_goals(handle: *mut c_void, first: u32) -> i32 {
+    boundary(-1, || {
+        unsafe { environment(handle)? }.render_goals(first)?;
+        Ok(0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sim_env_retarget(handle: *mut c_void, targets: *const f32) -> i32 {
+    boundary(-1, || {
+        unsafe { environment(handle)?.retarget(targets)?; }
+        Ok(0)
+    })
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn sim_env_buffer(handle: *mut c_void, field: i32) -> u64 {
     boundary(0, || unsafe { environment(handle)? }.buffer(field))
 }

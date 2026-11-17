@@ -1,4 +1,4 @@
-/* city-drone-goal-v1, C ABI v4.
+/* city-drone-goal-v2, C ABI v5.
  *
  * All tensor storage is CUDA device memory on the stream returned by
  * sim_env_stream(). Buffers are valid until sim_env_destroy(). Calls must be
@@ -14,7 +14,7 @@
 extern "C" {
 #endif
 
-#define SIM_ENV_ABI_VERSION 4
+#define SIM_ENV_ABI_VERSION 5
 
 /* Field identifiers for sim_env_buffer(). */
 enum sim_env_field {
@@ -28,28 +28,31 @@ enum sim_env_field {
     SIM_ENV_FIELD_DONE = 3,
     /* float32 [n]: 1 if the episode succeeded on this transition, else 0. */
     SIM_ENV_FIELD_SUCCESS = 4,
-    /* float32 [n, 21]: privileged state, for critics only (see metadata). */
+    /* float32 [n, 29]: privileged state, for critics only (see metadata). */
     SIM_ENV_FIELD_PRIVILEGED = 5,
     /* float32 [n]: 1 if the drone crashed (collision or hard landing), else 0. */
     SIM_ENV_FIELD_COLLISION = 6,
     /* uint64 [n]: current episode index per environment (after autoreset). */
     SIM_ENV_FIELD_EPISODES = 7,
-    /* float32 [n, 24]: diagnostics (see metadata "diagnostics"). */
+    /* float32 [n, 28]: diagnostics (see metadata "diagnostics"). */
     SIM_ENV_FIELD_DIAGNOSTICS = 8,
-    /* int32 [n]: split-local target design index of the current episode. */
-    SIM_ENV_FIELD_DESIGN = 9,
-    /* float32 [K, 3, H, W]: rendered goal image per target design (static). */
-    SIM_ENV_FIELD_GOAL = 10,
-    /* float32 [4]: [w_visible, w_partial, w_hidden, p_no_gps] sampling weights and
-     * per-episode GPS-outage probability; writable by the caller. */
-    SIM_ENV_FIELD_BUCKET_WEIGHTS = 11,
+    /* int32 [n]: catalog index of the current episode (row of a learner's goal table). */
+    SIM_ENV_FIELD_CATALOG_INDEX = 9,
+    /* float32 [n, 3, H, W]: goal reference views written by sim_env_render_goals(). */
+    SIM_ENV_FIELD_GOAL_VIEWS = 10,
+    /* float32 [5]: [w_visible, w_partial, w_hidden, p_no_gps, appearance] bucket sampling
+     * weights, per-episode GPS-outage probability and appearance randomization strength
+     * in [0, 1]; writable by the caller. */
+    SIM_ENV_FIELD_CURRICULUM = 11,
     /* float32 [n]: bucket of the episode ended on this transition (-1 if not done). */
     SIM_ENV_FIELD_BUCKET = 12,
     /* float32 [n]: 1 if the drone left the district or ceiling, else 0. */
     SIM_ENV_FIELD_OOB = 13,
     /* float32 [n]: 1 if GPS was available for the episode ended on this transition, else 0; -1 if not done. */
     SIM_ENV_FIELD_GPS_AVAILABLE = 14,
-    SIM_ENV_FIELD_COUNT = 15
+    /* float32 [n, 4]: normalized goal crops [x0, y0, x1, y1] written by sim_env_render_goals(). */
+    SIM_ENV_FIELD_GOAL_CROPS = 15,
+    SIM_ENV_FIELD_COUNT = 16
 };
 
 /* Creates an environment batch of n drones.
@@ -72,6 +75,17 @@ int sim_env_reset(void *env, uint64_t seed);
  * "action" (velocity: forward, right, up, yaw_rate; rates: thrust, roll_rate,
  * pitch_rate, yaw_rate). Caller must order producers before sim_env_stream(). */
 int sim_env_step(void *env, const float *actions);
+
+/* Renders the goal reference views of catalog entries first .. first + n - 1 (clamped to the
+ * last entry) into SIM_ENV_FIELD_GOAL_VIEWS and their crops into SIM_ENV_FIELD_GOAL_CROPS,
+ * then restores the current observation. Intended for one-time goal-table construction. */
+int sim_env_render_goals(void *env, uint32_t first);
+
+/* Replaces current-episode targets. targets: float32 [n, 8] on the environment stream, rows
+ * [centre x, y, z, layout object, half x, y, z, layout class]; rows with object < 0 keep the
+ * catalog target. Success, reward and privileged labels then refer to the given box until the
+ * episode ends (autoreset returns to catalog targets). Observations are refreshed. */
+int sim_env_retarget(void *env, const float *targets);
 
 /* Device pointer to field storage (see enum), or 0 on error. */
 uint64_t sim_env_buffer(void *env, int32_t field);

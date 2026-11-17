@@ -1,5 +1,10 @@
-//! GPU-resident city drone visual-goal environment (city-drone-goal-v1, ABI v4).
+//! GPU-resident city drone visual-goal environment (city-drone-goal-v2, ABI v5).
 //! See `sim_env.h` for the ABI. Build with cargo oxide and device-codegen-crate sim_physics,sim_env.
+//!
+//! Targets are placed objects of the imported city (buildings, vehicles, vegetation, props);
+//! nothing extra is rendered. The goal is a crop of a reference camera view of the object:
+//! `render_goals` renders catalog entries' reference views into the goal field so the
+//! learner can encode the whole catalog once.
 mod ffi;
 mod kernels;
 mod task;
@@ -9,30 +14,28 @@ use anyhow::{Result, ensure};
 use cuda_core::{CudaStream, DeviceBuffer, Function, launch_kernel_on_stream};
 use glam::{Mat4, Vec3};
 use sim_interop::{Exchange, Gpu, SharedBuffer};
-use sim_physics::{ImageShape, Physics};
-use sim_render::{Camera, Instance, Material, RenderBindings, RenderConfig, Renderer};
+use sim_render::{Camera, RenderBindings, RenderConfig, Renderer};
 use sim_scene::{CityScene, drone};
 use sim_state::BodyState;
 use sim_state::collision::{BvhNode, Triangle};
 use sim_state::drone as dynamics;
 use sim_state::drone::EpisodeSpec;
-use kernels::{Buffers, Config, EnvState};
+use kernels::{Buffers, Config, EnvState, ImageArgs};
 use task::*;
 
-/// Goal camera distance from the design origin (metres): a 0.7-1.0 m design
-/// fills roughly half the 75-degree frame, so encoder goal tokens describe the
-/// object rather than background.
-const GOAL_CAMERA_DISTANCE: f32 = 1.2;
 /// Fixed visibility and projection aspect (width / height).
 const CAMERA_ASPECT: f32 = 4.0 / 3.0;
-/// Goal camera view direction (before normalisation).
-const GOAL_CAMERA_DIRECTION: [f32; 3] = [0.7, 0.25, 0.7];
+/// Default curriculum lanes: uniform buckets, GPS always available, full appearance randomization.
+const DEFAULT_LANES: [f32; CURRICULUM_LANES] = [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 0.0, 1.0];
 
 struct TaskKernels {
     reset: Function,
     control: Function,
     finish: Function,
     observe: Function,
+    goal_view: Function,
+    appearance: Function,
+    retarget: Function,
 }
 
 impl TaskKernels {
@@ -44,30 +47,34 @@ impl TaskKernels {
             control: module.load_function(kernels::device::control_CUDA_SIGNATURE.entry)?,
             finish: module.load_function(kernels::device::finish_CUDA_SIGNATURE.entry)?,
             observe: module.load_function(kernels::device::observe_CUDA_SIGNATURE.entry)?,
+            goal_view: module.load_function(kernels::device::goal_view_CUDA_SIGNATURE.entry)?,
+            appearance: module.load_function(kernels::device::appearance_CUDA_SIGNATURE.entry)?,
+            retarget: module.load_function(kernels::device::retarget_CUDA_SIGNATURE.entry)?,
         })
     }
 
+    /// Per-env kernel; `extra` is the actions pointer (control) or the first catalog index (goal_view).
     unsafe fn launch(&self, function: &Function, stream: &CudaStream,
-        mut buffers: Buffers, mut config: Config, actions: Option<*const f32>) -> Result<()> {
-        let mut actions = actions.unwrap_or(std::ptr::null());
+        mut buffers: Buffers, mut config: Config, extra: Option<*mut c_void>) -> Result<()> {
         let mut args = [
             (&raw mut buffers).cast::<c_void>(),
             (&raw mut config).cast::<c_void>(),
-            (&raw mut actions).cast::<c_void>(),
+            extra.unwrap_or(std::ptr::null_mut()),
         ];
-        let count = if actions.is_null() { 2 } else { 3 };
+        let count = if extra.is_some() { 3 } else { 2 };
         unsafe {
             launch_kernel_on_stream(function, (config.n.div_ceil(256), 1, 1),
                 (256, 1, 1), 0, stream, &mut args[..count])?;
         }
         Ok(())
     }
-}
 
-/// Target design metadata kept on the host after the meshes move to the renderer.
-struct DesignMeta {
-    name: String,
-    scale: f32,
+    unsafe fn launch_appearance(&self, stream: &CudaStream, mut args: ImageArgs) -> Result<()> {
+        let blocks = args.pixels.div_ceil(256);
+        let mut pointers = [(&raw mut args).cast::<c_void>()];
+        unsafe { launch_kernel_on_stream(&self.appearance, (blocks, 1, 1), (256, 1, 1), 0, stream, &mut pointers)? };
+        Ok(())
+    }
 }
 
 /// Owns all device allocations for one batch. Calls must be serialized by the
@@ -78,7 +85,6 @@ pub struct Env {
     exchange: Exchange,
     renderer: Renderer,
     bindings: RenderBindings,
-    physics: Physics,
     kernels: TaskKernels,
     state: Arc<SharedBuffer>,
     cameras: Arc<SharedBuffer>,
@@ -88,9 +94,14 @@ pub struct Env {
     triangles: DeviceBuffer<u8>,
     catalog: DeviceBuffer<u8>,
     exclusions: DeviceBuffer<u8>,
+    materials: DeviceBuffer<u8>,
+    keys: DeviceBuffer<u8>,
     outputs: [DeviceBuffer<u8>; FIELD_COUNT],
     config: Config,
-    shape: ImageShape,
+    width: u32,
+    height: u32,
+    mesh_count: u32,
+    frame: u32,
     metadata: CString,
     gpu: Arc<Gpu>,
 }
@@ -104,7 +115,8 @@ impl Env {
             "control_mode must be 0 (velocity) or 1 (rates), got {control_mode}");
         ensure!(u64::from(width) * 3 == u64::from(height) * 4,
             "image must be 4:3 (width * 3 == height * 4), got {width}x{height}");
-        let shape = ImageShape::new(width, height, n)?;
+        ensure!(width > 0 && u64::from(width) * u64::from(height) * u64::from(n) <= u64::from(u32::MAX),
+            "image batch exceeds the u32 pixel index");
         let city_path = city_path.canonicalize()?;
         let mut city = CityScene::load(&city_path)?;
         ensure!(!city.triangles.is_empty() && !city.nodes.is_empty(), "city collision geometry is empty");
@@ -115,77 +127,15 @@ impl Env {
         ensure!(catalog.episodes.len() == CATALOG_SIZE, "catalog size mismatch");
         let district = drone::district(style, city.half_extent);
 
-        let designs: Vec<_> = drone::target_designs().into_iter().filter(|d| d.split == style).collect();
-        ensure!(!designs.is_empty(), "no target designs for style {style}");
-        let mut design_meta = Vec::with_capacity(designs.len());
-        let mut design_meshes = Vec::with_capacity(designs.len());
-        let mut design_materials: Vec<Material> = Vec::with_capacity(designs.len());
-        for (k, d) in designs.into_iter().enumerate() {
-            ensure!(d.index as usize == k, "design index {} does not match split-local position {k}", d.index);
-            design_meta.push(DesignMeta { name: d.name, scale: d.scale });
-            design_materials.push(d.material);
-            design_meshes.push(d.mesh);
-        }
-        let k_designs = design_meta.len() as u32;
-        let shape_goal = ImageShape::new(width, height, k_designs)?;
-
         let gpu = Gpu::new(0)?;
-        let physics = Physics::load(gpu.cuda_context())?;
         let kernels = TaskKernels::load(&gpu)?;
         let device = gpu.device();
         let render_config = RenderConfig { width, height, ..Default::default() };
-
-        // Bodies: n drones, then n*K target slots (slot = n + i*K + k).
-        let body_count = u64::from(n) + u64::from(n) * u64::from(k_designs);
-        let state = SharedBuffer::new(gpu.clone(), body_count * size_of::<BodyState>() as u64,
-            wgpu::BufferUsages::STORAGE, "city drone and target bodies")?;
+        let state = SharedBuffer::new(gpu.clone(), u64::from(n) * size_of::<BodyState>() as u64,
+            wgpu::BufferUsages::STORAGE, "city drone bodies")?;
         let cameras = SharedBuffer::new(gpu.clone(), u64::from(n) * CAMERA_FLOATS as u64 * 4,
             wgpu::BufferUsages::STORAGE, "city drone cameras")?;
 
-        // Goal renderer: design k alone in camera k, static pose at the origin.
-        let goal_eye = Vec3::from(GOAL_CAMERA_DIRECTION).normalize() * GOAL_CAMERA_DISTANCE;
-        let goal_cameras: Vec<Camera> = (0..k_designs).map(|_| Camera {
-            eye: goal_eye,
-            target: Vec3::ZERO,
-            up: Vec3::Y,
-            vertical_fov_radians: dynamics::CAMERA_VFOV_RAD,
-            near: dynamics::CAMERA_NEAR,
-            far: dynamics::CAMERA_FAR,
-        }).collect();
-        let goal_instances: Vec<Instance> = design_meta.iter().enumerate().map(|(k, m)| {
-            let mut inst = Instance::static_mesh(k);
-            inst.scale = [m.scale; 3];
-            inst.material = design_materials[k];
-            inst.object_id = 1 + k as u32;
-            inst.camera = Some(k as u32);
-            inst
-        }).collect();
-        // SAFETY: the queue is used only for startup-owned texture uploads; it
-        // is not retained, no exchange buffers exist yet, and Gpu is not reentered.
-        let goal_renderer = unsafe { gpu.with_queue(|queue| Renderer::new(
-            device, queue, render_config, &design_meshes, &goal_instances, &goal_cameras))? };
-        let goal_rendered = SharedBuffer::new(gpu.clone(), goal_renderer.output_layout().total_bytes,
-            wgpu::BufferUsages::STORAGE, "city goal render output")?;
-        let goal_bindings = goal_renderer.bind(device, state.buffer(), goal_rendered.buffer(), None)?;
-
-        // Main renderer: city geometry, then design meshes; per-env target instances keyed by body.
-        let mut meshes = std::mem::take(&mut city.meshes);
-        let design_mesh_base = meshes.len();
-        meshes.extend(design_meshes);
-        let mut instances = std::mem::take(&mut city.instances);
-        let design_object_base = instances.iter().map(|i| i.object_id).max().unwrap_or(0) + 1;
-        instances.reserve(n as usize * k_designs as usize);
-        for i in 0..n {
-            for k in 0..k_designs {
-                let body = n + i * k_designs + k;
-                let mut inst = Instance::body(design_mesh_base + k as usize, body);
-                inst.scale = [design_meta[k as usize].scale; 3];
-                inst.material = design_materials[k as usize];
-                inst.object_id = design_object_base + k;
-                inst.camera = Some(i);
-                instances.push(inst);
-            }
-        }
         // Internal cameras are never bound: the CUDA-written camera buffer supplies every view.
         let internal_cameras: Vec<Camera> = (0..n).map(|_| Camera {
             eye: Vec3::ZERO,
@@ -195,17 +145,23 @@ impl Env {
             near: dynamics::CAMERA_NEAR,
             far: dynamics::CAMERA_FAR,
         }).collect();
-        // SAFETY: as above.
+        let meshes = std::mem::take(&mut city.meshes);
+        let instances = std::mem::take(&mut city.instances);
+        let mesh_count = meshes.len() as u32;
+        // SAFETY: the queue is used only for startup-owned texture uploads; it is not
+        // retained, no exchange buffers exist yet, and Gpu is not reentered.
         let renderer = unsafe { gpu.with_queue(|queue| Renderer::new(
             device, queue, render_config, &meshes, &instances, &internal_cameras))? };
         let rendered = SharedBuffer::new(gpu.clone(), renderer.output_layout().total_bytes,
             wgpu::BufferUsages::STORAGE, "city render output")?;
         let bindings = renderer.bind(device, state.buffer(), rendered.buffer(), Some(cameras.buffer()))?;
 
-        // Startup-only uploads of static geometry and the episode catalog.
-        let nodes = DeviceBuffer::from_host(gpu.cuda_stream(), bytemuck::cast_slice(&city.nodes))?;
-        let triangles = DeviceBuffer::from_host(gpu.cuda_stream(), bytemuck::cast_slice(&city.triangles))?;
-        let catalog_device = DeviceBuffer::from_host(gpu.cuda_stream(), bytemuck::cast_slice(&catalog.episodes))?;
+        // Startup-only uploads of static geometry, materials and the episode catalog.
+        let stream = gpu.cuda_stream();
+        let nodes = DeviceBuffer::from_host(stream, bytemuck::cast_slice(&city.nodes))?;
+        let triangles = DeviceBuffer::from_host(stream, bytemuck::cast_slice(&city.triangles))?;
+        let catalog_device = DeviceBuffer::from_host(stream, bytemuck::cast_slice(&catalog.episodes))?;
+        let materials = DeviceBuffer::from_host(stream, bytemuck::cast_slice(&city.mesh_materials))?;
         // Exclusions are read only up to exclusion_count; the single zero rectangle is never read when empty.
         let mut exclusion_rects: Vec<[f32; 4]> = district.exclusions.iter()
             .map(|&(lo, hi)| [lo[0], lo[1], hi[0], hi[1]]).collect();
@@ -213,19 +169,18 @@ impl Env {
         if exclusion_rects.is_empty() {
             exclusion_rects.push([0.0; 4]);
         }
-        let exclusions = DeviceBuffer::from_host(gpu.cuda_stream(), bytemuck::cast_slice(&exclusion_rects))?;
-        let weights_init = [1.0f32 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 0.0];
-        let weights = DeviceBuffer::from_host(gpu.cuda_stream(), bytemuck::cast_slice(&weights_init))?;
+        let exclusions = DeviceBuffer::from_host(stream, bytemuck::cast_slice(&exclusion_rects))?;
+        let lanes = DeviceBuffer::from_host(stream, bytemuck::cast_slice(&DEFAULT_LANES))?;
 
         let count = n as usize;
-        let states = unsafe {
-            DeviceBuffer::<u8>::uninitialized_async(gpu.cuda_stream(), count * size_of::<EnvState>())?
-        };
         let allocate = |bytes: usize| -> Result<DeviceBuffer<u8>> {
-            Ok(unsafe { DeviceBuffer::<u8>::uninitialized_async(gpu.cuda_stream(), bytes)? })
+            Ok(unsafe { DeviceBuffer::<u8>::uninitialized_async(stream, bytes)? })
         };
+        let rgb_bytes = count * 3 * height as usize * width as usize * 4;
+        let states = allocate(count * size_of::<EnvState>())?;
+        let keys = allocate(count * 4)?;
         let outputs: [DeviceBuffer<u8>; FIELD_COUNT] = [
-            allocate(shape.rgb_bytes())?,
+            allocate(rgb_bytes)?,
             allocate(count * SENSOR_DIM * 4)?,
             allocate(count * 4)?,
             allocate(count * 4)?,
@@ -235,33 +190,19 @@ impl Env {
             allocate(count * 8)?,
             allocate(count * DIAGNOSTIC_DIM * 4)?,
             allocate(count * 4)?,
-            allocate(shape_goal.rgb_bytes())?,
-            weights,
+            allocate(rgb_bytes)?,
+            lanes,
             allocate(count * 4)?,
             allocate(count * 4)?,
             allocate(count * 4)?,
+            allocate(count * 4 * 4)?,
         ];
 
-        let mut exchange = Exchange::new(gpu.clone(), vec![state.clone(), cameras.clone(),
-            rendered.clone(), goal_rendered.clone()])?;
-        let goal_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("city goal observation"),
-        });
-        let mut goal_encoder = goal_encoder;
-        goal_renderer.render(&mut goal_encoder, &goal_bindings);
-        unsafe {
-            exchange.cycle(goal_encoder, || {
-                physics.preprocess_rgba8(gpu.cuda_stream(), goal_rendered.device_ptr() as *const u8,
-                    outputs[10].cu_deviceptr() as *mut f32, shape_goal)?;
-                Ok(())
-            })?;
-        }
-
+        let exchange = Exchange::new(gpu.clone(), vec![state.clone(), cameras.clone(), rendered.clone()])?;
         let projection = Mat4::perspective_rh(dynamics::CAMERA_VFOV_RAD, CAMERA_ASPECT,
             dynamics::CAMERA_NEAR, dynamics::CAMERA_FAR).to_cols_array();
         let config = Config {
             n,
-            designs: k_designs,
             catalog_size: CATALOG_SIZE as u32,
             node_count: city.nodes.len() as u32,
             seed,
@@ -279,13 +220,11 @@ impl Env {
             projection_z: projection[10],
             projection_w: projection[14],
         };
-        let metadata = task_metadata(&city, &catalog, &design_meta, &district, &city_path, style, k_designs,
-            control_mode)?;
+        let metadata = task_metadata(&city, &catalog, &district, &city_path, style, control_mode)?;
         let mut env = Self {
             exchange,
             renderer,
             bindings,
-            physics,
             kernels,
             state,
             cameras,
@@ -295,9 +234,14 @@ impl Env {
             triangles,
             catalog: catalog_device,
             exclusions,
+            materials,
+            keys,
             outputs,
             config,
-            shape,
+            width,
+            height,
+            mesh_count,
+            frame: 0,
             metadata,
             gpu,
         };
@@ -327,24 +271,31 @@ impl Env {
             oob: self.outputs[13].cu_deviceptr() as *mut f32,
             bucket: self.outputs[12].cu_deviceptr() as *mut f32,
             episodes: self.outputs[7].cu_deviceptr() as *mut u64,
-            design: self.outputs[9].cu_deviceptr() as *mut i32,
+            catalog_index: self.outputs[9].cu_deviceptr() as *mut i32,
             gps_available: self.outputs[14].cu_deviceptr() as *mut f32,
+            crops: self.outputs[15].cu_deviceptr() as *mut f32,
+            keys: self.keys.cu_deviceptr() as *mut u32,
         }
+    }
+
+    /// Runs per-env kernels between Vulkan accesses: `run` receives the kernels, the CUDA
+    /// stream, buffer pointers and config while the exchange owns the shared buffers.
+    fn cycle(&mut self, label: &str, run: impl FnOnce(&TaskKernels, &CudaStream, Buffers, Config) -> Result<()>) -> Result<()> {
+        let buffers = self.buffers();
+        let config = self.config;
+        let encoder = self.gpu.device().create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+        let (kernels, gpu) = (&self.kernels, &self.gpu);
+        unsafe { self.exchange.cycle(encoder, || run(kernels, gpu.cuda_stream(), buffers, config))? };
+        Ok(())
     }
 
     /// Restarts every environment with `seed`; episode counters restart at 0.
     pub fn reset(&mut self, seed: u64) -> Result<()> {
         self.config.seed = seed;
-        let buffers = self.buffers();
-        let config = self.config;
-        let encoder = self.gpu.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("city reset ownership"),
-        });
-        unsafe {
-            self.exchange.cycle(encoder, || self.kernels.launch(&self.kernels.reset,
-                self.gpu.cuda_stream(), buffers, config, None))?;
-        }
-        self.render_observation()
+        self.cycle("city reset ownership", |kernels, stream, buffers, config| unsafe {
+            kernels.launch(&kernels.reset, stream, buffers, config, None)
+        })?;
+        self.render_into(0)
     }
 
     /// Steps all environments with `actions` (n * 4 float32 on stream()).
@@ -355,34 +306,68 @@ impl Env {
     /// callers must order any producer before the environment's CUDA stream.
     pub unsafe fn step(&mut self, actions: *const f32) -> Result<()> {
         ensure!(!actions.is_null(), "actions pointer must not be null");
-        let buffers = self.buffers();
-        let config = self.config;
-        let encoder = self.gpu.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("city control ownership"),
-        });
-        unsafe {
-            self.exchange.cycle(encoder, || {
-                let stream = self.gpu.cuda_stream();
-                self.kernels.launch(&self.kernels.control, stream, buffers, config, Some(actions))?;
-                self.kernels.launch(&self.kernels.finish, stream, buffers, config, None)?;
-                self.kernels.launch(&self.kernels.observe, stream, buffers, config, None)
-            })?;
-        }
-        self.render_observation()
+        let mut actions = actions;
+        self.cycle("city control ownership", |kernels, stream, buffers, config| unsafe {
+            kernels.launch(&kernels.control, stream, buffers, config, Some((&raw mut actions).cast()))?;
+            kernels.launch(&kernels.finish, stream, buffers, config, None)?;
+            kernels.launch(&kernels.observe, stream, buffers, config, None)
+        })?;
+        self.render_into(0)
     }
 
-    fn render_observation(&mut self) -> Result<()> {
+    /// Renders the goal reference views of catalog entries `first .. first + n` (clamped to the
+    /// last entry) into the goal field and their crop rectangles into the crop field, then
+    /// restores the current observation. Startup-time API: the learner encodes the catalog once.
+    pub fn render_goals(&mut self, first: u32) -> Result<()> {
+        ensure!(first < self.config.catalog_size, "first catalog index {first} out of range");
+        let mut first = first;
+        self.cycle("city goal views", |kernels, stream, buffers, config| unsafe {
+            kernels.launch(&kernels.goal_view, stream, buffers, config, Some((&raw mut first).cast()))
+        })?;
+        self.render_into(10)?;
+        self.cycle("city observation restore", |kernels, stream, buffers, config| unsafe {
+            kernels.launch(&kernels.observe, stream, buffers, config, None)
+        })?;
+        self.render_into(0)
+    }
+
+    /// Replaces current-episode targets: `targets` is a device pointer to n x 8 float32 rows
+    /// `[centre xyz, layout object (< 0 keeps the catalog target), half xyz, layout class]` on
+    /// stream(). Observations are refreshed; the next autoreset returns to catalog targets.
+    ///
+    /// # Safety
+    /// `targets` must hold n x 8 initialized floats that stay live until the stream completes.
+    pub unsafe fn retarget(&mut self, targets: *const f32) -> Result<()> {
+        ensure!(!targets.is_null(), "targets pointer must not be null");
+        let mut targets = targets;
+        self.cycle("city retarget", |kernels, stream, buffers, config| unsafe {
+            kernels.launch(&kernels.retarget, stream, buffers, config, Some((&raw mut targets).cast()))
+        })?;
+        self.render_into(0)
+    }
+
+    /// Renders every camera slot, then applies the randomized appearance into `field`
+    /// (0: observation, 10: goal views).
+    fn render_into(&mut self, field: usize) -> Result<()> {
         let mut encoder = self.gpu.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("city rendered observation"),
         });
         self.renderer.render(&mut encoder, &self.bindings);
+        self.frame = self.frame.wrapping_add(1);
+        let args = ImageArgs {
+            rendered: self.rendered.device_ptr() as *const u32,
+            output: self.outputs[field].cu_deviceptr() as *mut f32,
+            keys: self.keys.cu_deviceptr() as *const u32,
+            materials: self.materials.cu_deviceptr() as *const u32,
+            lanes: self.outputs[11].cu_deviceptr() as *const f32,
+            width: self.width,
+            height: self.height,
+            pixels: self.width * self.height * self.config.n,
+            mesh_count: self.mesh_count,
+            frame: self.frame,
+        };
         unsafe {
-            self.exchange.cycle(encoder, || {
-                self.physics.preprocess_rgba8(self.gpu.cuda_stream(),
-                    self.rendered.device_ptr() as *const u8,
-                    self.outputs[0].cu_deviceptr() as *mut f32, self.shape)?;
-                Ok(())
-            })?;
+            self.exchange.cycle(encoder, || self.kernels.launch_appearance(self.gpu.cuda_stream(), args))?;
         }
         Ok(())
     }
@@ -405,11 +390,8 @@ impl Drop for Env {
     }
 }
 
-fn task_metadata(city: &CityScene, catalog: &drone::Catalog, designs: &[DesignMeta],
-    district: &drone::District, city_path: &Path, style: u32, k_designs: u32, control_mode: u32) -> Result<CString> {
-    let designs_json: Vec<serde_json::Value> = designs.iter().enumerate()
-        .map(|(k, m)| serde_json::json!({"index": k, "name": m.name, "scale_m": m.scale}))
-        .collect();
+fn task_metadata(city: &CityScene, catalog: &drone::Catalog, district: &drone::District, city_path: &Path,
+    style: u32, control_mode: u32) -> Result<CString> {
     let exclusions: Vec<serde_json::Value> = district.exclusions.iter()
         .map(|(lo, hi)| serde_json::json!({"min": lo, "max": hi})).collect();
     const SPLIT_NAMES: [&str; 3] = ["train", "validation", "test"];
@@ -430,6 +412,9 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, designs: &[DesignMe
             "path": city_path.display().to_string(),
             "fingerprint": city.fingerprint,
             "half_extent_m": city.half_extent,
+            "classes": city.classes,
+            "objects": city.objects.len(),
+            "materials": city.material_count,
         },
         "action": {
             "dim": ACTION_DIM,
@@ -466,12 +451,15 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, designs: &[DesignMe
             "near_m": dynamics::CAMERA_NEAR,
             "far_m": dynamics::CAMERA_FAR,
         },
-        "success": {"radius": "target enclosing-sphere radius + margin, per episode", "margin_m": dynamics::SUCCESS_MARGIN,
-            "speed_mps": dynamics::SUCCESS_SPEED},
+        "success": {
+            "standoff_max_m": dynamics::STANDOFF_MAX, "hold_speed_mps": dynamics::HOLD_SPEED,
+            "hold_steps": dynamics::HOLD_STEPS,
+            "facing": "anchor (target-box point nearest the camera ray) inside the frustum, sight line clear to 2 cm before the box",
+        },
         "landing": {"max_speed_mps": dynamics::LANDING_SPEED, "max_tilt_rad": dynamics::LANDING_TILT_RAD},
         "ceiling_m": dynamics::CEILING,
         "reward": {
-            "terms": "(d_prev - d_now) - 0.01 - 0.02*|a - a_prev|^2/4 - 0.005*|w_b|^2/3.5^2 + 10*success - 10*crash - 5*oob",
+            "terms": "(max(d_prev, 3) - max(d_box, 3)) - 0.01 - 0.02*|a - a_prev|^2/4 - 0.005*|w_b|^2/3.5^2 - 0.02*(w_yaw/1.5)^2 + 0.1*holding + 10*success - 10*crash - 5*oob",
             "done": "crash || oob || success || step >= horizon; no bootstrap",
         },
         "sensors": {
@@ -482,28 +470,30 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, designs: &[DesignMe
                 "6-8 body velocity (+noise sd 0.1) / 5",
                 "9 height above landable surface (+noise sd 0.03) / 10",
                 "10-13 last applied action",
-                "14-16 noisy target offset in heading frame (x right, y up, z = -forward) / 32; 0 when GPS unavailable",
+                "14-16 noisy target-centre offset in heading frame (x right, y up, z = -forward) / 32; 0 when GPS unavailable",
                 "17 remaining horizon fraction", "18 gps_available (0/1)",
             ],
         },
         "privileged": {
             "dim": PRIVILEGED_DIM,
             "layout": [
-                "0-2 target in body frame / 32", "3 distance / 32", "4-6 world velocity / 5",
-                "7-9 body rates / 3.5", "10-13 quaternion xyzw", "14 target visible (0/1)",
-                "15-17 one-hot bucket", "18-19 target NDC x,y (0 outside frustum)", "20 target in frustum (0/1)",
+                "0-2 target centre in body frame / 32", "3 box distance / 32", "4-6 world velocity / 5",
+                "7-9 body rates / 3.5", "10-13 quaternion xyzw", "14 anchor visible (0/1)",
+                "15-17 one-hot bucket", "18-19 anchor NDC x,y (0 outside frustum)", "20 anchor in frustum (0/1)",
+                "21-23 target half extents / 32", "24 hold progress (steps / hold_steps)",
+                "25-28 target box projection [x_min, y_min, x_max, y_max] in NDC (y up) when the anchor is visible, else 0",
             ],
         },
         "diagnostics": {
             "dim": DIAGNOSTIC_DIM,
             "layout": [
-                "0-2 position", "3-5 target", "6-9 quaternion xyzw", "10-12 world velocity",
-                "13 thrust N", "14 design", "15 bucket", "16 catalog index", "17 step",
-                "18 landed", "19 start landed", "20 initial distance", "21 visible fraction at start",
-                "22 episode (low 24 bits)", "23 gps_available (0/1)",
+                "0-2 position", "3-5 target centre", "6-9 quaternion xyzw", "10-12 world velocity",
+                "13 thrust N", "14 target class (layout index)", "15 bucket", "16 catalog index", "17 step",
+                "18 landed", "19 start landed", "20 initial box distance", "21 visible fraction at start",
+                "22 episode (low 24 bits)", "23 gps_available (0/1)", "24-26 target half extents",
+                "27 target object (layout index)",
             ],
         },
-        "designs": designs_json,
         "district": {
             "min": district.min,
             "max": district.max,
@@ -520,7 +510,6 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, designs: &[DesignMe
             "bucket_ranges": catalog.bucket_ranges,
             "rules": catalog.rules,
         },
-        "target_designs": k_designs,
         "fields": [
             {"index": 0, "name": "rgb", "dtype": "float32", "shape": ["n", 3, "H", "W"]},
             {"index": 1, "name": "sensors", "dtype": "float32", "shape": ["n", SENSOR_DIM]},
@@ -531,12 +520,13 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, designs: &[DesignMe
             {"index": 6, "name": "collision", "dtype": "float32", "shape": ["n"]},
             {"index": 7, "name": "episodes", "dtype": "uint64", "shape": ["n"]},
             {"index": 8, "name": "diagnostics", "dtype": "float32", "shape": ["n", DIAGNOSTIC_DIM]},
-            {"index": 9, "name": "design", "dtype": "int32", "shape": ["n"]},
-            {"index": 10, "name": "goal", "dtype": "float32", "shape": [k_designs, 3, "H", "W"]},
-            {"index": 11, "name": "bucket_weights", "dtype": "float32", "shape": [4]},
+            {"index": 9, "name": "catalog_index", "dtype": "int32", "shape": ["n"]},
+            {"index": 10, "name": "goal_views", "dtype": "float32", "shape": ["n", 3, "H", "W"]},
+            {"index": 11, "name": "curriculum", "dtype": "float32", "shape": [CURRICULUM_LANES]},
             {"index": 12, "name": "bucket", "dtype": "float32", "shape": ["n"]},
             {"index": 13, "name": "oob", "dtype": "float32", "shape": ["n"]},
             {"index": 14, "name": "gps_available", "dtype": "float32", "shape": ["n"]},
+            {"index": 15, "name": "goal_crops", "dtype": "float32", "shape": ["n", 4]},
         ],
     });
     // Flat keys consumed by learner/replay checks (inserted after the macro to
@@ -547,6 +537,8 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, designs: &[DesignMe
     json["control_mode"] = control_mode_name.into();
     json["action_names"] = action_names.into();
     json["action_scales"] = action_scales.into();
+    json["catalog_size"] = CATALOG_SIZE.into();
+    json["target_classes"] = drone::TARGET_CLASSES.into();
     if control_mode != CONTROL_RATES {
         json["velocity_loop"] = serde_json::json!({
             "p_gain_per_s": dynamics::VELOCITY_GAIN,
@@ -557,15 +549,17 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, designs: &[DesignMe
     }
     json["gps"] = serde_json::json!({
         "radius_m": [GPS_MIN_RADIUS, GPS_MAX_RADIUS], "vertical_m": GPS_VERTICAL,
-        "per_episode_available": "unit >= weights[3] (p_no_gps): weights[3]=1 never available, 0 always",
+        "per_episode_available": "unit >= lanes[3] (p_no_gps): 1 never available, 0 always",
     });
-    json["design_count"] = k_designs.into();
+    json["appearance"] = serde_json::json!({
+        "strength": "curriculum lane 4 in [0, 1]; 0 = plain render",
+        "key": "catalog index: an episode and its goal view share one appearance",
+        "per_material": "YIQ hue +-0.35 rad, saturation x[0.6, 1.4], value x[0.75, 1.25]",
+        "global": "exposure 2^+-0.6, white balance +-12% per channel, contrast +-20%, gamma 2^+-0.3, noise sd <= 0.03",
+        "sky": "vertical gradient, blue/overcast top, warm horizon", "fog": "1 - exp(-k depth), k <= 0.02 per m, horizon colour",
+        "unchanged": "sun direction and shadows",
+    });
     json["city_fingerprint"] = city.fingerprint.clone().into();
     json["city_path"] = city_path.display().to_string().into();
-    json["goal_camera"] = serde_json::json!({
-        "distance_m": GOAL_CAMERA_DISTANCE, "direction": GOAL_CAMERA_DIRECTION,
-        "vertical_fov_rad": dynamics::CAMERA_VFOV_RAD,
-        "scene": "each split-local design alone at the origin, split lighting/background, rendered once at create",
-    });
     Ok(CString::new(json.to_string())?)
 }

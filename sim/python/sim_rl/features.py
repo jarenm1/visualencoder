@@ -11,7 +11,18 @@ from visenc.models import load_encoder
 ARMS = {"pretrained": "lingbot:small", "baseline": "run:runs/baseline", "mean": "run:runs/mean",
         "state": "state", "hint": "hint"}
 PREPROCESSING = "native-NCHW-float01/ImageNet/bf16/CLS+patch-grid16/token-LayerNorm/v3"
-GOAL_CHUNK = 8
+
+
+def crop_goals(images, crops):
+    """Bilinear crop-and-resize: images float32 [m,3,H,W], crops [m,4] normalized [x0,y0,x1,y1]
+    (top-left origin) -> [m,3,H,W]. The same operation turns any box in a frame (catalog goal
+    reference, operator tap, language-model detection) into the policy's goal image."""
+    x0, y0, x1, y1 = crops.unbind(-1)
+    zeros = torch.zeros_like(x0)
+    theta = torch.stack((torch.stack((x1 - x0, zeros, x0 + x1 - 1), -1),
+                         torch.stack((zeros, y1 - y0, y0 + y1 - 1), -1)), 1)
+    grid = F.affine_grid(theta, list(images.shape), align_corners=False)
+    return F.grid_sample(images, grid, mode="bilinear", padding_mode="border", align_corners=False)
 
 
 class FrozenFeatures:
@@ -63,12 +74,33 @@ class FrozenFeatures:
         return self.encode(env.obs)
 
     @torch.no_grad()
-    def goal_table(self, goal_images):
-        """Per-design goal embedding [K, 2D] = concat(CLS, mean patch token); computed once per env."""
+    def goal_embedding(self, images):
+        """Goal embedding [m, 2D] = concat(CLS, mean patch token) of goal images [m,3,H,W]."""
         if self.encoder is None:
             raise ValueError("goal embeddings require a visual arm")
-        rows = []
-        for start in range(0, goal_images.shape[0], GOAL_CHUNK):
-            cls, patches = self.encode(goal_images[start:start + GOAL_CHUNK])
-            rows.append(torch.cat((cls, patches.float().mean(1)), dim=-1))
-        return torch.cat(rows, dim=0)
+        cls, patches = self.encode(images)
+        return torch.cat((cls, patches.float().mean(1)), dim=-1)
+
+    @torch.no_grad()
+    def catalog_goals(self, env, appearance):
+        """bf16 [catalog_size, 2D] goal embedding per catalog entry, built once per env, encoder and
+        appearance strength.
+
+        Startup work outside collection: the env renders each entry's goal reference view (with that
+        entry's randomized appearance at ``appearance`` strength), which is cropped to its goal box
+        and encoded. Episodes look up their row by ``env.catalog_index``.
+        """
+        cache = env.__dict__.setdefault("goal_tables", {})
+        key = (self.fingerprint, float(appearance))
+        if key not in cache:
+            restore = env.curriculum.clone()
+            env.curriculum[4] = appearance
+            table = torch.empty((env.catalog_size, 2 * self.dim), device=env.device, dtype=torch.bfloat16)
+            for first in range(0, env.catalog_size, env.n):
+                count = min(env.n, env.catalog_size - first)
+                env.render_goals(first)
+                goals = crop_goals(env.goal_views[:count], env.goal_crops[:count])
+                table[first:first + count] = self.goal_embedding(goals).to(torch.bfloat16)
+            env.curriculum.copy_(restore)
+            cache[key] = table
+        return cache[key]

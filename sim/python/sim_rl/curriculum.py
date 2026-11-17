@@ -1,7 +1,8 @@
 """Visibility-bucket curriculum: GPU-resident lanes written into native field 11.
 
-Lanes are [w_visible, w_partial, w_hidden, p_no_gps]. The bucket weights adapt
-(adaptive mode); p_no_gps is a fixed training-time probability of GPS-denied episodes.
+Lanes are [w_visible, w_partial, w_hidden, p_no_gps, appearance]. The bucket weights adapt
+(adaptive mode); p_no_gps is a fixed training-time probability of GPS-denied episodes and
+appearance the fixed randomized-appearance strength (0 = plain render).
 """
 from __future__ import annotations
 
@@ -46,22 +47,24 @@ def update_weights(weights, ema, floors):
 class Curriculum:
     """Tracks per-bucket success EMAs and weights; ``uniform`` keeps weights fixed."""
 
-    def __init__(self, mode, device, no_gps_fraction):
+    def __init__(self, mode, device, no_gps_fraction, appearance=1.0):
         if mode not in MODES:
             raise ValueError(f"curriculum must be one of {MODES}")
         if not 0.0 <= no_gps_fraction <= 1.0:
             raise ValueError("no_gps_fraction must be in [0, 1]")
+        if not 0.0 <= appearance <= 1.0:
+            raise ValueError("appearance must be in [0, 1]")
         self.mode = mode
         start = START_WEIGHTS if mode == "adaptive" else UNIFORM_WEIGHTS
         self.weights = torch.tensor(start, device=device, dtype=torch.float32)
         self.floors = torch.tensor(FLOORS, device=device, dtype=torch.float32)
-        self.no_gps = torch.tensor([no_gps_fraction], device=device, dtype=torch.float32)
+        self.fixed = torch.tensor([no_gps_fraction, appearance], device=device, dtype=torch.float32)
         self.ema = torch.zeros(3, device=device, dtype=torch.float32)
         self.seen = torch.zeros(3, device=device, dtype=torch.bool)
 
     def lanes(self):
-        """float32[4] device tensor: bucket weights then p_no_gps (device cat, no host transfer)."""
-        return torch.cat((self.weights, self.no_gps))
+        """float32[5] device tensor: bucket weights, p_no_gps, appearance (device cat, no host transfer)."""
+        return torch.cat((self.weights, self.fixed))
 
     def observe(self, counts, successes):
         """counts, successes: float32 [3] tensors of completed episodes per bucket this rollout."""

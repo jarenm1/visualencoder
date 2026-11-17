@@ -1,22 +1,24 @@
-//! Constants and counter-based hashing for city-drone-goal-v1 (ABI v4).
+//! Constants and counter-based hashing for city-drone-goal-v2 (ABI v5).
 //!
 //! Plain integer and constant definitions shared by the host and the CUDA kernels.
 
-pub const TASK_NAME: &str = "city-drone-goal-v1";
-pub const ABI_VERSION: u32 = 4;
+pub const TASK_NAME: &str = "city-drone-goal-v2";
+pub const ABI_VERSION: u32 = 5;
 pub const ACTION_DIM: usize = 4;
 pub const SENSOR_DIM: usize = 19;
-pub const PRIVILEGED_DIM: usize = 21;
-pub const DIAGNOSTIC_DIM: usize = 24;
+pub const PRIVILEGED_DIM: usize = 29;
+pub const DIAGNOSTIC_DIM: usize = 28;
 pub const CATALOG_SIZE: usize = 65536;
 /// Floats per camera slot: view (16), view-projection (16), eye (4).
 pub const CAMERA_FLOATS: usize = 36;
-pub const FIELD_COUNT: usize = 15;
+pub const FIELD_COUNT: usize = 16;
+/// Curriculum lanes: bucket weights (3), no-GPS probability, appearance strength.
+pub const CURRICULUM_LANES: usize = 5;
 
 /// Keep-in margin applied to the district rectangle (metres).
 pub const DISTRICT_MARGIN: f32 = 2.0;
-/// Y coordinate of target slots not used by the active episode design.
-pub const TARGET_PARK_Y: f32 = -1000.0;
+/// Salt of the per-catalog-entry appearance stream (shared by episodes and their goal views).
+pub const APPEARANCE_SALT: u64 = 0x5EED_A99E_A2A9_CE01;
 
 pub const EVENT_CRASH: u32 = 1;
 pub const EVENT_OOB: u32 = 2;

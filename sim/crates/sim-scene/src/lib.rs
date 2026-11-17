@@ -17,12 +17,28 @@ pub mod drone;
 
 pub struct CityScene {
     pub meshes: Vec<MeshData>,
+    /// Unique-material index of each mesh in `meshes` (render object id = mesh + 1).
+    pub mesh_materials: Vec<u32>,
+    pub material_count: u32,
     pub instances: Vec<Instance>,
     pub nodes: Vec<BvhNode>,
     pub triangles: Vec<Triangle>,
     pub half_extent: f32,
     pub landable: Landable,
+    /// `layout.json` class names; `objects[i].class` indexes this list.
+    pub classes: Vec<String>,
+    /// Placed assets with world AABBs, in layout order (the object index of episodes).
+    pub objects: Vec<CityObject>,
     pub fingerprint: String,
+}
+
+/// One placed asset from `layout.json` with its world axis-aligned bounding box.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CityObject {
+    pub class: u32,
+    pub asset: String,
+    pub center: Vec3,
+    pub half: Vec3,
 }
 
 /// Landable geometry. Every landable vertex lies within the level band, so the plane at
@@ -78,6 +94,7 @@ impl CityScene {
         hash_file(&mut hash, "layout.json", &layout);
         let mut importer = Importer::default();
         let classes = json["classes"].as_array().context("layout lacks classes")?;
+        let objects = layout_objects(&json, classes)?;
         for (name, class_name) in ASSETS {
             let class = class_index(classes, class_name)?;
             let bytes = std::fs::read(path.join(name)).with_context(|| format!("reading {name}"))?;
@@ -94,7 +111,14 @@ impl CityScene {
         ensure!(!importer.triangles.is_empty(), "city contains no triangles");
         ensure!(importer.triangles.len() <= u32::MAX as usize, "city triangle count exceeds collision ABI");
         let landable = landable_plane(&importer.triangles)?;
-        let meshes: Vec<_> = importer.chunks.into_values().map(|chunk| chunk.mesh).collect();
+        let mut material_ids: BTreeMap<MaterialKey, u32> = BTreeMap::new();
+        let mut mesh_materials = Vec::with_capacity(importer.chunks.len());
+        let mut meshes = Vec::with_capacity(importer.chunks.len());
+        for ((_, _, key), chunk) in importer.chunks {
+            let next = material_ids.len() as u32;
+            mesh_materials.push(*material_ids.entry(key).or_insert(next));
+            meshes.push(chunk.mesh);
+        }
         let instances = (0..meshes.len()).map(|mesh| {
             let mut instance = Instance::static_mesh(mesh);
             instance.material.color = [1.0; 4];
@@ -104,7 +128,9 @@ impl CityScene {
         let leaves = importer.triangles.len().div_ceil(LEAF_TRIANGLES).next_power_of_two();
         let mut nodes = Vec::with_capacity(leaves * 2 - 1);
         build_bvh(&mut importer.triangles, 0, &mut nodes);
-        Ok(Self { meshes, instances, nodes, triangles: importer.triangles, half_extent, landable,
+        Ok(Self { meshes, mesh_materials, material_count: material_ids.len() as u32, instances, nodes,
+            triangles: importer.triangles, half_extent, landable,
+            classes: classes.iter().map(|c| c.as_str().unwrap_or_default().to_owned()).collect(), objects,
             fingerprint: format!("sha256:{:x}", hash.finalize()) })
     }
 
@@ -238,6 +264,25 @@ fn class_index(classes: &[serde_json::Value], name: &str) -> Result<u32> {
     classes.iter().position(|c| c.as_str() == Some(name)).map(|i| i as u32)
         .with_context(|| format!("layout lacks class {name}"))
 }
+
+fn layout_objects(json: &serde_json::Value, classes: &[serde_json::Value]) -> Result<Vec<CityObject>> {
+    let entries = json["objects"].as_array().context("layout lacks objects")?;
+    entries.iter().enumerate().map(|(i, entry)| {
+        let vector = |key: &str| -> Result<Vec3> {
+            let values = entry[key].as_array().with_context(|| format!("object {i} lacks {key}"))?;
+            ensure!(values.len() == 3, "object {i} {key} must have 3 values");
+            let v: Vec<f32> = values.iter().map(|v| v.as_f64().map(|v| v as f32)).collect::<Option<_>>()
+                .with_context(|| format!("object {i} {key} is not numeric"))?;
+            Ok(Vec3::new(v[0], v[1], v[2]))
+        };
+        let (min, max) = (vector("min")?, vector("max")?);
+        ensure!(min.is_finite() && max.is_finite() && min.cmple(max).all(), "object {i} has an invalid box");
+        let class = class_index(classes, entry["class"].as_str().with_context(|| format!("object {i} lacks class"))?)?;
+        let asset = entry["asset"].as_str().unwrap_or_default().to_owned();
+        Ok(CityObject { class, asset, center: (min + max) * 0.5, half: (max - min) * 0.5 })
+    }).collect()
+}
+
 /// Verifies that every landable vertex lies in the level band and summarises the landable
 /// surface. Zero-area triangles still constrain the band but do not count as non-level.
 fn landable_plane(triangles: &[Triangle]) -> Result<Landable> {

@@ -8,7 +8,7 @@ import torch
 from torch.profiler import record_function
 
 from .curriculum import MODES as CURRICULUM_MODES, Curriculum
-from .model import gaussian_entropy, gaussian_log_prob, saliency_loss
+from .model import saliency_loss, squashed_entropy, squashed_log_prob
 from .native import HOVER_ACTIONS, PRIVILEGED_WIDTH, PROPRIO_WIDTH
 
 # finish_rollout layout: rollout totals, PPO losses, bucket totals, used/next weights, EMAs.
@@ -45,6 +45,7 @@ class Config:
     curriculum: str = "adaptive"
     aux_coefficient: float = 0.5
     no_gps_fraction: float = 0.0
+    appearance: float = 1.0
 
     def validate(self):
         if min(self.total_steps, self.rollout_steps, self.sequence_length,
@@ -60,6 +61,8 @@ class Config:
             raise ValueError("aux_coefficient must be non-negative")
         if not 0.0 <= self.no_gps_fraction <= 1.0:
             raise ValueError("no_gps_fraction must be in [0, 1]")
+        if not 0.0 <= self.appearance <= 1.0:
+            raise ValueError("appearance must be in [0, 1]")
 
 
 def terminal_gae(rewards, values, done, gamma, lam, out=None):
@@ -93,13 +96,13 @@ class Trainer:
         self.hover = torch.tensor(HOVER_ACTIONS[env.control_mode], device=env.device)
         self.optimizer = torch.optim.Adam(policy.parameters(), lr=config.learning_rate, fused=True, capturable=True)
         self.steps = 0
-        self.curriculum = Curriculum(config.curriculum, env.device, config.no_gps_fraction)
+        self.curriculum = Curriculum(config.curriculum, env.device, config.no_gps_fraction, config.appearance)
         self.curriculum.write(env)
         t, n, h = config.rollout_steps, env.n, policy.hidden_size
         allocate = lambda *shape: torch.empty(shape, device=env.device)
         self.proprio = allocate(t, n, PROPRIO_WIDTH)
         self.privileged = allocate(t, n, PRIVILEGED_WIDTH)
-        self.designs = torch.zeros((t, n), device=env.device, dtype=torch.long)
+        self.catalog = torch.zeros((t, n), device=env.device, dtype=torch.long)
         self.starts = allocate(t, n)
         self.hidden = allocate(t, n, h)
         self.actions = allocate(t, n, env.action_dim)
@@ -114,7 +117,7 @@ class Trainer:
         self.episode_return = torch.zeros(n, device=env.device)
         if features.visual:
             patches = env.height // 16 * (env.width // 16)
-            self.goals = features.goal_table(env.goal_images)
+            self.goals = features.catalog_goals(env, config.appearance)
             self.cls = allocate(t, n, features.dim)
             self.tokens = torch.empty((t, n, patches, features.dim), device=env.device, dtype=torch.bfloat16)
         else:
@@ -127,9 +130,9 @@ class Trainer:
         if self.features.visual:
             self.current_cls, self.current_tokens = self.features.observe(self.env)
 
-    def _inputs(self, cls, tokens, design, proprio, privileged):
-        """Returns (actor inputs, GoalAttention output or None)."""
-        goal = self.goals[design] if self.features.visual else None
+    def _inputs(self, cls, tokens, catalog, proprio, privileged):
+        """Returns (actor inputs, saliency logits or None); the goal is the catalog entry's crop embedding."""
+        goal = self.goals[catalog].float() if self.features.visual else None
         return self.policy.actor_inputs_and_features(cls, tokens, goal, proprio, privileged)
 
     @torch.no_grad()
@@ -137,7 +140,7 @@ class Trainer:
         """Initialize kernels/allocator, then discard warmup physics episodes."""
         hover = self.hover.expand(self.env.n, -1).contiguous()
         for _ in range(iterations):
-            inputs, _ = self._inputs(self.current_cls, self.current_tokens, self.env.design.long(),
+            inputs, _ = self._inputs(self.current_cls, self.current_tokens, self.env.catalog_index.long(),
                                      self.env.proprio, self.env.privileged)
             self.policy.step(inputs, self.memory, self.next_start)
             self.env.step(hover)
@@ -159,7 +162,7 @@ class Trainer:
             for t in range(length):
                 self.proprio[t].copy_(self.env.proprio)
                 self.privileged[t].copy_(self.env.privileged)
-                self.designs[t].copy_(self.env.design)
+                self.catalog[t].copy_(self.env.catalog_index)
                 self.starts[t].copy_(self.next_start)
                 self.hidden[t].copy_(self.memory)
                 if self.features.visual:
@@ -167,16 +170,16 @@ class Trainer:
                     self.tokens[t].copy_(self.current_tokens)
                 inputs, _ = self._inputs(self.cls[t] if self.features.visual else None,
                                          self.tokens[t] if self.features.visual else None,
-                                         self.designs[t], self.proprio[t], self.privileged[t])
+                                         self.catalog[t], self.proprio[t], self.privileged[t])
                 mean, memory = self.policy.step(inputs, self.memory, self.next_start)
-                sample = mean + log_std.exp() * torch.randn_like(mean)
-                self.actions[t].copy_(sample)
-                self.logprobs[t].copy_(gaussian_log_prob(mean, log_std, sample))
+                raw = mean + log_std.exp() * torch.randn_like(mean)
+                self.actions[t].copy_(raw)
+                self.logprobs[t].copy_(squashed_log_prob(mean, log_std, raw))
                 self.values[t].copy_(self.policy.value(self.privileged[t], self.proprio[t]))
                 self.memory.copy_(memory)
-                # Only the clamped command reaches the simulator; the unclipped
-                # sample remains the log-probability's action.
-                torch.clamp(sample, -1, 1, out=self.applied)
+                # The simulator receives the squashed command; rollouts keep the pre-squash
+                # sample, whose log-probability includes the tanh Jacobian.
+                torch.tanh(raw, out=self.applied)
                 self.env.step(self.applied)
                 self.rewards[t].copy_(self.env.reward)
                 self.done[t].copy_(self.env.done)
@@ -220,15 +223,15 @@ class Trainer:
                     if self.features.visual:
                         inputs, attended = self._inputs(self.cls[times, env_ids].flatten(0, 1),
                                                         self.tokens[times, env_ids].flatten(0, 1),
-                                                        self.designs[times, env_ids].flatten(),
+                                                        self.catalog[times, env_ids].flatten(),
                                                         proprio.flatten(0, 1), privileged.flatten(0, 1))
                     else:
                         inputs, attended = self._inputs(None, None, None, proprio.flatten(0, 1),
                                                         privileged.flatten(0, 1))
                     means = self.policy.sequence(inputs.view(length_b, batch, -1),
                                                  self.hidden[first, env_ids], self.starts[times, env_ids])
-                    logprobs = gaussian_log_prob(means, self.policy.log_std, self.actions[times, env_ids])
-                    entropy = gaussian_entropy(self.policy.log_std)
+                    logprobs = squashed_log_prob(means, self.policy.log_std, self.actions[times, env_ids])
+                    entropy = squashed_entropy(means, self.policy.log_std)
                     values = self.policy.value(privileged, proprio)
                     logratio = logprobs - self.logprobs[times, env_ids]
                     ratio = logratio.exp()

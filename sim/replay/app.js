@@ -109,11 +109,14 @@ function drawSaliency(frame, x, width, height) {
   const state = environment().states[frame];
   const field = (name) => state[manifest.state_fields.indexOf(name)];
   if (field("target_visible") > 0.5) {
+    // White outline: the target box's projection, the region the saliency label rewards.
+    const left = x + (field("target_box_x0") + 1) / 2 * width;
+    const right = x + (field("target_box_x1") + 1) / 2 * width;
+    const top = (1 - field("target_box_y1")) / 2 * height;
+    const bottom = (1 - field("target_box_y0")) / 2 * height;
     context.strokeStyle = "rgba(255,255,255,0.9)";
     context.lineWidth = 1.5;
-    context.beginPath();
-    context.arc(x + (field("target_ndc_x") + 1) / 2 * width, (1 - field("target_ndc_y")) / 2 * height, 9, 0, 2 * Math.PI);
-    context.stroke();
+    context.strokeRect(left, top, right - left, bottom - top);
   }
 }
 
@@ -192,6 +195,12 @@ function chooseEnvironment(index) {
   timeline.max = String(env.duration_seconds);
   timeline.step = String(1 / manifest.control_hz);
   timeline.value = "0";
+  const goal = $("goal");
+  goal.hidden = false;
+  goal.src = replayUrl(env.goal);
+  goal.alt = goal.title = env.grounding
+    ? `Gemma box: ${env.grounding.asset ?? "unmatched"}${env.grounding.scored ? "" : " (not scored)"}`
+    : `Goal crop: ${env.target_class}`;
 
   const source = document.createElement("video");
   video = source;
@@ -287,7 +296,7 @@ function cycleView() {
 
 function validateManifest(data) {
   const demand = (condition, message) => { if (!condition) throw new Error(message); };
-  demand(data?.format === "sim-city-replay-v2", "Unsupported recording format");
+  demand(data?.format === "sim-city-replay-v3", "Unsupported recording format");
   demand(typeof data.recording === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(data.recording), "Missing recording id");
   demand(Number.isFinite(data.control_hz) && data.control_hz > 0, "Invalid recording frame rate");
   demand(Number.isInteger(data.video_width) && Number.isInteger(data.video_height), "Missing video dimensions");
@@ -304,6 +313,7 @@ function validateManifest(data) {
     demand(Math.abs(env.duration_seconds - env.frame_count / data.control_hz) < 0.0001, `Invalid duration for environment ${env.id}`);
     demand(typeof env.video === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]*\.mp4$/.test(env.video), "Unsafe recording video filename");
     demand(data.encoder_map == null || (typeof env.encoder_map === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]*\.encoder$/.test(env.encoder_map)), "Unsafe encoder map filename");
+    demand(typeof env.goal === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]*-goal\.png$/.test(env.goal), "Unsafe goal image filename");
   }
   return data;
 }
@@ -346,13 +356,6 @@ async function loadManifest() {
     MODES = ALL_MODES.filter((name) => name !== "encoder");
     if (mode === "encoder") mode = "split";
   }
-  const goal = $("goal");
-  const chosen = manifest.instruction;
-  goal.hidden = !chosen;
-  if (chosen) {
-    goal.src = `/goal/${Number(chosen.design)}.png`;
-    goal.alt = goal.title = `"${chosen.instruction}" → ${chosen.name}`;
-  }
   resize();
   chooseEnvironment(0);
 }
@@ -361,12 +364,14 @@ async function loadManifest() {
 const instruction = $("instruction");
 
 function showStatus(status) {
-  const working = status.state === "resolving" || status.state === "flying";
+  const working = ["framing", "grounding", "flying"].includes(status.state);
   instruction.disabled = working;
   $("send").disabled = working;
-  if (status.state === "resolving") instruction.placeholder = `Gemma reading: ${status.instruction}`;
-  else if (status.state === "flying") instruction.placeholder = `${status.instruction} → ${status.name} - flying`;
-  else if (status.state === "done") instruction.placeholder = `${status.instruction} → ${status.name} - ${status.episodes} episodes`;
+  const found = `${status.found} views with a box, ${status.matched} matched to a city object`;
+  if (status.state === "framing") instruction.placeholder = `${status.instruction}: rendering start views`;
+  else if (status.state === "grounding") instruction.placeholder = `${status.instruction}: Gemma looking`;
+  else if (status.state === "flying") instruction.placeholder = `${status.instruction}: ${found} - flying`;
+  else if (status.state === "done") instruction.placeholder = `${status.instruction}: ${found}`;
   else if (status.state === "error") instruction.placeholder = status.message;
   if (working) instruction.value = "";
   return working;

@@ -4,6 +4,7 @@ from __future__ import annotations
 import torch
 
 from .curriculum import BUCKETS, UNIFORM_WEIGHTS
+from .model import deterministic_action
 from .native import HOVER_ACTIONS
 from .ppo import gpu_range
 from .stats import wilson
@@ -48,12 +49,12 @@ def gps_pursuit(proprio, action_scales):
 
 
 @torch.no_grad()
-def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0):
-    """Deterministic policy (clamped mean) or blind heuristic over one reset of the native finite horizon.
+def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, appearance=1.0):
+    """Deterministic policy (tanh of the mean) or blind heuristic over one reset of the native finite horizon.
 
-    Curriculum is uniform over visibility buckets with p_no_gps = ``no_gps``. Outcomes are
-    exclusive (success > collision > out_of_bounds > timeout) and recorded only for each
-    environment's first completed episode.
+    Curriculum is uniform over visibility buckets with p_no_gps = ``no_gps`` and the given
+    appearance strength. Outcomes are exclusive (success > collision > out_of_bounds > timeout)
+    and recorded only for each environment's first completed episode.
     """
     if (policy is None) == (heuristic is None):
         raise ValueError("provide exactly one trained policy or blind heuristic")
@@ -62,11 +63,12 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0):
     if policy is not None and policy.mode != ("visual" if features.visual else features.spec):
         raise ValueError("policy mode differs from the frozen feature arm")
     n, device = env.n, env.device
-    lanes = torch.tensor(UNIFORM_WEIGHTS + (no_gps,), device=device, dtype=torch.float32)
+    lanes = torch.tensor(UNIFORM_WEIGHTS + (no_gps, appearance), device=device, dtype=torch.float32)
     env.write_curriculum(lanes)
+    goals = features.catalog_goals(env, appearance) if policy is not None and features.visual else None
     env.reset(seed)
-    goals = features.goal_table(env.goal_images) if features.visual else None
     start_landed = env.diagnostics[:, 19].clamp(0, 1).clone()
+    start_class = env.diagnostics[:, 14].clone()
     active = torch.ones(n, device=device)
     completed = torch.zeros(n, device=device)
     success = torch.zeros(n, device=device)
@@ -86,10 +88,10 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0):
         for _ in range(env.horizon):
             if policy is not None:
                 cls, tokens = features.observe(env) if features.visual else (None, None)
-                goal = goals[env.design.long()] if features.visual else None
+                goal = goals[env.catalog_index.long()].float() if features.visual else None
                 inputs, _ = policy.actor_inputs_and_features(cls, tokens, goal, env.proprio, env.privileged)
                 mean, hidden = policy.step(inputs, hidden, starts)
-                actions.copy_(mean.clamp(-1, 1))
+                actions.copy_(deterministic_action(mean))
             elif heuristic == "hover":
                 actions.copy_(hover)
             elif heuristic == "gps":
@@ -117,13 +119,20 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0):
     landed = start_landed
     landed_onehot = torch.stack((1 - landed, landed), dim=-1)
     table = torch.einsum("kn,nb,ns->kbs", rows, bucket_onehot, landed_onehot)
+    layout = torch.tensor([env.layout_classes.index(name) for name in env.target_classes], device=device,
+                          dtype=torch.float32)
+    class_table = torch.stack((completed, success)) @ (start_class.unsqueeze(-1) == layout).float()
     unfinished = active.sum()
     env.stream.synchronize()  # Explicit evaluation end-batch boundary.
     values = table.sum((1, 2)).cpu().tolist()
     if unfinished.item() != 0 or round(values[0]) != n:
         raise RuntimeError(f"native finite horizon violated: {n - round(values[0])} environments unfinished")
     cells = table.cpu().tolist()
-    return summarize(n, cells, policy=heuristic or "checkpoint", horizon=env.horizon, no_gps=no_gps)
+    result = summarize(n, cells, policy=heuristic or "checkpoint", horizon=env.horizon, no_gps=no_gps)
+    result["appearance"] = appearance
+    result["classes"] = {name: {"episodes": round(count), "success": hits / count if count else None}
+                         for name, count, hits in zip(env.target_classes, *class_table.cpu().tolist())}
+    return result
 
 
 def _aggregate(cells, buckets, landed):

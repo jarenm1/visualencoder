@@ -21,7 +21,7 @@ from .profiling import capture, verify_trace
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_LIBRARY = ROOT / ".sim-target/training/libsim_env.so"
-CHECKPOINT_FORMAT = "sim-drone-ppo-v2"
+CHECKPOINT_FORMAT = "sim-drone-ppo-v3"
 TRAIN_STYLE, VALIDATION_STYLE, TEST_STYLE = 0, 1, 2
 VALIDATION_SEED, TEST_SEED = 10_001, 20_002
 PROBE_TRAIN_SEED = 30_003
@@ -29,11 +29,11 @@ MIN_EPISODES = 256
 DEFAULTS = Config()
 DEFAULT_ENCODERS = "pretrained,baseline,mean"
 ACTOR_INPUTS = {
-    "visual": "goal-attention(frozen CLS + patch tokens, goal table) + proprio(19)",
-    "state": "privileged(21) + proprio(19)",
+    "visual": "target-saliency(frozen CLS + patch tokens, catalog goal-crop embedding) + proprio(19)",
+    "state": "privileged(29) + proprio(19)",
     "hint": "proprio(19)",
 }
-CRITIC_INPUTS = "privileged(21) + proprio(19)"
+CRITIC_INPUTS = "privileged(29) + proprio(19)"
 # Recorded and compared on load; the library hash is provenance only (rebuilds keep the contract).
 CHECKED_KEYS = ("task", "abi_version", "action_dim", "horizon", "control_hz", "control_mode",
                 "width", "height", "policy_mode", "encoder", "feature_dim", "encoder_fingerprint",
@@ -74,7 +74,7 @@ def native_provenance(env, features):
     return {
         "format": CHECKPOINT_FORMAT, "task": TASK, "abi_version": ABI_VERSION,
         "action_dim": env.action_dim, "horizon": env.horizon, "control_hz": env.control_hz,
-        "control_mode": env.control_mode, "design_count": env.design_count,
+        "control_mode": env.control_mode, "catalog_size": env.catalog_size,
         "width": env.width, "height": env.height,
         "policy_mode": mode, "encoder": features.spec, "feature_dim": features.dim,
         "encoder_fingerprint": features.fingerprint, "preprocessing": PREPROCESSING,
@@ -89,7 +89,7 @@ def provenance(env, features, training):
 
 def training_settings(args):
     return {"curriculum": args.curriculum, "no_gps_fraction": args.no_gps_fraction,
-            "aux_coefficient": args.aux_coefficient}
+            "aux_coefficient": args.aux_coefficient, "appearance": args.appearance}
 
 
 def checkpoint(policy, metadata, steps):
@@ -100,11 +100,11 @@ def checkpoint(policy, metadata, steps):
 def load_checkpoint(path):
     saved = torch.load(path, map_location="cpu", weights_only=True)
     if saved.get("format") != CHECKPOINT_FORMAT:
-        raise ValueError(f"{path} is not a {CHECKPOINT_FORMAT} checkpoint; v1/v2/v3 checkpoints "
-                         "cannot be used for city-drone-goal-v1 ABI 4")
+        raise ValueError(f"{path} is not a {CHECKPOINT_FORMAT} checkpoint; earlier checkpoints "
+                         f"cannot be used for {TASK} ABI {ABI_VERSION}")
     metadata = saved["metadata"]
     if metadata.get("abi_version") != ABI_VERSION or metadata.get("task") != TASK:
-        raise ValueError("checkpoint targets an incompatible native ABI or task; retrain on sim_env ABI v4")
+        raise ValueError(f"checkpoint targets an incompatible native ABI or task; retrain on sim_env ABI v{ABI_VERSION}")
     return saved
 
 
@@ -124,7 +124,7 @@ def make_config(args):
                   gamma=args.gamma, gae_lambda=args.gae_lambda, clip=args.clip, entropy=args.entropy,
                   value_coefficient=args.value_coefficient, max_grad_norm=args.max_grad_norm,
                   curriculum=args.curriculum, aux_coefficient=args.aux_coefficient,
-                  no_gps_fraction=args.no_gps_fraction)
+                  no_gps_fraction=args.no_gps_fraction, appearance=args.appearance)
 
 
 def open_env(args, n, seed, style):
@@ -332,27 +332,35 @@ def probe_command(args, started):
     if not args.encoders:
         raise SystemExit("--encoders must name at least one visual arm")
     device = torch.device("cuda:0")
+    arms = {}
+    for spec in args.encoders:
+        arm = FrozenFeatures(spec, device)
+        if not arm.visual:
+            raise SystemExit(f"probe needs a visual encoder; {spec} has none")
+        arms[spec] = arm
+    # Catalog goal tables render through the env, so each is built before that env's first reset.
     with open_env(args, args.probe_envs, PROBE_TRAIN_SEED, TRAIN_STYLE) as env:
         with env.execution():
-            train_frames = collect_frames(env, args.train_frames, PROBE_TRAIN_SEED, args.seed)
+            train_tables = {spec: arm.catalog_goals(env, args.appearance) for spec, arm in arms.items()}
+            train_frames = collect_frames(env, args.train_frames, PROBE_TRAIN_SEED, args.seed, args.appearance)
+            class_index = {name: env.layout_classes.index(name) for name in env.target_classes}
     with open_env(args, args.probe_envs, TEST_SEED, TEST_STYLE) as env:
         with env.execution():
-            test_frames = collect_frames(env, args.test_frames, TEST_SEED, args.seed + 1)
+            test_tables = {spec: arm.catalog_goals(env, args.appearance) for spec, arm in arms.items()}
+            test_frames = collect_frames(env, args.test_frames, TEST_SEED, args.seed + 1, args.appearance)
     config = {"epochs": args.epochs, "batch_size": args.batch_size, "learning_rate": args.learning_rate}
     encoders = {}
     for spec in args.encoders:
-        features = FrozenFeatures(spec, device)
-        if not features.visual:
-            raise SystemExit(f"probe needs a visual encoder; {spec} has none")
         seed_all(args.seed)
-        encoders[spec] = run_encoder(features, train_frames, test_frames, args.height // 16, args.width // 16,
-                                     config, args.seed)
-        del features
+        encoders[spec] = run_encoder(arms.pop(spec), train_frames, train_tables.pop(spec), test_frames,
+                                     test_tables.pop(spec), args.height // 16, args.width // 16, config,
+                                     args.seed, class_index)
     train_count, test_count = train_frames.images.shape[0], test_frames.images.shape[0]
     payload = {"protocol": protocol_of(train_count, test_count), "train_frames": train_count,
                "test_frames": test_count, "train_seed": PROBE_TRAIN_SEED, "test_seed": TEST_SEED,
                "control_mode": args.control, "width": args.width, "height": args.height,
-               "seed": args.seed, "config": config, "encoders": encoders}
+               "seed": args.seed, "config": config, "appearance": args.appearance,
+               "target_classes": list(class_index), "encoders": encoders}
     args.out.mkdir(parents=True, exist_ok=True)
     emit(payload, args.out / "probe.json")
     (args.out / "probe.md").write_text(write_markdown(payload))
@@ -443,6 +451,8 @@ def add_learner(parser):
                         help="probability that a training episode runs without GPS")
     parser.add_argument("--aux-coefficient", type=float, default=DEFAULTS.aux_coefficient,
                         help="weight of the visibility + localization auxiliary loss (visual arms)")
+    parser.add_argument("--appearance", type=float, default=DEFAULTS.appearance,
+                        help="randomized appearance strength during training (0 = plain render)")
     parser.add_argument("--total-steps", type=int, default=DEFAULTS.total_steps)
     parser.add_argument("--rollout-steps", type=int, default=DEFAULTS.rollout_steps)
     parser.add_argument("--sequence-length", type=int, default=DEFAULTS.sequence_length)
@@ -492,6 +502,8 @@ def parser():
     probe.add_argument("--epochs", type=int, default=20)
     probe.add_argument("--batch-size", type=int, default=128)
     probe.add_argument("--learning-rate", type=float, default=1e-3)
+    probe.add_argument("--appearance", type=float, default=DEFAULTS.appearance,
+                       help="appearance strength of catalog goal views and probe episodes (0 = plain render)")
     probe.add_argument("--out", type=Path, required=True, help="output directory for probe.json and probe.md")
     probe.set_defaults(func=probe_command)
 

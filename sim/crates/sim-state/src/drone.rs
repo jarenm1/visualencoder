@@ -40,10 +40,15 @@ pub const CAMERA_VFOV_RAD: f32 = 5.0 * core::f32::consts::PI / 12.0;
 pub const CAMERA_OFFSET: [f32; 3] = [0.0, 0.05, -0.1];
 pub const CAMERA_NEAR: f32 = 0.05;
 pub const CAMERA_FAR: f32 = 120.0;
-/// Success: within the target's scaled enclosing sphere plus this margin (metres);
-/// the per-episode radius is stored in `EpisodeSpec.stats[2]`.
-pub const SUCCESS_MARGIN: f32 = 1.0;
-pub const SUCCESS_SPEED: f32 = 3.0;
+/// Standoff task: success needs the drone within `STANDOFF_MAX` of the target's bounding
+/// box, facing it (box anchor in frame and unoccluded), slower than `HOLD_SPEED`, for
+/// `HOLD_STEPS` consecutive control steps.
+pub const STANDOFF_MAX: f32 = 6.0;
+/// Progress reward stops below this box distance: closer brings no reward, only risk.
+pub const STANDOFF_NEAR: f32 = 3.0;
+pub const HOLD_SPEED: f32 = 1.0;
+/// 0.5 s at 30 Hz.
+pub const HOLD_STEPS: u32 = 15;
 /// Maximum downward speed for a landed (not crashed) contact with landable geometry, m/s.
 pub const LANDING_SPEED: f32 = 2.0;
 /// Maximum tilt for a landed contact, radians (30 deg).
@@ -70,10 +75,15 @@ pub const MAX_TILT_TAN: f32 = 0.700_207_5;
 /// would otherwise require downward thrust.
 pub const MIN_VERTICAL_ACCEL_FRACTION: f32 = 0.1;
 
-/// One candidate episode. Written by host catalog construction; read by the native reset.
+/// One candidate episode. Written by host catalog construction; read by the native reset
+/// and the goal-view renderer.
 ///
-/// `meta = [design (split-local), bucket, landed (0/1), catalog index]`.
-/// `stats = [visible_fraction, initial_distance, success_radius, 0]`.
+/// `target` / `target_half`: centre and half extents of the target object's world AABB.
+/// `reference_eye` / `reference_forward`: the goal camera (roll-free, world up), whose
+/// view of the object supplies the goal crop `crop = [x0, y0, x1, y1]` in normalized
+/// image coordinates (top-left origin, square in normalized units so 4:3 is preserved).
+/// `meta = [object index (city layout), bucket, landed (0/1), catalog index]`.
+/// `stats = [visible_fraction, initial box distance, object class (layout index), reference visible fraction]`.
 /// Start position is the body centre; landed starts sit at landable height + RADIUS.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
@@ -83,8 +93,80 @@ pub struct EpisodeSpec {
     pub start_velocity: [f32; 4],
     pub start_rates: [f32; 4],
     pub target: [f32; 4],
+    pub target_half: [f32; 4],
+    pub reference_eye: [f32; 4],
+    pub reference_forward: [f32; 4],
+    pub crop: [f32; 4],
     pub meta: [u32; 4],
     pub stats: [f32; 4],
+}
+
+/// Euclidean distance from `p` to the axis-aligned box (`center`, `half`); 0 inside.
+#[inline(always)]
+pub fn box_distance(p: [f32; 3], center: [f32; 3], half: [f32; 3]) -> f32 {
+    let mut sum = 0.0;
+    let mut k = 0;
+    while k < 3 {
+        let offset = p[k] - center[k];
+        let d = (if offset < 0.0 { -offset } else { offset }) - half[k];
+        if d > 0.0 { sum += d * d; }
+        k += 1;
+    }
+    if sum > 0.0 { sqrt(sum) } else { 0.0 }
+}
+
+/// Parameter in [0, 1] where segment `from -> to` enters the box, or a negative value if it
+/// misses. 0 when `from` is inside.
+#[inline(always)]
+pub fn segment_box_entry(from: [f32; 3], to: [f32; 3], center: [f32; 3], half: [f32; 3]) -> f32 {
+    let mut t0 = 0.0f32;
+    let mut t1 = 1.0f32;
+    let mut k = 0;
+    while k < 3 {
+        let d = to[k] - from[k];
+        let lo = center[k] - half[k];
+        let hi = center[k] + half[k];
+        if d < 1.0e-9 && d > -1.0e-9 {
+            if from[k] < lo || from[k] > hi { return -1.0; }
+        } else {
+            let a = (lo - from[k]) / d;
+            let b = (hi - from[k]) / d;
+            let (near, far) = if a < b { (a, b) } else { (b, a) };
+            if near > t0 { t0 = near; }
+            if far < t1 { t1 = far; }
+            if t0 > t1 { return -1.0; }
+        }
+        k += 1;
+    }
+    t0
+}
+
+/// Point of the box nearest to the camera's forward ray: the part of the object the
+/// camera is most directly looking at. Used for the facing test and saliency labels.
+#[inline(always)]
+pub fn box_anchor(eye: [f32; 3], forward: [f32; 3], center: [f32; 3], half: [f32; 3]) -> [f32; 3] {
+    let rel = [center[0] - eye[0], center[1] - eye[1], center[2] - eye[2]];
+    let along = rel[0] * forward[0] + rel[1] * forward[1] + rel[2] * forward[2];
+    let t = if along > 0.0 { along } else { 0.0 };
+    let mut anchor = [0.0; 3];
+    let mut k = 0;
+    while k < 3 {
+        let p = eye[k] + forward[k] * t;
+        let lo = center[k] - half[k];
+        let hi = center[k] + half[k];
+        anchor[k] = if p < lo { lo } else if p > hi { hi } else { p };
+        k += 1;
+    }
+    anchor
+}
+
+// Newton iterations from a bit-level estimate; core has no sqrt in no_std device code.
+#[inline(always)]
+fn sqrt(x: f32) -> f32 {
+    let mut y = f32::from_bits((x.to_bits() >> 1) + 0x1fbd_1df5);
+    y = 0.5 * (y + x / y);
+    y = 0.5 * (y + x / y);
+    0.5 * (y + x / y)
 }
 
 // sin/cos of CAMERA_UPTILT_RAD; core has no trigonometry in no_std.
@@ -128,12 +210,31 @@ mod tests {
 
     #[test]
     fn episode_layout_is_exact() {
-        assert_eq!(size_of::<EpisodeSpec>(), 112);
+        assert_eq!(size_of::<EpisodeSpec>(), 176);
         assert_eq!(align_of::<EpisodeSpec>(), 16);
         assert_eq!(offset_of!(EpisodeSpec, start_rotation), 16);
         assert_eq!(offset_of!(EpisodeSpec, target), 64);
-        assert_eq!(offset_of!(EpisodeSpec, meta), 80);
-        assert_eq!(offset_of!(EpisodeSpec, stats), 96);
+        assert_eq!(offset_of!(EpisodeSpec, target_half), 80);
+        assert_eq!(offset_of!(EpisodeSpec, reference_eye), 96);
+        assert_eq!(offset_of!(EpisodeSpec, reference_forward), 112);
+        assert_eq!(offset_of!(EpisodeSpec, crop), 128);
+        assert_eq!(offset_of!(EpisodeSpec, meta), 144);
+        assert_eq!(offset_of!(EpisodeSpec, stats), 160);
+    }
+
+    #[test]
+    fn box_geometry_helpers() {
+        let (c, h) = ([0.0, 1.0, 0.0], [1.0, 1.0, 2.0]);
+        assert_eq!(box_distance([0.5, 1.5, 0.0], c, h), 0.0);
+        assert!((box_distance([4.0, 1.0, 0.0], c, h) - 3.0).abs() < 1e-5);
+        assert!((box_distance([4.0, 6.0, 0.0], c, h) - 5.0).abs() < 1e-5);
+        assert!((segment_box_entry([-5.0, 1.0, 0.0], [5.0, 1.0, 0.0], c, h) - 0.4).abs() < 1e-6);
+        assert_eq!(segment_box_entry([0.0, 1.0, 0.0], [5.0, 1.0, 0.0], c, h), 0.0);
+        assert!(segment_box_entry([-5.0, 5.0, 0.0], [5.0, 5.0, 0.0], c, h) < 0.0);
+        // Looking along +x past the box: the anchor is the box point nearest the ray.
+        let anchor = box_anchor([-5.0, 3.0, 0.0], [1.0, 0.0, 0.0], c, h);
+        assert_eq!(anchor, [0.0, 2.0, 0.0]);
+        assert!((sqrt(2.0) - core::f32::consts::SQRT_2).abs() < 1e-6);
     }
 
     #[test]

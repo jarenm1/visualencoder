@@ -1,4 +1,4 @@
-"""ABI v4 CPU-only checks: rank metrics, masked auxiliary loss, GPS heuristic, curriculum lanes."""
+"""ABI v5 CPU-only checks: rank metrics, box-region auxiliary targets, GPS heuristic, curriculum lanes."""
 import math
 import unittest
 
@@ -31,20 +31,28 @@ class RankMetricsTest(unittest.TestCase):
 
 
 class SaliencyTargetTest(unittest.TestCase):
-    def test_visible_target_maps_to_its_patch_and_hidden_to_absent_class(self):
+    def test_visible_target_spreads_over_its_box_and_hidden_goes_to_absent_class(self):
         privileged = torch.zeros(3, PRIVILEGED_WIDTH)
-        privileged[0, 14], privileged[0, 18:20] = 1.0, torch.tensor([-1.0, 1.0])     # top-left corner
-        privileged[1, 14], privileged[1, 18:20] = 1.0, torch.tensor([0.99, -0.99])   # bottom-right corner
-        privileged[2, 18:20] = torch.tensor([0.0, 0.0])                                # not visible
-        target, visible = saliency_targets(privileged, 15, 20)
-        self.assertEqual(target.tolist(), [0, 14 * 20 + 19, 300])
+        # Visible target whose projection covers the top-left 2x2 patches (patches are 0.1 x 0.133 NDC).
+        privileged[0, 14], privileged[0, 18:20] = 1.0, torch.tensor([-0.95, 0.95])
+        privileged[0, 25:29] = torch.tensor([-1.0, 0.75, -0.85, 1.0])
+        # Visible target smaller than a patch: only the anchor patch (bottom-right) carries mass.
+        privileged[1, 14], privileged[1, 18:20] = 1.0, torch.tensor([0.99, -0.99])
+        privileged[1, 25:29] = torch.tensor([0.985, -0.995, 0.995, -0.985])
+        target, visible, on_target = saliency_targets(privileged, 15, 20)
+        self.assertEqual(sorted(on_target[0].nonzero().flatten().tolist()), [0, 1, 20, 21])
+        torch.testing.assert_close(target[0, [0, 1, 20, 21]], torch.full((4,), 0.25))
+        self.assertEqual(on_target[1].nonzero().flatten().tolist(), [14 * 20 + 19])
+        self.assertEqual(target[2].argmax().item(), 300)
         self.assertEqual(visible.tolist(), [True, True, False])
+        torch.testing.assert_close(target.sum(-1), torch.ones(3))
 
-    def test_accuracy_counts_only_visible_frames(self):
+    def test_accuracy_counts_peaks_on_the_target_in_visible_frames_only(self):
         privileged = torch.zeros(2, PRIVILEGED_WIDTH)
-        privileged[0, 14], privileged[0, 18:20] = 1.0, torch.tensor([-1.0, 1.0])
+        privileged[0, 14], privileged[0, 18:20] = 1.0, torch.tensor([-0.95, 0.95])
+        privileged[0, 25:29] = torch.tensor([-1.0, 0.75, -0.85, 1.0])
         logits = torch.full((2, 301), -10.0)
-        logits[0, 0] = 10.0      # correct patch for the visible frame
+        logits[0, 21] = 10.0     # a patch inside the visible target's box, not the anchor patch
         logits[1, 5] = 10.0      # hidden frame: patch choice must not count
         loss, accuracy = saliency_loss(logits, privileged, 15, 20)
         self.assertEqual(accuracy.item(), 1.0)
@@ -71,17 +79,21 @@ class GpsPursuitTest(unittest.TestCase):
 
 
 class CurriculumLaneTest(unittest.TestCase):
-    def test_lanes_carry_bucket_weights_then_no_gps_probability(self):
-        lanes = Curriculum("adaptive", torch.device("cpu"), 0.25).lanes()
-        torch.testing.assert_close(lanes, torch.tensor([0.8, 0.15, 0.05, 0.25]))
+    def test_lanes_carry_bucket_weights_then_no_gps_then_appearance(self):
+        lanes = Curriculum("adaptive", torch.device("cpu"), 0.25, 0.5).lanes()
+        torch.testing.assert_close(lanes, torch.tensor([0.8, 0.15, 0.05, 0.25, 0.5]))
 
     def test_uniform_mode_starts_uniform(self):
         lanes = Curriculum("uniform", torch.device("cpu"), 0.0).lanes()
-        torch.testing.assert_close(lanes, torch.tensor([1 / 3, 1 / 3, 1 / 3, 0.0]))
+        torch.testing.assert_close(lanes, torch.tensor([1 / 3, 1 / 3, 1 / 3, 0.0, 1.0]))
 
     def test_no_gps_fraction_must_be_a_probability(self):
         with self.assertRaises(ValueError):
             Config(no_gps_fraction=1.5).validate()
+
+    def test_appearance_must_be_a_strength(self):
+        with self.assertRaises(ValueError):
+            Config(appearance=-0.1).validate()
 
 
 if __name__ == "__main__":

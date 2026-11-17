@@ -3,12 +3,12 @@ use std::{collections::HashSet, fs, path::{Component, Path, PathBuf}};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
-pub const FORMAT: &str = "sim-city-replay-v2";
+pub const FORMAT: &str = "sim-city-replay-v3";
 /// Four control channels (named by `action_names`) followed by these outcome fields.
 const OUTCOME_FIELDS: [&str; 5] = ["reward", "done", "success", "collision", "out_of_bounds"];
 const TRANSITION_WIDTH: usize = 4 + OUTCOME_FIELDS.len();
 const STATE_FIELDS: [&str; 13] = ["world_x", "world_y", "world_z", "quat_x", "quat_y", "quat_z", "quat_w",
-    "target_x", "target_y", "target_z", "design", "clock", "landed"];
+    "target_x", "target_y", "target_z", "catalog", "clock", "landed"];
 
 #[derive(Deserialize)]
 pub struct Recording {
@@ -19,7 +19,6 @@ pub struct Recording {
     pub video_width: u32,
     pub video_height: u32,
     pub views: Views,
-    pub style: u32,
     pub city_path: PathBuf,
     pub city_fingerprint: String,
     pub state_fields: Vec<String>,
@@ -40,7 +39,6 @@ pub struct Environment {
     pub frame_count: usize,
     pub duration_seconds: f64,
     pub outcome: String,
-    pub design: u32,
     pub video: PathBuf,
     pub states: Vec<Vec<f32>>,
     pub transitions: Vec<Vec<f64>>,
@@ -52,7 +50,6 @@ pub struct Pose {
     pub position: [f32; 3],
     /// xyzw, actual simulated attitude.
     pub rotation: [f32; 4],
-    pub target: [f32; 3],
 }
 
 /// Column indices of the named state fields used by the renderer.
@@ -61,7 +58,7 @@ pub struct StateColumns {
     position: [usize; 3],
     rotation: [usize; 4],
     target: [usize; 3],
-    design: usize,
+    catalog: usize,
     clock: usize,
 }
 
@@ -73,14 +70,13 @@ impl StateColumns {
             position: [column("world_x")?, column("world_y")?, column("world_z")?],
             rotation: [column("quat_x")?, column("quat_y")?, column("quat_z")?, column("quat_w")?],
             target: [column("target_x")?, column("target_y")?, column("target_z")?],
-            design: column("design")?,
+            catalog: column("catalog")?,
             clock: column("clock")?,
         })
     }
 
     pub fn pose(&self, state: &[f32]) -> Pose {
-        Pose { position: self.position.map(|i| state[i]), rotation: self.rotation.map(|i| state[i]),
-            target: self.target.map(|i| state[i]) }
+        Pose { position: self.position.map(|i| state[i]), rotation: self.rotation.map(|i| state[i]) }
     }
 }
 
@@ -100,7 +96,6 @@ impl Recording {
 
     fn validate(&self, directory: &Path) -> Result<StateColumns> {
         ensure!(self.format == FORMAT, "unsupported replay format {} (expected {FORMAT})", self.format);
-        ensure!(self.style <= 2, "style must be 0, 1 or 2");
         ensure!(self.control_hz.is_finite() && self.control_hz > 0.0, "control_hz must be positive and finite");
         ensure!(self.frame_width > 0 && self.frame_height > 0 && self.frame_height % 2 == 0,
             "frame dimensions must be positive, with even height for yuv420p");
@@ -151,6 +146,7 @@ impl Environment {
             "duration_seconds must equal frame_count / control_hz");
         ensure!(matches!(self.outcome.as_str(), "success" | "collision" | "out_of_bounds" | "timeout"), "unknown terminal outcome");
         let first_target = columns.target.map(|i| self.states[0][i]);
+        let first_catalog = self.states[0][columns.catalog];
         for (index, (state, transition)) in self.states.iter().zip(&self.transitions).enumerate() {
             ensure!(state.len() == recording.state_fields.len() && transition.len() == TRANSITION_WIDTH,
                 "row width mismatch at frame {index}");
@@ -158,7 +154,7 @@ impl Environment {
                 "non-finite value at frame {index}");
             ensure!(state[columns.clock] as f64 == index as f64,
                 "clock discontinuity at frame {index}; autoreset states must not be appended");
-            ensure!(state[columns.design] as f64 == f64::from(self.design), "design changes at frame {index}");
+            ensure!(state[columns.catalog] == first_catalog, "catalog changes at frame {index}");
             ensure!(columns.target.map(|i| state[i]) == first_target, "target moves at frame {index}");
             let rotation = columns.rotation.map(|i| state[i]);
             let norm = rotation.iter().map(|v| v * v).sum::<f32>().sqrt();

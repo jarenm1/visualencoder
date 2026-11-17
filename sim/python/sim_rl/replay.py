@@ -9,21 +9,29 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from PIL import Image
 
 from .cli import (DEFAULT_LIBRARY, ROOT, TEST_SEED, TEST_STYLE, TRAIN_STYLE, VALIDATION_SEED,
                   VALIDATION_STYLE, build_policy, load_checkpoint, sha256, validate_checkpoint)
 from .curriculum import UNIFORM_WEIGHTS
-from .features import FrozenFeatures
-from .native import DEFAULT_CITY, CudaEnv
+from .features import FrozenFeatures, crop_goals
+from .model import deterministic_action, saliency_targets
+from .native import DEFAULT_CITY, PRIVILEGED_WIDTH, CudaEnv
 
-# Diagnostics indices (ABI v4, width 24) recorded per frame, pre-action.
-STATE_INDEX = (0, 1, 2, 6, 7, 8, 9, 3, 4, 5, 14, 17, 18)
+# Diagnostics indices (ABI v5, width 28) recorded per frame, pre-action: pose, target centre and
+# half extents, catalog index, layout class and object, clock, landed.
+STATE_INDEX = (0, 1, 2, 6, 7, 8, 9, 3, 4, 5, 24, 25, 26, 16, 14, 27, 17, 18)
 # Privileged lanes appended per frame as ground-truth labels for saliency diagnosis
-# (replay-only; the actor never receives them).
-LABEL_INDEX = (14, 18, 19)
+# (replay-only; the actor never receives them): anchor visible, anchor NDC, anchor in frustum,
+# and the target box's screen bounds (NDC, y up).
+LABEL_INDEX = (14, 18, 19, 20, 25, 26, 27, 28)
 STATE_FIELDS = ["world_x", "world_y", "world_z", "quat_x", "quat_y", "quat_z", "quat_w",
-                "target_x", "target_y", "target_z", "design", "clock", "landed",
-                "target_visible", "target_ndc_x", "target_ndc_y"]
+                "target_x", "target_y", "target_z", "target_half_x", "target_half_y", "target_half_z",
+                "catalog", "target_class", "object", "clock", "landed",
+                "target_visible", "target_ndc_x", "target_ndc_y", "anchor_in_frustum",
+                "target_box_x0", "target_box_y0", "target_box_x1", "target_box_y1"]
+COLUMN = {name: index for index, name in enumerate(STATE_FIELDS)}
+TARGET_FIELDS = ["catalog", "target_class", "object", "target_half_x", "target_half_y", "target_half_z"]
 # Transition columns: action_names (4), then the outcome fields below.
 OUTCOME_FIELDS = ["reward", "done", "success", "collision", "out_of_bounds"]
 START_LANDED_INDEX = 19
@@ -61,10 +69,54 @@ def encoder_maps(tokens, valid):
 
 
 @torch.no_grad()
-def capture(args, saved, features, seed, style, no_gps_fraction):
-    """Roll out the deterministic policy (clamped mean) over the full horizon.
+def goal_crops(env):
+    """uint8 [n, H, W, 3]: each env's current goal crop, as the policy's goal encoder sees it.
 
-    Buckets are uniform; episodes run without GPS with probability ``no_gps_fraction``.
+    One goal render per env (slot 0 shows the requested catalog entry); render_goals restores the
+    current observation, so this is safe right after reset. Startup-time host loop.
+    """
+    images = torch.empty((env.n, env.height, env.width, 3), dtype=torch.uint8, device=env.device)
+    for slot, entry in enumerate(env.catalog_index.cpu().tolist()):
+        env.render_goals(entry)
+        crop = crop_goals(env.goal_views[:1], env.goal_crops[:1])[0]
+        images[slot].copy_((crop.clamp(0, 1) * 255).round().to(torch.uint8).permute(1, 2, 0))
+    return images
+
+
+@torch.no_grad()
+def ground_goals(env, features, grounded):
+    """Override goals with crops of the start frame at language-model boxes (see gemma_goal.py).
+
+    Returns (goal embeddings [n, 2D], has_box [n] bool, goal crops uint8 [n,H,W,3] or None,
+    retarget rows [n, 8]). Matched boxes retarget the env so success scores that object; unmatched
+    boxes still steer the policy but keep the catalog target. Call right after reset.
+    """
+    n = env.n
+    boxes = torch.zeros((n, 4), device=env.device)
+    has_box = torch.zeros(n, dtype=torch.bool, device=env.device)
+    targets = torch.full((n, 8), -1.0, device=env.device)
+    for entry in grounded["boxes"]:
+        if entry["box"] is None:
+            continue
+        boxes[entry["env"]] = torch.tensor(entry["box"])
+        has_box[entry["env"]] = True
+        if entry["object"] is not None:
+            targets[entry["env"]] = torch.tensor([*entry["center"], entry["object"], *entry["half"],
+                                                  env.layout_classes.index(entry["object_class"])])
+    crops = crop_goals(env.obs.clone(), boxes)
+    goals = features.goal_embedding(crops) if features.visual else None
+    images = (crops.clamp(0, 1) * 255).round().to(torch.uint8).permute(0, 2, 3, 1)
+    env.retarget(targets)
+    return goals, has_box, images, targets
+
+
+@torch.no_grad()
+def capture(args, saved, features, seed, style, no_gps_fraction, appearance, grounded=None):
+    """Roll out the deterministic policy (tanh of the mean) over the full horizon.
+
+    Buckets are uniform; episodes run without GPS with probability ``no_gps_fraction`` and
+    goal crops are rendered at ``appearance`` strength. With ``grounded`` (gemma_goal.py
+    boxes.json), envs with a box use the start-frame crop at that box as their goal.
     """
     metadata = saved["metadata"]
     n = args.num_envs
@@ -78,10 +130,15 @@ def capture(args, saved, features, seed, style, no_gps_fraction):
             device, horizon = env.device, env.horizon
             h, w = env.height, env.width
             patch_h, patch_w = h // 16, w // 16
-            goals = features.goal_table(env.goal_images) if features.visual else None
-            lanes = torch.tensor(UNIFORM_WEIGHTS + (no_gps_fraction,), device=device, dtype=torch.float32)
+            lanes = torch.tensor(UNIFORM_WEIGHTS + (no_gps_fraction, appearance), device=device, dtype=torch.float32)
             env.write_curriculum(lanes)
+            goals = features.catalog_goals(env, appearance) if features.visual else None
             env.reset(seed)
+            goal_images = goal_crops(env)
+            if grounded is not None:
+                # retargets stays referenced until the export sync: native reads it on the stream.
+                grounded_goals, has_box, grounded_images, retargets = ground_goals(env, features, grounded)
+                goal_images = torch.where(has_box[:, None, None, None], grounded_images, goal_images)
             start_landed = env.diagnostics[:, START_LANDED_INDEX].clone()
             gps_available = env.diagnostics[:, GPS_AVAILABLE_INDEX].clone()
             index = torch.tensor(STATE_INDEX, device=device)
@@ -106,14 +163,16 @@ def capture(args, saved, features, seed, style, no_gps_fraction):
                 if features.visual:
                     cls, patch_tokens = features.observe(env)
                     tokens[t].copy_(patch_tokens)
-                    goal = goals[env.design.long()]
+                    goal = goals[env.catalog_index.long()].float()
+                    if grounded is not None:
+                        goal = torch.where(has_box[:, None], grounded_goals, goal)
                 else:
                     cls, patch_tokens, goal = None, None, None
                 inputs, logits = policy.actor_inputs_and_features(cls, patch_tokens, goal, env.proprio, env.privileged)
                 if saliency is not None:
                     saliency[t].copy_(logits.softmax(-1))
                 mean, hidden = policy.step(inputs, hidden, starts)
-                applied = mean.clamp(-1, 1).contiguous()
+                applied = deterministic_action(mean).contiguous()
                 env.step(applied)
                 transitions[t, :, :action_width].copy_(applied)
                 transitions[t, :, 4].copy_(env.reward)
@@ -131,32 +190,39 @@ def capture(args, saved, features, seed, style, no_gps_fraction):
             return {"images": images.cpu().numpy(), "states": states.cpu().numpy(),
                     "transitions": transitions.cpu().numpy(), "ended": ended.cpu().numpy(),
                     "start_landed": start_landed.cpu().numpy(), "gps_available": gps_available.cpu().numpy(),
+                    "goal_images": goal_images.cpu().numpy(),
                     "maps": None if maps is None else maps.numpy(),
                     "saliency": None if saliency is None else saliency.float().cpu().numpy(),
                     "grid": (patch_h, patch_w),
                     "native": {"control_hz": env.control_hz, "control_mode": env.control_mode,
                                "action_names": list(env.action_names), "city_path": str(env.city_path),
+                               "target_classes": list(env.target_classes), "layout_classes": list(env.layout_classes),
                                "city_fingerprint": env.metadata["city_fingerprint"]}}
 
 
 def diagnose(probs, labels, grid):
     """Per-episode detection diagnosis from policy saliency against ground truth.
 
-    probs float [L, P+1] (softmax over patches + "not in view"); labels [L, 3] =
-    (visible, ndc_x, ndc_y). A frame counts as detected when the target centre is
-    visible, P(in view) > 0.5 and the most likely patch is within one patch of it.
+    probs float [L, P+1] (softmax over patches + "not in view"); labels [L, 8] = (visible, anchor
+    ndc_x, ndc_y, in frustum, box x0, y0, x1, y1). A frame counts as detected when the target is
+    visible, P(in view) > 0.5 and the most likely patch lies on the target, the training label.
     """
-    grid_h, grid_w = grid
+    _, _, on_target = saliency_targets(torch.as_tensor(labels_privileged(labels)), *grid)
+    on_target = on_target.numpy()
     visible = labels[:, 0] > 0.5
-    column = np.clip(np.floor((labels[:, 1] + 1) / 2 * grid_w), 0, grid_w - 1)
-    row = np.clip(np.floor((1 - labels[:, 2]) / 2 * grid_h), 0, grid_h - 1)
     best = probs[:, :-1].argmax(-1)
-    near = (np.abs(best // grid_w - row) <= 1) & (np.abs(best % grid_w - column) <= 1)
-    detected = visible & near & (probs[:, -1] < 0.5)
+    detected = visible & on_target[np.arange(len(best)), best] & (probs[:, -1] < 0.5)
     first = lambda mask: int(np.flatnonzero(mask)[0]) if mask.any() else None
     return {"visible_frames": int(visible.sum()), "detected_frames": int(detected.sum()),
             "first_visible_frame": first(visible), "first_detected_frame": first(detected),
             "detection_rate": float(detected.sum() / visible.sum()) if visible.any() else None}
+
+
+def labels_privileged(labels):
+    """Scatter recorded label columns back into privileged-lane positions for saliency_targets."""
+    privileged = np.zeros((len(labels), PRIVILEGED_WIDTH), dtype=np.float32)
+    privileged[:, list(LABEL_INDEX)] = labels
+    return privileged
 
 
 def failure_kind(outcome, diagnosis):
@@ -175,6 +241,8 @@ def record(args):
         raise ValueError("--num-envs must be positive")
     if not 0.0 <= args.no_gps_fraction <= 1.0:
         raise ValueError("--no-gps-fraction must be in [0, 1]")
+    if not 0.0 <= args.appearance <= 1.0:
+        raise ValueError("--appearance must be in [0, 1]")
     renderer = args.renderer.resolve(strict=True)
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is required; use the sim Nix development shell")
@@ -188,8 +256,17 @@ def record(args):
     seed = seeds[args.split] if args.seed is None else args.seed
     if not 0 <= seed < 2**64:
         raise ValueError("seed must fit unsigned 64 bits")
-    recording = capture(args, saved, features, seed, styles[args.split], args.no_gps_fraction)
+    grounded = None
+    if args.goal_boxes is not None:
+        grounded = json.loads(args.goal_boxes.read_text())
+        if (args.split, args.num_envs) != (grounded["split"], grounded["num_envs"]):
+            raise ValueError(f"--goal-boxes was grounded on {grounded['num_envs']} {grounded['split']} envs; "
+                             "use the same --split and --num-envs")
+        seed, args.appearance = grounded["seed"], grounded["appearance"]
+    recording = capture(args, saved, features, seed, styles[args.split], args.no_gps_fraction, args.appearance, grounded)
     torch.cuda.empty_cache()  # Release this exporter's unused memory before the renderer process.
+    if args.target_class is not None and args.target_class not in recording["native"]["target_classes"]:
+        raise ValueError(f"--target-class must be one of {', '.join(recording['native']['target_classes'])}")
     states, transitions = recording["states"], recording["transitions"]
     if not np.isfinite(states).all() or not np.isfinite(transitions).all():
         raise RuntimeError("native recording contains non-finite state or transitions")
@@ -203,11 +280,18 @@ def record(args):
             raise RuntimeError(f"environment {index} did not terminate within its finite horizon")
         length = int(terminal[0]) + 1
         episode = states[:length, index]
-        if not np.all(episode[:, 10] == episode[0, 10]) or not np.array_equal(episode[:, 11], np.arange(length)):
+        identity = [COLUMN[name] for name in TARGET_FIELDS]
+        clock = episode[:, COLUMN["clock"]]
+        if not np.all(episode[:, identity] == episode[0, identity]) or not np.array_equal(clock, np.arange(length)):
             raise RuntimeError(f"environment {index} recording crosses an autoreset boundary")
-        # One target per scene: an instruction selects episodes whose scene holds that design.
-        if args.design is not None and int(episode[0, 10]) != args.design:
+        target_class = recording["native"]["layout_classes"][int(episode[0, COLUMN["target_class"]])]
+        if args.target_class is not None and target_class != args.target_class:
             continue
+        grounding = None
+        if grounded is not None:
+            grounding = next(entry for entry in grounded["boxes"] if entry["env"] == index)
+            if grounding["box"] is None:
+                continue
         final = transitions[length - 1, index]
         outcome = ("success" if final[6] else "collision" if final[7]
                    else "out_of_bounds" if final[8] else "timeout")
@@ -215,12 +299,19 @@ def record(args):
         with (args.out / f"{basename}.rgb").open("wb") as stream:
             for frame in recording["images"][:length, index]:
                 stream.write(memoryview(np.ascontiguousarray(frame)))
+        Image.fromarray(recording["goal_images"][index]).save(args.out / f"{basename}-goal.png")
         entry = {
             "id": len(environments), "frame_count": length, "duration_seconds": length / recording["native"]["control_hz"],
             "outcome": outcome, "bucket": int(recording["ended"][length - 1, index]),
             "start_landed": bool(recording["start_landed"][index] > 0.5),
             "gps_available": bool(recording["gps_available"][index] > 0.5),
-            "design": int(episode[0, 10]),
+            "target_class": target_class, "object": int(episode[0, COLUMN["object"]]),
+            "goal": f"{basename}-goal.png",
+            # Language-grounded goal: the box, and whether success scores the boxed object
+            # (matched) or still the catalog target (unmatched).
+            "grounding": None if grounding is None else {
+                key: grounding.get(key) for key in ("box", "object", "object_class", "asset", "iou", "answer")}
+                | {"scored": grounding["object"] is not None},
             "video": f"{basename}.mp4", "states": episode.tolist(),
             "transitions": transitions[:length, index].tolist(),
         }
@@ -242,14 +333,16 @@ def record(args):
             entry["saliency"] = saliency_path.name
         environments.append(entry)
     if not environments:
-        raise RuntimeError(f"no recorded episode has target design {args.design}; record more environments")
+        raise RuntimeError("no recorded episode matches the --target-class filter or has a grounded goal box")
     width, height = metadata["width"], metadata["height"]
     manifest = {
-        "instruction": None if args.instruction_json is None else json.loads(args.instruction_json),
-        "format": "sim-city-replay-v2", "title": "City drone goal replay", "style": styles[args.split],
+        "instruction": None if grounded is None else {
+            key: grounded[key] for key in ("instruction", "model", "found", "matched", "match_iou")},
+        "format": "sim-city-replay-v3", "title": "City drone goal replay", "style": styles[args.split],
         "split": args.split, "control_hz": recording["native"]["control_hz"],
         "control_mode": recording["native"]["control_mode"], "action_names": action_names,
         "no_gps_fraction": args.no_gps_fraction,
+        "appearance": args.appearance,
         "frame_width": width, "frame_height": height, "video_width": width * 2, "video_height": height,
         "views": {"first_person": [0, 0, width, height], "third_person": [width, 0, width, height]},
         "encoder_map": None if recording["maps"] is None else {
@@ -303,7 +396,10 @@ def main():
     parser.add_argument("--split", choices=("train", "validation", "test"), default="test")
     parser.add_argument("--no-gps-fraction", type=float, default=0.0,
                         help="probability that the replayed episodes run without GPS")
-    parser.add_argument("--design", type=int,
-                        help="keep only episodes whose target is this split-local design (instruction-driven replays)")
-    parser.add_argument("--instruction-json", help="resolution record of the instruction, stored in the manifest")
+    parser.add_argument("--appearance", type=float, default=1.0,
+                        help="randomized appearance strength of the goal crops (0 = plain render)")
+    parser.add_argument("--target-class",
+                        help="keep only episodes whose target is a city object of this layout class (e.g. building)")
+    parser.add_argument("--goal-boxes", type=Path,
+                        help="gemma_goal.py boxes.json: goals are start-frame crops at these boxes (its seed and appearance)")
     record(parser.parse_args())

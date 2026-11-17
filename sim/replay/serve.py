@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Serve the offline city replay UI and only its selected recording files.
 
-With --live, POST /api/instruct {"instruction": "..."} asks Gemma 4 (sim/python/gemma_goal.py
-resolve) to pick the target design, records the trained policy on held-out episodes whose
-scene holds that design (sim/python/replay.py --design), and swaps the new recording in.
-GET /api/status reports the pipeline state. One instruction runs at a time.
+With --live, POST /api/instruct {"instruction": "..."} renders the start frames of a fresh
+held-out batch (sim/python/gemma_goal.py frames), asks Gemma 4 to box the instructed object in
+each frame (gemma_goal.py ground), records the trained policy flying to those boxes
+(sim/python/replay.py --goal-boxes), and swaps the new recording in. GET /api/status reports
+the pipeline state. One instruction runs at a time.
 """
 
 import argparse
@@ -30,9 +31,9 @@ UI_FILES = {
 VIDEO_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.mp4\Z")
 MAP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.encoder\Z")
 SALIENCY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.saliency\Z")
+GOAL_FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*-goal\.png\Z")
 BYTE_RANGE = re.compile(r"bytes=(\d*)-(\d*)\Z")
 RECORDING_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
-GOAL_IMAGE = re.compile(r"/goal/(\d{1,3})\.png\Z")
 
 
 def recording(data):
@@ -45,14 +46,14 @@ def recording(data):
     if not manifest_path.resolve(strict=True).is_relative_to(root):
         raise ValueError("manifest.json must stay inside the selected data directory")
     manifest = json.loads(manifest_path.read_bytes())
-    if manifest.get("format") != "sim-city-replay-v2":
-        raise ValueError("expected a sim-city-replay-v2 manifest")
+    if manifest.get("format") != "sim-city-replay-v3":
+        raise ValueError("expected a sim-city-replay-v3 manifest")
     environments = manifest.get("environments")
     if not isinstance(environments, list) or not environments:
         raise ValueError("manifest contains no recorded environments")
     files = {}
+    kinds = [("video", VIDEO_NAME, "video/mp4"), ("goal", GOAL_FILE, "image/png")]
     # Non-visual policies (privileged state, hint-only) have no encoder output.
-    kinds = [("video", VIDEO_NAME, "video/mp4")]
     if manifest.get("encoder_map") is not None:
         kinds.append(("encoder_map", MAP_NAME, "application/octet-stream"))
     if manifest.get("saliency") is not None:
@@ -100,6 +101,8 @@ class ReplayServer(ThreadingHTTPServer):
 REPO = Path(__file__).resolve().parents[2]
 PYTHON = REPO / ".venv/bin/python"
 INSTRUCTION_LIMIT = 300
+# Pipeline states during which a new instruction is refused.
+WORKING = ("framing", "grounding", "flying")
 
 
 def tail(text, lines=6):
@@ -116,28 +119,30 @@ def sim_python(script, *args, timeout):
 
 
 def run_instruction(server, instruction):
-    """Gemma resolve -> filtered policy recording -> swap. Runs on a worker thread."""
+    """Start frames -> Gemma boxes -> grounded policy recording -> swap. Runs on a worker thread."""
     live = server.live
     try:
-        server.report(state="resolving", instruction=instruction)
-        resolved = sim_python("sim/python/gemma_goal.py", "resolve", "--out", str(live["library"]),
-                              "--instruction", instruction, "--model", live["model"], timeout=900)
-        choice = json.loads(resolved.strip().splitlines()[-1])
-        if choice["design"] is None:
-            raise RuntimeError(f"No target matches \"{instruction}\" (Gemma answered {choice['answer']!r})")
-        out = live["out"] / time.strftime("%Y%m%d-%H%M%S")
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        work, out = live["out"] / f"{stamp}-ground", live["out"] / stamp
         # Fresh scenes per instruction; repeating an instruction must not replay the same episodes.
         seed = int.from_bytes(os.urandom(7), "little")
-        server.report(state="flying", instruction=instruction, design=choice["design"], name=choice["name"],
-                      answer=choice["answer"])
+        server.report(state="framing", instruction=instruction)
+        sim_python("sim/python/gemma_goal.py", "frames", "--out", str(work), "--num-envs", str(live["num_envs"]),
+                   "--seed", str(seed), timeout=900)
+        server.report(state="grounding", instruction=instruction)
+        sim_python("sim/python/gemma_goal.py", "ground", "--out", str(work), "--instruction", instruction,
+                   "--model", live["model"], timeout=1800)
+        grounded = json.loads((work / "boxes.json").read_text())
+        if grounded["found"] == 0:
+            raise RuntimeError(f"Gemma found nothing matching \"{instruction}\" in {grounded['num_envs']} start views")
+        server.report(state="flying", instruction=instruction, found=grounded["found"], matched=grounded["matched"])
         sim_python("sim/python/replay.py", "--checkpoint", str(live["checkpoint"]), "--out", str(out),
-                   "--num-envs", str(live["num_envs"]), "--split", "test", "--seed", str(seed),
-                   "--design", str(choice["design"]), "--instruction-json", json.dumps(choice), timeout=1800)
+                   "--num-envs", str(live["num_envs"]), "--split", "test", "--goal-boxes", str(work / "boxes.json"),
+                   timeout=1800)
         loaded = recording(out)
         server.install(loaded)
-        server.report(state="done", instruction=instruction, design=choice["design"], name=choice["name"],
-                      answer=choice["answer"], recording=loaded[0],
-                      episodes=len(json.loads(loaded[1])["environments"]))
+        server.report(state="done", instruction=instruction, found=grounded["found"], matched=grounded["matched"],
+                      recording=loaded[0], episodes=len(json.loads(loaded[1])["environments"]))
     except Exception as error:  # Reported to the page; the previous recording stays served.
         server.report(state="error", instruction=instruction, message=str(error))
 
@@ -173,14 +178,14 @@ class ReplayHandler(BaseHTTPRequestHandler):
             self.fail(400, f"Expected JSON {{\"instruction\": text of 1-{INSTRUCTION_LIMIT} characters}}")
             return
         with self.server.lock:
-            busy = self.server.status["state"] in ("resolving", "flying")
+            busy = self.server.status["state"] in WORKING
             if not busy:
-                self.server.status = {"live": True, "state": "resolving", "instruction": instruction}
+                self.server.status = {"live": True, "state": "framing", "instruction": instruction}
         if busy:
             self.json_reply(409, {"error": "an instruction is already running"})
             return
         threading.Thread(target=run_instruction, args=(self.server, instruction), daemon=True).start()
-        self.json_reply(202, {"state": "resolving", "instruction": instruction})
+        self.json_reply(202, {"state": "framing", "instruction": instruction})
 
     def headers_for(self, status, length, content_type, content_range=None):
         self.send_response(status)
@@ -229,14 +234,10 @@ class ReplayHandler(BaseHTTPRequestHandler):
             if not head:
                 self.wfile.write(body)
             return
-        goal = GOAL_IMAGE.fullmatch(path)
         if path in UI_FILES:
             name, content_type = UI_FILES[path]
             file_path = UI_ROOT / name
             root = UI_ROOT
-        elif goal and self.server.live is not None:
-            root = self.server.live["library"]
-            file_path, content_type = root / f"goal-{int(goal.group(1))}.png", "image/png"
         else:
             with self.server.lock:
                 entry = self.server.files.get(path)
@@ -308,19 +309,17 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="bind address (default: localhost only)")
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--live", action="store_true", help="enable typed instructions (Gemma 4 + policy recording)")
-    parser.add_argument("--checkpoint", type=Path, default=REPO / "runs/drone4-mean-seed0/best.pt")
-    parser.add_argument("--goal-library", type=Path, default=REPO / "runs/gemma-goal",
-                        help="held-out goal images from `gemma_goal.py dump`")
+    parser.add_argument("--checkpoint", type=Path, default=REPO / "runs/drone5-mean-seed0/best.pt")
     parser.add_argument("--live-out", type=Path, default=REPO / "runs/replay-live")
     parser.add_argument("--model", default="google/gemma-4-E4B-it")
     parser.add_argument("--live-envs", type=int, default=32, help="environments recorded per instruction")
     args = parser.parse_args()
     live = None
     if args.live:
-        if not (args.goal_library / "designs.json").is_file() or not args.checkpoint.is_file():
-            parser.exit(1, "Replay server: --live needs --goal-library (gemma_goal.py dump) and --checkpoint\n")
+        if not args.checkpoint.is_file():
+            parser.exit(1, "Replay server: --live needs a trained --checkpoint\n")
         args.live_out.mkdir(parents=True, exist_ok=True)
-        live = {"library": args.goal_library.resolve(), "checkpoint": args.checkpoint.resolve(), "out": args.live_out.resolve(),
+        live = {"checkpoint": args.checkpoint.resolve(), "out": args.live_out.resolve(),
                 "model": args.model, "num_envs": args.live_envs}
     try:
         loaded = recording(args.data)

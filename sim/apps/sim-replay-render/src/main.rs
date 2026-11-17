@@ -1,5 +1,5 @@
 //! Offline replay export from actual pre-action drone poses (real attitude) and native RGB.
-//! The split's actual target designs are drawn at recorded target positions.
+//! Placed city targets are part of the shared city geometry and are not drawn separately.
 //! No policy execution, simulation stepping, or trained-library changes occur.
 
 mod capture;
@@ -12,7 +12,7 @@ use std::{env, ffi::OsStr, path::PathBuf};
 use anyhow::{Context, Result, bail, ensure};
 use sim_scene::CityScene;
 
-use crate::{capture::Capture, proxy::Proxy, recording::Recording};
+use crate::{capture::Capture, recording::Recording};
 
 fn main() -> Result<()> {
     let mut arguments = env::args_os().skip(1);
@@ -37,7 +37,7 @@ fn main() -> Result<()> {
         recording.city_fingerprint, scene.fingerprint);
     println!("Loaded one shared city: {} triangles, {} material chunks; {}",
         scene.triangles.len(), scene.meshes.len(), scene.fingerprint);
-    let proxy = Proxy::append(&mut scene, recording.style);
-    let capture = Capture::new(&scene, &recording, &columns, &proxy)?;
-    encode::export(&capture, &scene, &proxy, &columns, &recording, &directory)
+    proxy::append(&mut scene);
+    let capture = Capture::new(&scene, &recording, &columns)?;
+    encode::export(&capture, &scene, &columns, &recording, &directory)
 }

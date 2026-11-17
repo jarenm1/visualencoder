@@ -1,7 +1,8 @@
-//! CUDA kernels for city-drone-goal-v1 (ABI v4).
+//! CUDA kernels for city-drone-goal-v2 (ABI v5).
 //!
-//! Each thread owns one environment `i`. It writes only drone body `i`, target
-//! slots `n + i*K + k`, camera matrices `i`, and row `i` of every per-env field.
+//! Each env thread owns one environment `i`. It writes only drone body `i`, camera
+//! matrices `i`, and row `i` of every per-env field. The appearance kernel owns one
+//! output pixel per thread.
 
 use cuda_device::cuda_module;
 use sim_state::BodyState;
@@ -12,8 +13,6 @@ use sim_state::drone::EpisodeSpec;
 #[derive(Clone, Copy)]
 pub(crate) struct Config {
     pub n: u32,
-    /// Target designs for this split (K).
-    pub designs: u32,
     pub catalog_size: u32,
     pub node_count: u32,
     pub seed: u64,
@@ -40,8 +39,10 @@ pub(crate) struct Config {
 #[derive(Clone, Copy)]
 pub(crate) struct EnvState {
     pub episode: u64,
-    /// Target centre (xyz); w = per-episode success radius (EpisodeSpec.stats[2]).
+    /// Target box centre (xyz, w = 0).
     pub target: [f32; 4],
+    /// Target box half extents (xyz, w = 0).
+    pub target_half: [f32; 4],
     /// Clamped action applied on the last step.
     pub action: [f32; 4],
     /// Clamped action applied on the step before.
@@ -50,16 +51,22 @@ pub(crate) struct EnvState {
     pub gps_offset: [f32; 4],
     /// Yaw-only setpoint quaternion (xyzw, rotation about world +y), velocity mode only.
     pub yaw_setpoint: [f32; 4],
+    /// Box distance at the start.
     pub initial_distance: f32,
+    /// max(box distance, STANDOFF_NEAR) after the previous step (progress reward state).
     pub previous_distance: f32,
     pub visible_start: f32,
     pub thrust: f32,
     pub step: u32,
     pub catalog: u32,
-    pub design: u32,
+    /// City layout object index and class of the target.
+    pub object: u32,
+    pub class: u32,
     pub bucket: u32,
     pub start_landed: u32,
     pub landed: u32,
+    /// Consecutive control steps inside the standoff hold condition.
+    pub hold: u32,
     /// EVENT_* bits set by the control kernel.
     pub event: u32,
     /// Per-episode GPS availability, sampled at reset (0 or 1).
@@ -88,31 +95,71 @@ pub(crate) struct Buffers {
     pub oob: *mut f32,
     pub bucket: *mut f32,
     pub episodes: *mut u64,
-    pub design: *mut i32,
+    /// Current catalog index per env (the goal-table row).
+    pub catalog_index: *mut i32,
     pub gps_available: *mut f32,
+    /// Goal crop rectangles written by `goal_view` (n x [x0, y0, x1, y1]).
+    pub crops: *mut f32,
+    /// Appearance key per camera slot: the catalog index whose appearance it renders.
+    pub keys: *mut u32,
+}
+
+/// Arguments of the per-pixel appearance kernel.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct ImageArgs {
+    /// Renderer output words: packed sRGB RGBA8, then f32 depth bits, then object IDs,
+    /// each region `pixels` words, camera-major.
+    pub rendered: *const u32,
+    /// NCHW f32 RGB in [0, 1].
+    pub output: *mut f32,
+    pub keys: *const u32,
+    /// Unique-material index per render object id - 1 (object id 0 is sky).
+    pub materials: *const u32,
+    /// Curriculum lanes; lane 4 is the appearance strength in [0, 1].
+    pub lanes: *const f32,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: u32,
+    pub mesh_count: u32,
+    /// Render counter: decorrelates sensor noise between frames.
+    pub frame: u32,
 }
 
 #[cuda_module]
 pub(crate) mod device {
-    use super::{Buffers, Config, EnvState};
+    use super::{Buffers, Config, EnvState, ImageArgs};
     use crate::task::{
-        CAMERA_FLOATS, COS_LANDING_TILT, CONTROL_RATES, DIAGNOSTIC_DIM, DISTRICT_MARGIN, EVENT_CRASH,
-        EVENT_OOB, GPS_MAX_RADIUS, GPS_MIN_RADIUS, GPS_SCALE, GPS_VERTICAL, HEIGHT_SCALE,
+        APPEARANCE_SALT, CAMERA_FLOATS, COS_LANDING_TILT, CONTROL_RATES, DIAGNOSTIC_DIM, DISTRICT_MARGIN,
+        EVENT_CRASH, EVENT_OOB, GPS_MAX_RADIUS, GPS_MIN_RADIUS, GPS_SCALE, GPS_VERTICAL, HEIGHT_SCALE,
         LANE_BUCKET, LANE_CATALOG, LANE_GPS_ANGLE, LANE_GPS_AVAILABLE, LANE_GPS_RADIUS,
         LANE_GPS_VERTICAL, LANE_GYRO, LANE_HEIGHT, LANE_VELOCITY, NOISE_GYRO, NOISE_HEIGHT,
-        NOISE_VELOCITY, PRIVILEGED_DIM, RATE_SCALE, SENSOR_DIM, SETTLE_RATE, TARGET_PARK_Y,
-        VELOCITY_SCALE, stream, unit,
+        NOISE_VELOCITY, PRIVILEGED_DIM, RATE_SCALE, SENSOR_DIM, SETTLE_RATE, VELOCITY_SCALE, mix,
+        stream, unit,
     };
     use cuda_device::{float, kernel, thread};
     use sim_state::BodyState;
     use sim_state::collision::{LANDABLE, sweep_hits};
     use sim_state::drone::{
-        ATTITUDE_GAIN, CAMERA_FAR, CAMERA_NEAR, CEILING, DRAG, GRAVITY, HORIZON, INERTIA,
-        LANDING_SPEED, MASS, MAX_RATES, MAX_THRUST, MAX_TILT_TAN, MAX_TORQUE,
-        MIN_VERTICAL_ACCEL_FRACTION, PHYSICS_HZ, RADIUS, RATE_TAU, SUBSTEPS,
-        SUCCESS_SPEED, THRUST_TAU, VELOCITY_GAIN, VELOCITY_MAX_HORIZONTAL, VELOCITY_MAX_VERTICAL,
-        YAW_RATE_MAX, camera_basis,
+        ATTITUDE_GAIN, CAMERA_FAR, CAMERA_NEAR, CEILING, DRAG, GRAVITY, HOLD_SPEED, HOLD_STEPS, HORIZON,
+        INERTIA, LANDING_SPEED, MASS, MAX_RATES, MAX_THRUST, MAX_TILT_TAN, MAX_TORQUE,
+        MIN_VERTICAL_ACCEL_FRACTION, PHYSICS_HZ, RADIUS, RATE_TAU, STANDOFF_MAX, STANDOFF_NEAR, SUBSTEPS,
+        THRUST_TAU, VELOCITY_GAIN, VELOCITY_MAX_HORIZONTAL, VELOCITY_MAX_VERTICAL, YAW_RATE_MAX,
+        box_anchor, box_distance, camera_basis, segment_box_entry,
     };
+
+    /// Per-step reward terms of the standoff task.
+    const TIME_COST: f32 = 0.01;
+    const SMOOTHNESS_COST: f32 = 0.02;
+    const RATE_COST: f32 = 0.005;
+    /// Yaw spinning is the dominant failure of the v4 policy; it costs 0.02 per step at full rate.
+    const YAW_COST: f32 = 0.02;
+    const HOLD_REWARD: f32 = 0.1;
+    const SUCCESS_REWARD: f32 = 10.0;
+    const CRASH_PENALTY: f32 = 10.0;
+    const OOB_PENALTY: f32 = 5.0;
+    /// The occlusion test stops this far before the target box (metres).
+    const BOX_STANDOFF_EPS: f32 = 0.02;
 
     #[inline(always)]
     fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -347,10 +394,9 @@ pub(crate) mod device {
         let velocity = xyz(spec.start_velocity);
         let rates = rotate(rot, xyz(spec.start_rates));
         let target = xyz(spec.target);
-        let design = spec.meta[0];
+        let half = xyz(spec.target_half);
         let start_landed = spec.meta[2];
 
-        let d0 = spec.stats[1];
         // GPS: episode-level availability (no-GPS probability p) and a fixed-metre error radius.
         let gps_available = unit(base, LANE_GPS_AVAILABLE) >= p_no_gps;
         let radius = GPS_MIN_RADIUS + (GPS_MAX_RADIUS - GPS_MIN_RADIUS) * unit(base, LANE_GPS_RADIUS);
@@ -364,21 +410,24 @@ pub(crate) mod device {
         let thrust = if start_landed != 0 { 0.0 } else { MASS * GRAVITY };
         let state = EnvState {
             episode,
-            target: [spec.target[0], spec.target[1], spec.target[2], spec.stats[2]],
+            target: pack(target),
+            target_half: pack(half),
             action: [0.0; 4],
             prev_action: [0.0; 4],
             gps_offset: pack(gps),
             yaw_setpoint: heading_quat(rot),
-            initial_distance: d0,
-            previous_distance: length(sub(target, position)),
+            initial_distance: spec.stats[1],
+            previous_distance: maxf(box_distance(position, target, half), STANDOFF_NEAR),
             visible_start: spec.stats[0],
             thrust,
             step: 0,
             catalog: index,
-            design,
+            object: spec.meta[0],
+            class: spec.stats[2] as u32,
             bucket: bucket as u32,
             start_landed,
             landed: start_landed,
+            hold: 0,
             event: 0,
             gps_available: gps_available as u32,
         };
@@ -388,23 +437,57 @@ pub(crate) mod device {
             rotation: rot,
             angular_velocity: pack(rates),
         };
-        let slot0 = config.n as usize + i * config.designs as usize;
-        let mut k = 0u32;
-        while k < config.designs {
-            let slot = if k == design {
-                BodyState { position: pack(target), velocity: [0.0; 4], rotation: [0.0, 0.0, 0.0, 1.0],
-                    angular_velocity: [0.0; 4] }
-            } else {
-                BodyState { position: [0.0, TARGET_PARK_Y, 0.0, 0.0], velocity: [0.0; 4],
-                    rotation: [0.0, 0.0, 0.0, 1.0], angular_velocity: [0.0; 4] }
-            };
-            unsafe { *buffers.bodies.add(slot0 + k as usize) = slot };
-            k += 1;
-        }
         unsafe {
             *buffers.bodies.add(i) = body;
             *buffers.states.add(i) = state;
         }
+    }
+
+    // Where the camera looks at the target box: the anchor (box point nearest the view ray),
+    // its NDC, whether it is inside the frustum, and whether it is also unoccluded. The
+    // occlusion segment stops just before the box so the object's own mesh never occludes.
+    #[inline(always)]
+    unsafe fn anchor_view(buffers: Buffers, config: Config, eye: [f32; 3], forward: [f32; 3], up: [f32; 3],
+        center: [f32; 3], half: [f32; 3]) -> ([f32; 2], bool, bool) {
+        let anchor = box_anchor(eye, forward, center, half);
+        let (ndc, in_frustum) = project(config, eye, forward, up, anchor);
+        if !in_frustum {
+            return (ndc, false, false);
+        }
+        let entry = segment_box_entry(eye, anchor, center, half);
+        let span = length(sub(anchor, eye));
+        let stop = maxf(maxf(entry, 0.0) - BOX_STANDOFF_EPS / maxf(span, 1.0e-6), 0.0);
+        let visible = stop == 0.0 || !unsafe {
+            sweep_hits(buffers.nodes, config.node_count, buffers.triangles, eye,
+                add(eye, scale(sub(anchor, eye), stop)), 0.0, LANDABLE)
+        };
+        (ndc, true, visible)
+    }
+
+    // Screen-space bounds [x_min, y_min, x_max, y_max] (NDC, y up, clipped to [-1, 1]) of the
+    // target box's projection: the image region the object occupies. A corner at or behind the
+    // near plane means the camera is at the box, so the whole frame counts.
+    #[inline(always)]
+    fn box_screen(config: Config, eye: [f32; 3], forward: [f32; 3], up: [f32; 3], center: [f32; 3],
+        half: [f32; 3]) -> [f32; 4] {
+        let right = cross(forward, up);
+        let mut bounds = [1.0f32, 1.0, -1.0, -1.0];
+        let mut corner = 0u32;
+        while corner < 8 {
+            let sign = |bit: u32| if corner & bit == 0 { -1.0 } else { 1.0 };
+            let point = [center[0] + sign(1) * half[0], center[1] + sign(2) * half[1], center[2] + sign(4) * half[2]];
+            let d = sub(point, eye);
+            let z = dot(d, forward);
+            if z <= CAMERA_NEAR {
+                return [-1.0, -1.0, 1.0, 1.0];
+            }
+            let x = dot(d, right) / (z * config.tan_half_vfov * config.aspect);
+            let y = dot(d, up) / (z * config.tan_half_vfov);
+            bounds = [if x < bounds[0] { x } else { bounds[0] }, if y < bounds[1] { y } else { bounds[1] },
+                maxf(x, bounds[2]), maxf(y, bounds[3])];
+            corner += 1;
+        }
+        [clampf(bounds[0], -1.0, 1.0), clampf(bounds[1], -1.0, 1.0), clampf(bounds[2], -1.0, 1.0), clampf(bounds[3], -1.0, 1.0)]
     }
 
     // Sensors, privileged state, diagnostics, camera matrices and per-env identity fields.
@@ -417,6 +500,7 @@ pub(crate) mod device {
         let q = body.rotation;
         let w = xyz(body.angular_velocity);
         let target = xyz(st.target);
+        let half = xyz(st.target_half);
         let base = stream(config.seed, i as u32, st.episode, st.step);
         let w_b = rotate_inverse(q, w);
         let v_b = rotate_inverse(q, v);
@@ -457,16 +541,13 @@ pub(crate) mod device {
         // Privileged (critic-only) state.
         let (eye_off, cam_forward, cam_up) = camera_basis(q);
         let eye = add(p, eye_off);
-        let (ndc, in_frustum) = project(config, eye, cam_forward, cam_up, target);
-        let seen = in_frustum && !unsafe {
-            sweep_hits(buffers.nodes, config.node_count, buffers.triangles, eye, target, 0.0, LANDABLE)
-        };
+        let (ndc, in_frustum, seen) = unsafe { anchor_view(buffers, config, eye, cam_forward, cam_up, target, half) };
         let rel_true = sub(target, p);
         let rel_body = rotate_inverse(q, rel_true);
         let pv = unsafe { buffers.privileged.add(i * PRIVILEGED_DIM) };
         unsafe {
             put3(pv, 0, scale(rel_body, 1.0 / GPS_SCALE));
-            put(pv, 3, length(rel_true) / GPS_SCALE);
+            put(pv, 3, box_distance(p, target, half) / GPS_SCALE);
             put3(pv, 4, scale(v, 1.0 / VELOCITY_SCALE));
             put3(pv, 7, scale(w_b, 1.0 / RATE_SCALE));
             put4(pv, 10, q);
@@ -477,6 +558,10 @@ pub(crate) mod device {
             put(pv, 18, ndc[0]);
             put(pv, 19, ndc[1]);
             put(pv, 20, if in_frustum { 1.0 } else { 0.0 });
+            put3(pv, 21, scale(half, 1.0 / GPS_SCALE));
+            put(pv, 24, st.hold as f32 / HOLD_STEPS as f32);
+            let screen = if seen { box_screen(config, eye, cam_forward, cam_up, target, half) } else { [0.0; 4] };
+            put4(pv, 25, screen);
         }
 
         // Diagnostics.
@@ -487,7 +572,7 @@ pub(crate) mod device {
             put4(dg, 6, q);
             put3(dg, 10, v);
             put(dg, 13, st.thrust);
-            put(dg, 14, st.design as f32);
+            put(dg, 14, st.class as f32);
             put(dg, 15, st.bucket as f32);
             put(dg, 16, st.catalog as f32);
             put(dg, 17, st.step as f32);
@@ -497,14 +582,34 @@ pub(crate) mod device {
             put(dg, 21, st.visible_start);
             put(dg, 22, (st.episode & 0xFF_FFFF) as f32);
             put(dg, 23, if st.gps_available != 0 { 1.0 } else { 0.0 });
-            *buffers.design.add(i) = st.design as i32;
+            put3(dg, 24, half);
+            put(dg, 27, st.object as f32);
+            *buffers.catalog_index.add(i) = st.catalog as i32;
             *buffers.episodes.add(i) = st.episode;
+            *buffers.keys.add(i) = st.catalog;
         }
 
         // Camera: rigid view and projection, written for the renderer to read.
         let right_cam = cross(cam_forward, cam_up);
         unsafe {
             write_camera(buffers.cameras.add(i * CAMERA_FLOATS), config, eye, right_cam, cam_up, cam_forward);
+        }
+    }
+
+    // Camera slot `i` shows catalog entry `first + i`'s goal reference view (level camera) with
+    // that entry's appearance; its crop rectangle is copied out for the learner.
+    #[inline(always)]
+    unsafe fn goal_view_env(buffers: Buffers, config: Config, i: usize, first: u32) {
+        let index = if first + (i as u32) < config.catalog_size { first + i as u32 } else { config.catalog_size - 1 };
+        let spec = unsafe { *buffers.catalog.add(index as usize) };
+        let eye = xyz(spec.reference_eye);
+        let forward = normalize(xyz(spec.reference_forward));
+        let right = normalize(cross(forward, [0.0, 1.0, 0.0]));
+        let up = cross(right, forward);
+        unsafe {
+            write_camera(buffers.cameras.add(i * CAMERA_FLOATS), config, eye, right, up, forward);
+            put4(buffers.crops.add(i * 4), 0, spec.crop);
+            *buffers.keys.add(i) = index;
         }
     }
 
@@ -698,7 +803,9 @@ pub(crate) mod device {
         }
     }
 
-    // Reward, termination flags, and autoreset for env `i` after a control step.
+    // Reward, termination flags, and autoreset for env `i` after a control step. Success is a
+    // held standoff: within STANDOFF_MAX of the target box, slower than HOLD_SPEED and facing
+    // it for HOLD_STEPS consecutive steps. Progress is rewarded only down to STANDOFF_NEAR.
     #[inline(always)]
     unsafe fn finish_env(buffers: Buffers, config: Config, i: usize) {
         let mut st = unsafe { *buffers.states.add(i) };
@@ -706,12 +813,18 @@ pub(crate) mod device {
         let p = xyz(body.position);
         let v = xyz(body.velocity);
         let w_b = rotate_inverse(body.rotation, xyz(body.angular_velocity));
-        let d = length(sub(xyz(st.target), p));
+        let center = xyz(st.target);
+        let half = xyz(st.target_half);
+        let d = box_distance(p, center, half);
         let speed = length(v);
 
         let crash = st.event & EVENT_CRASH != 0;
         let oob = st.event & EVENT_OOB != 0;
-        let success = !crash && !oob && d <= st.target[3] && speed <= SUCCESS_SPEED;
+        let (eye_off, cam_forward, cam_up) = camera_basis(body.rotation);
+        let (_, _, facing) = unsafe { anchor_view(buffers, config, add(p, eye_off), cam_forward, cam_up, center, half) };
+        let holding = !crash && !oob && d <= STANDOFF_MAX && speed <= HOLD_SPEED && facing;
+        st.hold = if holding { st.hold + 1 } else { 0 };
+        let success = st.hold >= HOLD_STEPS;
         let done = crash || oob || success || st.step >= HORIZON;
 
         let mut da2 = 0.0f32;
@@ -722,16 +835,21 @@ pub(crate) mod device {
             k += 1;
         }
         let rate_sq = dot(w_b, w_b);
-        let mut reward = (st.previous_distance - d) - 0.01 - 0.02 * da2 / 4.0
-            - 0.005 * rate_sq / (MAX_RATES[0] * MAX_RATES[0]);
+        let yaw = w_b[1] / YAW_RATE_MAX;
+        let effective = maxf(d, STANDOFF_NEAR);
+        let mut reward = (st.previous_distance - effective) - TIME_COST - SMOOTHNESS_COST * da2 / 4.0
+            - RATE_COST * rate_sq / (MAX_RATES[0] * MAX_RATES[0]) - YAW_COST * yaw * yaw;
+        if holding {
+            reward += HOLD_REWARD;
+        }
         if success {
-            reward += 10.0;
+            reward += SUCCESS_REWARD;
         }
         if crash {
-            reward -= 10.0;
+            reward -= CRASH_PENALTY;
         }
         if oob {
-            reward -= 5.0;
+            reward -= OOB_PENALTY;
         }
 
         unsafe {
@@ -743,11 +861,144 @@ pub(crate) mod device {
             *buffers.bucket.add(i) = if done { st.bucket as f32 } else { -1.0 };
             *buffers.gps_available.add(i) = if done { st.gps_available as f32 } else { -1.0 };
         }
-        st.previous_distance = d;
+        st.previous_distance = effective;
         unsafe { *buffers.states.add(i) = st };
 
         if done {
             unsafe { reset_env(buffers, config, i, st.episode + 1) };
+        }
+    }
+
+    // Lane `lane` of the appearance stream of catalog entry `key`, optionally per material.
+    #[inline(always)]
+    fn appearance_unit(key: u32, material: u32, lane: u32) -> f32 {
+        unit(mix(APPEARANCE_SALT ^ ((key as u64) << 8) ^ ((material as u64) << 40)), lane)
+    }
+
+    #[inline(always)]
+    fn signed(u: f32) -> f32 {
+        2.0 * u - 1.0
+    }
+
+    #[inline(always)]
+    fn power(x: f32, y: f32) -> f32 {
+        if x <= 0.0 { 0.0 } else { float::ex2_approx_f32(y * float::lg2_approx_f32(x)) }
+    }
+
+    #[inline(always)]
+    fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+        [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
+    }
+
+    // Hue rotation, saturation and value scaling in YIQ, on display-referred RGB.
+    #[inline(always)]
+    fn recolor(c: [f32; 3], hue: f32, saturation: f32, value: f32) -> [f32; 3] {
+        let y = 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
+        let i = 0.596 * c[0] - 0.274 * c[1] - 0.322 * c[2];
+        let q = 0.211 * c[0] - 0.523 * c[1] + 0.312 * c[2];
+        let (s, k) = (float::sin_approx_f32(hue), float::cos_approx_f32(hue));
+        let i2 = (i * k - q * s) * saturation;
+        let q2 = (i * s + q * k) * saturation;
+        let y2 = y * value;
+        [y2 + 0.956 * i2 + 0.621 * q2, y2 - 0.272 * i2 - 0.647 * q2, y2 - 1.106 * i2 + 1.703 * q2]
+    }
+
+    // Per-pixel randomized appearance, keyed by the catalog entry so an episode and its goal
+    // view share one look: per-material hue/saturation/value, sky gradient, depth fog, exposure,
+    // white balance, contrast, gamma and sensor noise. Strength 0 reproduces the plain render.
+    #[kernel]
+    pub unsafe fn appearance(args: ImageArgs) {
+        let index = thread::index_1d().get();
+        if index >= args.pixels as usize {
+            return;
+        }
+        let plane = (args.width * args.height) as usize;
+        let camera = index / plane;
+        let pixel = index - camera * plane;
+        let row = pixel / args.width as usize;
+        let word = unsafe { *args.rendered.add(index) };
+        let mut c = [(word & 0xff) as f32 / 255.0, ((word >> 8) & 0xff) as f32 / 255.0, ((word >> 16) & 0xff) as f32 / 255.0];
+        let raw = unsafe { *args.lanes.add(4) };
+        let s = if raw != raw { 0.0 } else { clampf(raw, 0.0, 1.0) };
+        if s > 0.0 {
+            let depth = f32::from_bits(unsafe { *args.rendered.add(args.pixels as usize + index) });
+            let id = unsafe { *args.rendered.add(2 * args.pixels as usize + index) };
+            let key = unsafe { *args.keys.add(camera) };
+            // Sky: blue to overcast grey at the top, warmer and lighter toward the horizon.
+            let top = lerp3([0.35, 0.55, 0.85], [0.70, 0.72, 0.75], appearance_unit(key, 0, 0));
+            let horizon = lerp3([clampf(top[0] * 1.25, 0.0, 1.0), clampf(top[1] * 1.2, 0.0, 1.0), clampf(top[2] * 1.1, 0.0, 1.0)],
+                [0.95, 0.65, 0.45], 0.6 * appearance_unit(key, 0, 1));
+            if id == 0 {
+                let t = row as f32 / maxf((args.height - 1) as f32, 1.0);
+                c = lerp3(c, lerp3(top, horizon, t), s);
+            } else {
+                let material = if id - 1 < args.mesh_count { 1 + unsafe { *args.materials.add((id - 1) as usize) } } else { 0 };
+                c = recolor(c, s * signed(appearance_unit(key, material, 0)) * 0.35,
+                    1.0 + s * signed(appearance_unit(key, material, 1)) * 0.4,
+                    1.0 + s * signed(appearance_unit(key, material, 2)) * 0.25);
+                let density = s * appearance_unit(key, 0, 2) * 0.02;
+                let fog = 1.0 - float::ex2_approx_f32(-density * depth * core::f32::consts::LOG2_E);
+                c = lerp3(c, horizon, fog);
+            }
+            let exposure = float::ex2_approx_f32(s * signed(appearance_unit(key, 0, 3)) * 0.6);
+            let contrast = 1.0 + s * signed(appearance_unit(key, 0, 7)) * 0.2;
+            let gamma = float::ex2_approx_f32(s * signed(appearance_unit(key, 0, 8)) * 0.3);
+            let sigma = s * appearance_unit(key, 0, 9) * 0.03;
+            let noise = mix(((index as u64) << 20) ^ ((args.frame as u64) << 52) ^ key as u64);
+            let mut k = 0usize;
+            while k < 3 {
+                let balance = 1.0 + s * signed(appearance_unit(key, 0, 4 + k as u32)) * 0.12;
+                let v = (c[k] * balance * exposure - 0.5) * contrast + 0.5;
+                let grain = (unit(noise, 3 * k as u32) + unit(noise, 3 * k as u32 + 1) + unit(noise, 3 * k as u32 + 2) - 1.5) * 2.0;
+                c[k] = clampf(power(clampf(v, 0.0, 1.0), gamma) + sigma * grain, 0.0, 1.0);
+                k += 1;
+            }
+        }
+        let mut k = 0usize;
+        while k < 3 {
+            unsafe { *args.output.add((camera * 3 + k) * plane + pixel) = c[k] };
+            k += 1;
+        }
+    }
+
+    #[kernel]
+    pub unsafe fn goal_view(buffers: Buffers, config: Config, first: u32) {
+        let i = thread::index_1d().get();
+        if i >= config.n as usize {
+            return;
+        }
+        unsafe { goal_view_env(buffers, config, i, first) };
+    }
+
+    // Replaces env i's current-episode target where `targets[i*8 + 3] >= 0`. Row layout:
+    // [centre x, y, z, layout object, half x, y, z, layout class]. Success, reward and labels then
+    // refer to that box until the episode ends; autoreset returns to catalog targets.
+    #[kernel]
+    pub unsafe fn retarget(buffers: Buffers, config: Config, targets: *const f32) {
+        let i = thread::index_1d().get();
+        if i >= config.n as usize {
+            return;
+        }
+        let row = unsafe { targets.add(i * 8) };
+        let object = unsafe { *row.add(3) };
+        if !(object >= 0.0) {
+            return;
+        }
+        let center = unsafe { [*row, *row.add(1), *row.add(2)] };
+        let half = unsafe { [*row.add(4), *row.add(5), *row.add(6)] };
+        let mut st = unsafe { *buffers.states.add(i) };
+        let p = xyz(unsafe { *buffers.bodies.add(i) }.position);
+        let distance = box_distance(p, center, half);
+        st.target = pack(center);
+        st.target_half = pack(half);
+        st.object = object as u32;
+        st.class = unsafe { *row.add(7) } as u32;
+        st.initial_distance = distance;
+        st.previous_distance = maxf(distance, STANDOFF_NEAR);
+        st.hold = 0;
+        unsafe {
+            *buffers.states.add(i) = st;
+            observe_env(buffers, config, i);
         }
     }
 

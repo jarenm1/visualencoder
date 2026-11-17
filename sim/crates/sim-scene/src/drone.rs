@@ -1,114 +1,72 @@
-//! Visual-goal task catalogue: target designs, split districts and seeded episode candidates.
+//! Visual-goal task catalogue: city-object targets, split districts and seeded episodes.
 //!
 //! Host-side and deterministic. Each candidate draws from its own stream keyed by
 //! (seed, style, index), so results are independent of the visibility thread count.
+//!
+//! A target is one placed asset of the city layout (building, vehicle, vegetation or
+//! prop) lying wholly inside the split's district. Every episode also fixes a goal
+//! reference camera that sees the object and the crop of that view the policy receives
+//! as its goal: either the start view itself (the operator taps the object in the first
+//! frame) or an independent nearby viewpoint.
 
 use anyhow::{Result, bail, ensure};
 use glam::Vec3;
 use serde_json::json;
-use sim_render::{Material, MeshData};
 use sim_state::collision::LANDABLE;
-use sim_state::drone::{self, BUCKETS, EpisodeSpec};
+use sim_state::drone::{self, BUCKETS, EpisodeSpec, box_distance, segment_box_entry};
 
-use crate::CityScene;
+use crate::{CityObject, CityScene};
 
-const SHAPES: [&str; 6] = ["sphere", "cube", "cylinder", "cone", "octahedron", "torus"];
-const VARIANTS: usize = 8;
-const SPLIT_SIZES: [usize; 3] = [32, 8, 8];
-const DESIGN_SEED: u64 = 0x7A11_D351_6E00_0001;
-const PALETTE: [[f32; 3]; VARIANTS] = [
-    [0.85, 0.15, 0.12],
-    [0.10, 0.35, 0.85],
-    [0.95, 0.80, 0.10],
-    [0.15, 0.70, 0.25],
-    [0.95, 0.95, 0.95],
-    [0.75, 0.20, 0.75],
-    [0.95, 0.50, 0.10],
-    [0.10, 0.75, 0.80],
-];
-/// Edge length of the unit design in metres: at the 20 m maximum start distance a 1.5 m
-/// target spans about one 16 px encoder patch at 320x240 with the 75-degree camera.
-const SCALE_RANGE: [f32; 2] = [1.5, 2.5];
-const _: () = assert!(SPLIT_SIZES[0] + SPLIT_SIZES[1] + SPLIT_SIZES[2] == SHAPES.len() * VARIANTS);
-
-const SURFACE_SAMPLES: usize = 64;
+/// Layout classes that can be targets: the discrete, solid objects of the city.
+pub const TARGET_CLASSES: [&str; 4] = ["building", "vehicle", "vegetation", "prop"];
+/// Box-surface sample points per visibility estimate.
+const BOX_SAMPLES: usize = 64;
 /// Visible fraction thresholds: bucket 0 at or above the first, bucket 1 at or above the second.
 const BUCKET_EDGES: [f32; 2] = [0.5, 0.05];
 const MIN_BUCKET: usize = 512;
 const MIN_CANDIDATES: usize = 4096;
-const MAX_ATTEMPTS: u32 = 256;
+/// Placement attempts per drawn object, and object draws per candidate.
+const MAX_ATTEMPTS: u32 = 32;
+const MAX_OBJECTS: u32 = 64;
 /// Validation and test districts are 96 m squares, so their half size is 48 m.
 const DISTRICT_HALF: f32 = 48.0;
 const EXCLUSION_MARGIN: f32 = 16.0;
 const DISTRICT_MARGIN: f32 = 2.0;
-const TARGET_HEIGHT: [f32; 2] = [2.0, 7.0];
-const TARGET_CLEARANCE: f32 = 1.0;
-/// Bottom of the target's enclosing sphere stays this far above the landable plane.
-const TARGET_GROUND_CLEARANCE: f32 = 0.5;
+/// Targets need at least this extent (metres) along some axis.
+const MIN_TARGET_EXTENT: f32 = 0.5;
+/// Classes whose members look alike and stand in clusters (forest trees, rocks, lamps) must
+/// be at least `ISOLATION_GAP` metres (horizontal box gap) from any object of their class,
+/// so a goal crop identifies one object. Buildings differ by design; vehicles stand apart.
+const ISOLATED_CLASSES: [&str; 2] = ["vegetation", "prop"];
+const ISOLATION_GAP: f32 = 2.0;
 const FLYING_HEIGHT: [f32; 2] = [1.5, 12.0];
 const FLYING_CLEARANCE: f32 = 1.0;
 /// 15 degrees.
 const START_TILT_RAD: f32 = core::f32::consts::PI / 12.0;
 const START_SPEED: f32 = 2.0;
 const START_RATE: f32 = 0.5;
-const START_TARGET_DISTANCE: [f32; 2] = [4.0, 20.0];
-/// Aspect ratio used by the visibility frustum. Catalogue construction takes no image
-/// size, so this is fixed here; renders must use the same aspect for the buckets to match.
+/// Start distance from the target's box surface; always beyond the standoff band.
+const START_BOX_DISTANCE: [f32; 2] = [8.0, 30.0];
+/// Goal reference camera: distance from the box surface and height above the landable plane,
+/// in the range the drone itself flies (bird's-eye references made unrecognizable goals).
+const REFERENCE_BOX_DISTANCE: [f32; 2] = [5.0, 25.0];
+const REFERENCE_HEIGHT: [f32; 2] = [1.5, 12.0];
+/// Yaw and pitch jitter of the reference camera away from the box centre (~11 degrees).
+const REFERENCE_JITTER_RAD: f32 = 0.2;
+const REFERENCE_CLEARANCE: f32 = 0.5;
+const REFERENCE_MIN_VISIBLE: f32 = 0.5;
+const REFERENCE_ATTEMPTS: u32 = 64;
+/// Visible starts reuse the start view as the goal reference with this probability.
+const START_REFERENCE_PROBABILITY: f32 = 0.5;
+/// Goal crop: projected box bounds grown by this fraction per side, squared in normalized
+/// units (4:3 in pixels). The object must project to at least `MIN_PROJECTED` of the frame and
+/// the crop may cover at most `CROP_MAX`, so every goal shows one recognizable object.
+const CROP_MARGIN: f32 = 0.15;
+const MIN_PROJECTED: f32 = 0.08;
+const CROP_MAX: f32 = 0.8;
+/// Aspect ratio used by the visibility frustum and goal crops. Catalogue construction
+/// takes no image size, so this is fixed here; renders must use the same aspect.
 const CATALOG_ASPECT: f32 = 4.0 / 3.0;
-
-/// One target design. `index` is split-local; `scale` is the object's size in metres.
-pub struct TargetDesign {
-    pub name: String,
-    pub mesh: MeshData,
-    pub material: Material,
-    pub scale: f32,
-    pub split: u32,
-    pub index: u32,
-}
-
-/// Returns the 48 designs ordered by split, then split-local index. The assignment is a
-/// fixed seeded shuffle of the 6 shapes x 8 variants, cut into 32 train, 8 validation, 8 test.
-pub fn target_designs() -> Vec<TargetDesign> {
-    let mut order: Vec<usize> = (0..SHAPES.len() * VARIANTS).collect();
-    let mut rng = Rng::new(DESIGN_SEED);
-    for i in (1..order.len()).rev() {
-        let j = rng.below(i + 1);
-        order.swap(i, j);
-    }
-    let mut designs = Vec::with_capacity(order.len());
-    let mut offset = 0;
-    for (split, &count) in SPLIT_SIZES.iter().enumerate() {
-        for (index, &id) in order[offset..offset + count].iter().enumerate() {
-            designs.push(design(id, split as u32, index as u32));
-        }
-        offset += count;
-    }
-    designs
-}
-
-fn design(id: usize, split: u32, index: u32) -> TargetDesign {
-    let shape = id / VARIANTS;
-    let variant = id % VARIANTS;
-    let mesh = match shape {
-        0 => MeshData::sphere(24, 16),
-        1 => MeshData::cube(),
-        2 => MeshData::cylinder(24),
-        3 => MeshData::cone(24),
-        4 => MeshData::octahedron(),
-        _ => MeshData::torus(24, 12, 0.35),
-    };
-    let [r, g, b] = PALETTE[variant];
-    let material = Material {
-        color: [r, g, b, 1.0],
-        shininess: 32.0,
-        checker_scale: if variant % 2 == 1 { 3.0 } else { 0.0 },
-        checker_contrast: 0.5,
-        ..Material::default()
-    };
-    let unit = Rng::new(DESIGN_SEED ^ id as u64).unit();
-    let scale = SCALE_RANGE[0] + (SCALE_RANGE[1] - SCALE_RANGE[0]) * unit;
-    TargetDesign { name: format!("{}-{}", SHAPES[shape], variant), mesh, material, scale, split, index }
-}
 
 /// Horizontal (x, z) region for one split. Start and target points must lie inside
 /// `[min, max]` shrunk by a margin and outside every exclusion rectangle.
@@ -155,8 +113,42 @@ pub fn district(style: u32, half_extent: f32) -> District {
     }
 }
 
+/// Target-eligible object indices of one split, grouped by `TARGET_CLASSES` order.
+pub fn target_pools(scene: &CityScene, district: &District) -> Result<[Vec<u32>; TARGET_CLASSES.len()]> {
+    let mut classes = [0u32; TARGET_CLASSES.len()];
+    for (slot, name) in TARGET_CLASSES.iter().enumerate() {
+        classes[slot] = scene.classes.iter().position(|c| c == name)
+            .ok_or_else(|| anyhow::anyhow!("layout lacks target class {name}"))? as u32;
+    }
+    let isolated: Vec<bool> = TARGET_CLASSES.iter().map(|name| ISOLATED_CLASSES.contains(name)).collect();
+    let mut pools: [Vec<u32>; TARGET_CLASSES.len()] = Default::default();
+    for (index, object) in scene.objects.iter().enumerate() {
+        let Some(slot) = classes.iter().position(|&c| c == object.class) else { continue };
+        let (c, h) = (object.center, object.half);
+        let corners = [[c.x - h.x, c.z - h.z], [c.x + h.x, c.z - h.z], [c.x - h.x, c.z + h.z], [c.x + h.x, c.z + h.z]];
+        if 2.0 * h.max_element() < MIN_TARGET_EXTENT || !corners.iter().all(|&p| district.contains(p, DISTRICT_MARGIN)) {
+            continue;
+        }
+        let crowded = isolated[slot] && scene.objects.iter().enumerate().any(|(other, neighbour)| {
+            other != index && neighbour.class == object.class && horizontal_gap(object, neighbour) < ISOLATION_GAP
+        });
+        if !crowded {
+            pools[slot].push(index as u32);
+        }
+    }
+    ensure!(pools.iter().any(|pool| !pool.is_empty()), "district holds no target objects");
+    Ok(pools)
+}
+
+/// Horizontal (x, z) gap between two objects' boxes; 0 when they overlap.
+fn horizontal_gap(a: &CityObject, b: &CityObject) -> f32 {
+    let gap = |ca: f32, ha: f32, cb: f32, hb: f32| ((ca - cb).abs() - ha - hb).max(0.0);
+    let (x, z) = (gap(a.center.x, a.half.x, b.center.x, b.half.x), gap(a.center.z, a.half.z, b.center.z, b.half.z));
+    (x * x + z * z).sqrt()
+}
+
 /// Candidate episodes for one split. `episodes` is sorted by bucket; `bucket_ranges` holds
-/// `[first, count]` per bucket; `rules` records the generation rules and bucket counts.
+/// `[first, count]` per bucket; `rules` records the generation rules and counts.
 pub struct Catalog {
     pub episodes: Vec<EpisodeSpec>,
     pub bucket_ranges: [[u32; 2]; BUCKETS],
@@ -168,29 +160,30 @@ struct Candidate {
     episode: EpisodeSpec,
 }
 
-/// Per-design data the candidate generator needs. Samples are in unit mesh space.
-struct Slot {
-    index: u32,
-    scale: f32,
-    radius: f32,
-    samples: Vec<Vec3>,
-}
-
-impl Slot {
-    fn new(design: &TargetDesign) -> Self {
-        let radius = design.mesh.vertices.iter()
-            .map(|v| Vec3::from_array(v.position).length())
-            .fold(0.0, f32::max);
-        Self { index: design.index, scale: design.scale, radius, samples: surface_samples(&design.mesh) }
-    }
-}
-
 struct Ctx<'a> {
     scene: &'a CityScene,
-    slots: Vec<Slot>,
+    pools: [Vec<u32>; TARGET_CLASSES.len()],
     district: District,
     seed: u64,
     style: u32,
+}
+
+/// A roll-free or body camera: eye and orthonormal forward/up/right.
+#[derive(Clone, Copy)]
+struct View {
+    eye: Vec3,
+    forward: Vec3,
+    up: Vec3,
+    right: Vec3,
+}
+
+impl View {
+    /// Roll-free camera looking along `forward` (world up stays up in the image).
+    fn level(eye: Vec3, forward: Vec3) -> Self {
+        let forward = forward.normalize();
+        let right = forward.cross(Vec3::Y).normalize();
+        Self { eye, forward, up: right.cross(forward), right }
+    }
 }
 
 /// Builds the seeded catalogue of `size` candidates for one split. Errors if any bucket
@@ -198,11 +191,12 @@ struct Ctx<'a> {
 pub fn build_catalog(scene: &CityScene, style: u32, size: usize, seed: u64) -> Result<Catalog> {
     ensure!(style < 3, "style must be 0, 1 or 2, got {style}");
     ensure!(size >= MIN_CANDIDATES, "catalog needs at least {MIN_CANDIDATES} candidates, got {size}");
-    let slots: Vec<Slot> = target_designs().iter().filter(|d| d.split == style).map(Slot::new).collect();
-    let ctx = Ctx { scene, slots, district: district(style, scene.half_extent), seed, style };
+    let district = district(style, scene.half_extent);
+    let pools = target_pools(scene, &district)?;
+    let ctx = Ctx { scene, pools, district, seed, style };
     let candidates = generate(&ctx, size)?;
     let (episodes, bucket_ranges, counts) = finalize(candidates, MIN_BUCKET)?;
-    let rules = rules(scene, &ctx, size, counts);
+    let rules = rules(scene, &ctx, size, counts, &episodes);
     Ok(Catalog { episodes, bucket_ranges, rules })
 }
 
@@ -226,49 +220,39 @@ fn generate(ctx: &Ctx, size: usize) -> Result<Vec<Candidate>> {
 
 fn candidate(ctx: &Ctx, index: usize) -> Result<Candidate> {
     let mut rng = Rng::stream(ctx.seed, ctx.style, index as u64);
-    let slot = &ctx.slots[rng.below(ctx.slots.len())];
-    for _ in 0..MAX_ATTEMPTS {
-        if let Some(candidate) = attempt(ctx, slot, &mut rng) {
-            return Ok(candidate);
+    // Classes are drawn uniformly so the thousands of forest trees do not dominate. Objects
+    // without a clear start or goal view (e.g. trees deep in the forest) are re-drawn.
+    let classes: Vec<&Vec<u32>> = ctx.pools.iter().filter(|pool| !pool.is_empty()).collect();
+    for _ in 0..MAX_OBJECTS {
+        let pool = classes[rng.below(classes.len())];
+        let object = pool[rng.below(pool.len())];
+        for _ in 0..MAX_ATTEMPTS {
+            if let Some(candidate) = attempt(ctx, object, &mut rng) {
+                return Ok(candidate);
+            }
         }
     }
-    bail!("candidate {index} found no valid start and target in {MAX_ATTEMPTS} attempts")
+    bail!("candidate {index} found no placeable object in {MAX_OBJECTS} draws of {MAX_ATTEMPTS} attempts")
 }
 
-fn attempt(ctx: &Ctx, slot: &Slot, rng: &mut Rng) -> Option<Candidate> {
+fn attempt(ctx: &Ctx, object: u32, rng: &mut Rng) -> Option<Candidate> {
     let scene = ctx.scene;
     let plane = scene.landable.height;
-    let district = &ctx.district;
+    let target = &scene.objects[object as usize];
+    let (center, half) = (target.center, target.half);
+    let radius = (half.x * half.x + half.z * half.z).sqrt();
 
-    // Target: hovering over the district, clear of non-landable geometry by 1 m beyond
-    // its enclosing sphere.
-    let target_xz = [rng.range(district.min[0], district.max[0]), rng.range(district.min[1], district.max[1])];
-    if !district.contains(target_xz, DISTRICT_MARGIN + slot.scale) {
-        return None;
-    }
-    let target_y = plane + rng.range(TARGET_HEIGHT[0], TARGET_HEIGHT[1]);
-    let target = Vec3::new(target_xz[0], target_y, target_xz[1]);
-    let enclosing = slot.scale * slot.radius;
-    if target_y - enclosing < plane + TARGET_GROUND_CLEARANCE
-        || scene.sweep_hits(target.to_array(), target.to_array(), TARGET_CLEARANCE + enclosing, LANDABLE) {
-        return None;
-    }
-
-    // Start: landed on the plane or flying, at a 3-D distance inside the goal range.
+    // Start: landed on the plane or flying, at a box distance inside the start range.
     let landed = rng.unit() < 0.5;
     let start_y = if landed { plane + drone::RADIUS } else { plane + rng.range(FLYING_HEIGHT[0], FLYING_HEIGHT[1]) };
-    let distance = rng.range(START_TARGET_DISTANCE[0], START_TARGET_DISTANCE[1]);
-    let dy = start_y - target_y;
-    if dy.abs() >= distance || distance <= enclosing + drone::SUCCESS_MARGIN + drone::RADIUS {
-        return None;
-    }
-    let horizontal = (distance * distance - dy * dy).sqrt();
     let bearing = rng.range(0.0, core::f32::consts::TAU);
-    let start_xz = [target_xz[0] + horizontal * bearing.cos(), target_xz[1] + horizontal * bearing.sin()];
-    if !district.contains(start_xz, DISTRICT_MARGIN) {
+    let reach = rng.range(radius + START_BOX_DISTANCE[0], radius + START_BOX_DISTANCE[1]);
+    let start = Vec3::new(center.x + reach * bearing.cos(), start_y, center.z + reach * bearing.sin());
+    let distance = box_distance(start.to_array(), center.to_array(), half.to_array());
+    if !(START_BOX_DISTANCE[0]..=START_BOX_DISTANCE[1]).contains(&distance)
+        || !ctx.district.contains([start.x, start.z], DISTRICT_MARGIN) {
         return None;
     }
-    let start = Vec3::new(start_xz[0], start_y, start_xz[1]);
     let clearance = if landed { drone::RADIUS } else { FLYING_CLEARANCE };
     if scene.sweep_hits(start.to_array(), start.to_array(), clearance, LANDABLE) {
         return None;
@@ -289,18 +273,11 @@ fn attempt(ctx: &Ctx, slot: &Slot, rng: &mut Rng) -> Option<Candidate> {
         (rng.in_ball(START_SPEED), rng.in_ball(START_RATE))
     };
 
-    // Visibility from the start camera: each surface sample must be inside the frustum and
-    // reachable from the eye along a radius-0 segment free of non-landable geometry.
     let (eye_offset, forward, up) = drone::camera_basis(rotation);
-    let eye = start + Vec3::from_array(eye_offset);
     let forward = Vec3::from_array(forward);
     let up = Vec3::from_array(up);
-    let right = forward.cross(up);
-    let half_tan = (drone::CAMERA_VFOV_RAD * 0.5).tan();
-    let visible = slot.samples.iter().copied()
-        .filter(|s| visible_from(scene, eye, forward, up, right, half_tan, target + *s * slot.scale))
-        .count();
-    let fraction = visible as f32 / slot.samples.len() as f32;
+    let start_view = View { eye: start + Vec3::from_array(eye_offset), forward, up, right: forward.cross(up) };
+    let fraction = visible_fraction(scene, &start_view, center, half);
     let bucket = if fraction >= BUCKET_EDGES[0] {
         0
     } else if fraction >= BUCKET_EDGES[1] {
@@ -309,6 +286,18 @@ fn attempt(ctx: &Ctx, slot: &Slot, rng: &mut Rng) -> Option<Candidate> {
         2
     };
 
+    // Goal reference: the start view (level copy) or an independent viewpoint of the object,
+    // whichever gives a valid crop (the start view of a close building may not).
+    let start_reference = (bucket == 0 && rng.unit() < START_REFERENCE_PROBABILITY).then(|| {
+        let level = View::level(start_view.eye, start_view.forward);
+        (level, visible_fraction(scene, &level, center, half))
+    }).filter(|(view, visible)| *visible >= REFERENCE_MIN_VISIBLE && crop_rect(view, center, half).is_some());
+    let (reference, reference_fraction) = match start_reference {
+        Some(reference) => reference,
+        None => reference_view(ctx, center, half, radius, rng)?,
+    };
+    let crop = crop_rect(&reference, center, half)?;
+
     Some(Candidate {
         bucket,
         episode: EpisodeSpec {
@@ -316,24 +305,130 @@ fn attempt(ctx: &Ctx, slot: &Slot, rng: &mut Rng) -> Option<Candidate> {
             start_rotation: rotation,
             start_velocity: velocity.extend(0.0).to_array(),
             start_rates: rates.extend(0.0).to_array(),
-            target: target.extend(0.0).to_array(),
-            meta: [slot.index, bucket as u32, landed as u32, 0],
-            stats: [fraction, start.distance(target), enclosing + drone::SUCCESS_MARGIN, 0.0],
+            target: center.extend(0.0).to_array(),
+            target_half: half.extend(0.0).to_array(),
+            reference_eye: reference.eye.extend(0.0).to_array(),
+            reference_forward: reference.forward.extend(0.0).to_array(),
+            crop,
+            meta: [object, bucket as u32, landed as u32, 0],
+            stats: [fraction, distance, target.class as f32, reference_fraction],
         },
     })
 }
 
-fn visible_from(scene: &CityScene, eye: Vec3, forward: Vec3, up: Vec3, right: Vec3, half_tan: f32, point: Vec3) -> bool {
-    let d = point - eye;
-    let depth = d.dot(forward);
-    if !(drone::CAMERA_NEAR..=drone::CAMERA_FAR).contains(&depth) {
-        return false;
+/// A level camera near the object that sees at least half of its box samples and frames it
+/// in a valid goal crop.
+fn reference_view(ctx: &Ctx, center: Vec3, half: Vec3, radius: f32, rng: &mut Rng) -> Option<(View, f32)> {
+    let scene = ctx.scene;
+    let plane = scene.landable.height;
+    for _ in 0..REFERENCE_ATTEMPTS {
+        let bearing = rng.range(0.0, core::f32::consts::TAU);
+        let reach = rng.range(radius + REFERENCE_BOX_DISTANCE[0], radius + REFERENCE_BOX_DISTANCE[1]);
+        let height = plane + rng.range(REFERENCE_HEIGHT[0], REFERENCE_HEIGHT[1]);
+        let eye = Vec3::new(center.x + reach * bearing.cos(), height, center.z + reach * bearing.sin());
+        let distance = box_distance(eye.to_array(), center.to_array(), half.to_array());
+        if !(REFERENCE_BOX_DISTANCE[0]..=REFERENCE_BOX_DISTANCE[1]).contains(&distance)
+            || !ctx.district.contains([eye.x, eye.z], DISTRICT_MARGIN)
+            || scene.sweep_hits(eye.to_array(), eye.to_array(), REFERENCE_CLEARANCE, LANDABLE) {
+            continue;
+        }
+        let toward = (center - eye).normalize();
+        let yaw = rng.range(-REFERENCE_JITTER_RAD, REFERENCE_JITTER_RAD);
+        let pitch = (toward.y.asin() + rng.range(-REFERENCE_JITTER_RAD, REFERENCE_JITTER_RAD)).clamp(-1.3, 1.3);
+        let heading = toward.z.atan2(toward.x) + yaw;
+        let forward = Vec3::new(pitch.cos() * heading.cos(), pitch.sin(), pitch.cos() * heading.sin());
+        let view = View::level(eye, forward);
+        let fraction = visible_fraction(scene, &view, center, half);
+        if fraction >= REFERENCE_MIN_VISIBLE && crop_rect(&view, center, half).is_some() {
+            return Some((view, fraction));
+        }
     }
-    let half_h = depth * half_tan;
-    if d.dot(up).abs() > half_h || d.dot(right).abs() > half_h * CATALOG_ASPECT {
-        return false;
+    None
+}
+
+/// Fraction of box-surface samples inside the frustum whose sight line reaches the box
+/// unobstructed by non-landable geometry. The line stops 2 cm before the box, so the
+/// object's own triangles never count as occluders.
+fn visible_fraction(scene: &CityScene, view: &View, center: Vec3, half: Vec3) -> f32 {
+    let half_tan = (drone::CAMERA_VFOV_RAD * 0.5).tan();
+    let visible = box_samples(half).into_iter().filter(|&s| {
+        let point = center + s;
+        let d = point - view.eye;
+        let depth = d.dot(view.forward);
+        if !(drone::CAMERA_NEAR..=drone::CAMERA_FAR).contains(&depth) {
+            return false;
+        }
+        let half_h = depth * half_tan;
+        if d.dot(view.up).abs() > half_h || d.dot(view.right).abs() > half_h * CATALOG_ASPECT {
+            return false;
+        }
+        let entry = segment_box_entry(view.eye.to_array(), point.to_array(), center.to_array(), half.to_array());
+        let stop = (entry.max(0.0) - 0.02 / d.length()).max(0.0);
+        stop == 0.0 || !scene.sweep_hits(view.eye.to_array(), (view.eye + d * stop).to_array(), 0.0, LANDABLE)
+    }).count();
+    visible as f32 / BOX_SAMPLES as f32
+}
+
+/// Area-stratified sample points on the faces of a box with half extents `half`, relative
+/// to its centre.
+fn box_samples(half: Vec3) -> Vec<Vec3> {
+    // Faces: +-x (area y*z), +-y (x*z), +-z (x*y).
+    let areas = [half.y * half.z, half.y * half.z, half.x * half.z, half.x * half.z, half.x * half.y, half.x * half.y];
+    let total: f32 = areas.iter().sum();
+    (0..BOX_SAMPLES).map(|k| {
+        let goal = (k as f32 + 0.5) / BOX_SAMPLES as f32 * total;
+        let mut acc = 0.0;
+        let mut face = areas.len() - 1;
+        for (i, area) in areas.iter().enumerate() {
+            acc += area;
+            if acc >= goal {
+                face = i;
+                break;
+            }
+        }
+        let u = 2.0 * radical_inverse(k as u64, 2) - 1.0;
+        let v = 2.0 * radical_inverse(k as u64, 3) - 1.0;
+        let sign = if face % 2 == 0 { 1.0 } else { -1.0 };
+        match face / 2 {
+            0 => Vec3::new(sign * half.x, u * half.y, v * half.z),
+            1 => Vec3::new(u * half.x, sign * half.y, v * half.z),
+            _ => Vec3::new(u * half.x, v * half.y, sign * half.z),
+        }
+    }).collect()
+}
+
+/// Normalized goal crop `[x0, y0, x1, y1]` (top-left origin) around the box's projection,
+/// grown by `CROP_MARGIN`, squared, and shifted inside the frame. None when a box corner lies
+/// behind the near plane, the object projects smaller than `MIN_PROJECTED`, or the crop would
+/// exceed `CROP_MAX` of the frame.
+fn crop_rect(view: &View, center: Vec3, half: Vec3) -> Option<[f32; 4]> {
+    let half_tan = (drone::CAMERA_VFOV_RAD * 0.5).tan();
+    let (mut u0, mut v0, mut u1, mut v1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for corner in 0..8 {
+        let sign = |bit: usize| if corner & bit == 0 { -1.0 } else { 1.0 };
+        let point = center + Vec3::new(sign(1) * half.x, sign(2) * half.y, sign(4) * half.z);
+        let d = point - view.eye;
+        let depth = d.dot(view.forward);
+        if depth <= drone::CAMERA_NEAR {
+            return None;
+        }
+        let x = d.dot(view.right) / (depth * half_tan * CATALOG_ASPECT);
+        let y = d.dot(view.up) / (depth * half_tan);
+        let (u, v) = (0.5 * (x + 1.0), 0.5 * (1.0 - y));
+        u0 = u0.min(u);
+        u1 = u1.max(u);
+        v0 = v0.min(v);
+        v1 = v1.max(v);
     }
-    !scene.sweep_hits(eye.to_array(), point.to_array(), 0.0, LANDABLE)
+    let (u0, u1, v0, v1) = (u0.clamp(0.0, 1.0), u1.clamp(0.0, 1.0), v0.clamp(0.0, 1.0), v1.clamp(0.0, 1.0));
+    let extent = (u1 - u0).max(v1 - v0);
+    let side = extent * (1.0 + 2.0 * CROP_MARGIN);
+    if extent < MIN_PROJECTED || side > CROP_MAX {
+        return None;
+    }
+    let x0 = (0.5 * (u0 + u1) - 0.5 * side).clamp(0.0, 1.0 - side);
+    let y0 = (0.5 * (v0 + v1) - 0.5 * side).clamp(0.0, 1.0 - side);
+    Some([x0, y0, x0 + side, y0 + side])
 }
 
 /// Sorts candidates by bucket, stamps catalogue indices, and returns per-bucket
@@ -362,7 +457,15 @@ fn finalize(mut candidates: Vec<Candidate>, min_bucket: usize)
     Ok((episodes, ranges, counts))
 }
 
-fn rules(scene: &CityScene, ctx: &Ctx, size: usize, counts: [usize; BUCKETS]) -> serde_json::Value {
+fn rules(scene: &CityScene, ctx: &Ctx, size: usize, counts: [usize; BUCKETS], episodes: &[EpisodeSpec]) -> serde_json::Value {
+    let pool_sizes: serde_json::Map<_, _> = TARGET_CLASSES.iter().zip(&ctx.pools)
+        .map(|(name, pool)| (name.to_string(), json!(pool.len()))).collect();
+    let mut class_episodes = vec![0usize; scene.classes.len()];
+    for episode in episodes {
+        class_episodes[episode.stats[2] as usize] += 1;
+    }
+    let class_episodes: serde_json::Map<_, _> = scene.classes.iter().zip(class_episodes)
+        .filter(|(_, count)| *count > 0).map(|(name, count)| (name.clone(), json!(count))).collect();
     json!({
         "style": ctx.style,
         "seed": ctx.seed,
@@ -380,17 +483,34 @@ fn rules(scene: &CityScene, ctx: &Ctx, size: usize, counts: [usize; BUCKETS]) ->
             "tilt_max_rad": START_TILT_RAD,
             "speed_max_mps": START_SPEED,
             "rate_max_rps": START_RATE,
-            "start_target_distance_m": START_TARGET_DISTANCE,
+            "box_distance_m": START_BOX_DISTANCE,
             "flying_thrust": "hover",
         },
         "target": {
-            "height_above_landable_m": TARGET_HEIGHT,
-            "clearance_m": TARGET_CLEARANCE,
-            "ground_clearance_m": TARGET_GROUND_CLEARANCE,
-            "size_m": SCALE_RANGE,
-            "success_radius": "enclosing sphere radius of the scaled design + 1.0 m, per episode (EpisodeSpec.stats[2])",
-            "clearance_radius": "enclosing sphere of scaled design",
-            "district_margin_m": DISTRICT_MARGIN,
+            "classes": TARGET_CLASSES,
+            "class_choice": "uniform over target classes present in the district, then uniform object",
+            "eligible_objects": pool_sizes,
+            "episodes_by_class": class_episodes,
+            "min_extent_m": MIN_TARGET_EXTENT,
+            "placement": "object AABB wholly inside the district minus the margin",
+            "isolation": { "classes": ISOLATED_CLASSES, "min_same_class_gap_m": ISOLATION_GAP },
+            "success": {
+                "standoff_max_m": drone::STANDOFF_MAX,
+                "hold_speed_max_mps": drone::HOLD_SPEED,
+                "hold_steps": drone::HOLD_STEPS,
+                "facing": "box anchor (box point nearest the camera ray) inside the frustum and unoccluded",
+            },
+        },
+        "goal_reference": {
+            "start_view_probability_if_visible": START_REFERENCE_PROBABILITY,
+            "box_distance_m": REFERENCE_BOX_DISTANCE,
+            "height_above_landable_m": REFERENCE_HEIGHT,
+            "jitter_rad": REFERENCE_JITTER_RAD,
+            "clearance_m": REFERENCE_CLEARANCE,
+            "min_visible_fraction": REFERENCE_MIN_VISIBLE,
+            "camera": "level (roll-free), world up",
+            "crop": { "margin_per_side": CROP_MARGIN, "min_projected_extent": MIN_PROJECTED, "max_side": CROP_MAX,
+                "shape": "square in normalized units (4:3 in pixels), shifted inside the frame" },
         },
         "camera": {
             "aspect": CATALOG_ASPECT,
@@ -399,42 +519,14 @@ fn rules(scene: &CityScene, ctx: &Ctx, size: usize, counts: [usize; BUCKETS]) ->
             "far_m": drone::CAMERA_FAR,
         },
         "visibility": {
-            "surface_samples": SURFACE_SAMPLES,
-            "occlusion": "radius-0 segment eye to sample over non-landable triangles",
+            "box_samples": BOX_SAMPLES,
+            "occlusion": "radius-0 segment eye to 2 cm before the target box, over non-landable triangles",
             "visible_min_fraction": BUCKET_EDGES[0],
             "partial_min_fraction": BUCKET_EDGES[1],
         },
         "min_bucket": MIN_BUCKET,
         "bucket_counts": counts,
     })
-}
-
-/// Area-weighted, stratified sample points on the design's mesh surface (unit space).
-fn surface_samples(mesh: &MeshData) -> Vec<Vec3> {
-    let triangles: Vec<[Vec3; 3]> = mesh.indices.chunks_exact(3).map(|t| {
-        [t[0], t[1], t[2]].map(|i| Vec3::from_array(mesh.vertices[i as usize].position))
-    }).collect();
-    let areas: Vec<f32> = triangles.iter()
-        .map(|t| 0.5 * (t[1] - t[0]).cross(t[2] - t[0]).length())
-        .collect();
-    let total: f32 = areas.iter().sum();
-    (0..SURFACE_SAMPLES).map(|k| {
-        let target = (k as f32 + 0.5) / SURFACE_SAMPLES as f32 * total;
-        let mut acc = 0.0;
-        let mut pick = triangles.len() - 1;
-        for (i, area) in areas.iter().enumerate() {
-            acc += *area;
-            if acc >= target {
-                pick = i;
-                break;
-            }
-        }
-        let t = triangles[pick];
-        let s = radical_inverse(k as u64, 2).sqrt();
-        let v = radical_inverse(k as u64, 3);
-        let (b0, b1) = (1.0 - s, v * s);
-        t[0] * b0 + t[1] * b1 + t[2] * (1.0 - b0 - b1)
-    }).collect()
 }
 
 fn radical_inverse(mut n: u64, base: u64) -> f32 {
@@ -475,10 +567,6 @@ fn mix(mut z: u64) -> u64 {
 struct Rng(u64);
 
 impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
     fn stream(seed: u64, style: u32, index: u64) -> Self {
         Self(mix(mix(seed ^ mix(u64::from(style) + 0x51)) ^ index))
     }
@@ -514,24 +602,7 @@ impl Rng {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn designs_have_fixed_split_counts_and_unique_names() {
-        let designs = target_designs();
-        assert_eq!(designs.len(), 48);
-        for split in 0..3u32 {
-            let members: Vec<_> = designs.iter().filter(|d| d.split == split).collect();
-            assert_eq!(members.len(), SPLIT_SIZES[split as usize]);
-            for (i, d) in members.iter().enumerate() {
-                assert_eq!(d.index as usize, i);
-                assert!((SCALE_RANGE[0]..=SCALE_RANGE[1]).contains(&d.scale));
-            }
-        }
-        let mut names: Vec<_> = designs.iter().map(|d| d.name.clone()).collect();
-        names.sort();
-        names.dedup();
-        assert_eq!(names.len(), 48);
-    }
+    use bytemuck::Zeroable;
 
     #[test]
     fn districts_match_contract_geometry() {
@@ -550,22 +621,37 @@ mod tests {
     }
 
     #[test]
-    fn cube_surface_samples_lie_on_faces() {
-        let samples = surface_samples(&MeshData::cube());
-        assert_eq!(samples.len(), SURFACE_SAMPLES);
+    fn box_samples_lie_on_faces() {
+        let half = Vec3::new(1.0, 3.0, 0.5);
+        let samples = box_samples(half);
+        assert_eq!(samples.len(), BOX_SAMPLES);
         for p in samples {
-            let m = p.x.abs().max(p.y.abs()).max(p.z.abs());
-            assert!((m - 0.5).abs() < 1e-5, "sample {p:?} is off the cube surface");
+            let on_face = (p.x.abs() - half.x).abs() < 1e-5 || (p.y.abs() - half.y).abs() < 1e-5
+                || (p.z.abs() - half.z).abs() < 1e-5;
+            let inside = p.abs().cmple(half + 1e-5).all();
+            assert!(on_face && inside, "sample {p:?} is off the box surface");
         }
     }
 
     #[test]
+    fn crop_frames_a_centred_box_as_a_square() {
+        let view = View::level(Vec3::new(0.0, 1.0, 10.0), Vec3::new(0.0, 0.0, -1.0));
+        let crop = crop_rect(&view, Vec3::new(0.0, 1.0, 0.0), Vec3::splat(1.0)).unwrap();
+        let (w, h) = (crop[2] - crop[0], crop[3] - crop[1]);
+        assert!((w - h).abs() < 1e-6 && w < 0.5);
+        assert!(((crop[0] + crop[2]) * 0.5 - 0.5).abs() < 1e-5 && ((crop[1] + crop[3]) * 0.5 - 0.5).abs() < 1e-5);
+        // No goal from a box enclosing the camera, one too far to recognize, or one filling the frame.
+        assert_eq!(crop_rect(&view, Vec3::new(0.0, 1.0, 10.0), Vec3::splat(2.0)), None);
+        assert_eq!(crop_rect(&view, Vec3::new(0.0, 1.0, -200.0), Vec3::splat(0.5)), None);
+        assert_eq!(crop_rect(&view, Vec3::new(0.0, 1.0, 5.0), Vec3::splat(3.0)), None);
+    }
+
+    #[test]
     fn finalize_orders_buckets_and_stamps_indices() {
-        let candidate = |bucket: usize| Candidate {
-            bucket,
-            episode: EpisodeSpec { start_position: [0.0; 4], start_rotation: [0.0, 0.0, 0.0, 1.0],
-                start_velocity: [0.0; 4], start_rates: [0.0; 4], target: [0.0; 4],
-                meta: [0, bucket as u32, 0, 0], stats: [0.0; 4] },
+        let candidate = |bucket: usize| {
+            let mut episode = EpisodeSpec::zeroed();
+            episode.meta[1] = bucket as u32;
+            Candidate { bucket, episode }
         };
         let mut input = Vec::new();
         for _ in 0..3 { input.push(candidate(2)); }
@@ -608,7 +694,13 @@ mod tests {
             for range in a.bucket_ranges {
                 assert!(range[1] as usize >= MIN_BUCKET);
             }
-            eprintln!("style {style}: {size} candidates, bucket counts {}, build {elapsed:?}", a.rules["bucket_counts"]);
+            for episode in &a.episodes {
+                let crop = episode.crop;
+                assert!(crop[0] >= 0.0 && crop[1] >= 0.0 && crop[2] <= 1.0 + 1e-6 && crop[3] <= 1.0 + 1e-6);
+                assert!(episode.stats[1] >= START_BOX_DISTANCE[0] && episode.stats[3] >= REFERENCE_MIN_VISIBLE);
+            }
+            eprintln!("style {style}: {size} candidates, bucket counts {}, objects {}, by class {}, build {elapsed:?}",
+                a.rules["bucket_counts"], a.rules["target"]["eligible_objects"], a.rules["target"]["episodes_by_class"]);
         }
     }
 }
