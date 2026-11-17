@@ -20,6 +20,7 @@ UI_FILES = {
 }
 VIDEO_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.mp4\Z")
 MAP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.encoder\Z")
+SALIENCY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.saliency\Z")
 BYTE_RANGE = re.compile(r"bytes=(\d*)-(\d*)\Z")
 
 
@@ -40,6 +41,8 @@ def recording(data):
     kinds = [("video", VIDEO_NAME, "video/mp4")]
     if manifest.get("encoder_map") is not None:
         kinds.append(("encoder_map", MAP_NAME, "application/octet-stream"))
+    if manifest.get("saliency") is not None:
+        kinds.append(("saliency", SALIENCY_NAME, "application/octet-stream"))
     for environment in environments:
         for key, pattern, content_type in kinds:
             name = environment.get(key)
@@ -51,6 +54,8 @@ def recording(data):
             if path.stat().st_size == 0:
                 raise ValueError(f"{key} is empty: {name}")
             files["/replay/" + name] = (root / name, content_type)
+    if not files:
+        raise ValueError("manifest lists no replay files")
     return root, manifest_bytes, files
 
 
@@ -193,7 +198,8 @@ def main():
     except (OSError, ValueError, TypeError, KeyError) as error:
         parser.exit(1, f"Replay server: {error}\n")
     print(f"City replay: http://{args.host}:{args.port}/", flush=True)
-    print(f"Serving {len(files) // 2} recorded environments from {root}", flush=True)
+    count = len(json.loads(manifest)["environments"])
+    print(f"Serving {count} recorded environments ({len(files)} files) from {root}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

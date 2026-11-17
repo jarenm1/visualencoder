@@ -18,8 +18,12 @@ from .native import DEFAULT_CITY, CudaEnv
 
 # Diagnostics indices (ABI v4, width 24) recorded per frame, pre-action.
 STATE_INDEX = (0, 1, 2, 6, 7, 8, 9, 3, 4, 5, 14, 17, 18)
+# Privileged lanes appended per frame as ground-truth labels for saliency diagnosis
+# (replay-only; the actor never receives them).
+LABEL_INDEX = (14, 18, 19)
 STATE_FIELDS = ["world_x", "world_y", "world_z", "quat_x", "quat_y", "quat_z", "quat_w",
-                "target_x", "target_y", "target_z", "design", "clock", "landed"]
+                "target_x", "target_y", "target_z", "design", "clock", "landed",
+                "target_visible", "target_ndc_x", "target_ndc_y"]
 # Transition columns: action_names (4), then the outcome fields below.
 OUTCOME_FIELDS = ["reward", "done", "success", "collision", "out_of_bounds"]
 START_LANDED_INDEX = 19
@@ -84,23 +88,30 @@ def capture(args, saved, features, seed, style, no_gps_fraction):
             outcome_width = len(OUTCOME_FIELDS)
             action_width = env.action_dim
             images = torch.empty((horizon, n, h, w, 3), dtype=torch.uint8, device=device)
-            states = torch.empty((horizon, n, len(STATE_INDEX)), device=device)
+            states = torch.empty((horizon, n, len(STATE_INDEX) + len(LABEL_INDEX)), device=device)
+            label_index = torch.tensor(LABEL_INDEX, device=device)
             transitions = torch.empty((horizon, n, action_width + outcome_width), device=device)
             ended = torch.empty((horizon, n), device=device)
             tokens = (torch.empty((horizon, n, patch_h * patch_w, features.dim), dtype=torch.bfloat16, device=device)
                       if features.visual else None)
+            # Policy target saliency: softmax over P patches + "not in view".
+            saliency = (torch.empty((horizon, n, patch_h * patch_w + 1), dtype=torch.float16, device=device)
+                        if features.visual else None)
             starts = torch.ones(n, device=device)
             hidden = torch.zeros((n, policy.hidden_size), device=device)
             for t in range(horizon):
                 images[t].copy_((env.obs.clamp(0, 1) * 255).round().to(torch.uint8).permute(0, 2, 3, 1))
-                states[t].copy_(env.diagnostics.index_select(1, index))
+                states[t, :, :len(STATE_INDEX)].copy_(env.diagnostics.index_select(1, index))
+                states[t, :, len(STATE_INDEX):].copy_(env.privileged.index_select(1, label_index))
                 if features.visual:
                     cls, patch_tokens = features.observe(env)
                     tokens[t].copy_(patch_tokens)
                     goal = goals[env.design.long()]
                 else:
                     cls, patch_tokens, goal = None, None, None
-                inputs, _ = policy.actor_inputs_and_features(cls, patch_tokens, goal, env.proprio, env.privileged)
+                inputs, logits = policy.actor_inputs_and_features(cls, patch_tokens, goal, env.proprio, env.privileged)
+                if saliency is not None:
+                    saliency[t].copy_(logits.softmax(-1))
                 mean, hidden = policy.step(inputs, hidden, starts)
                 applied = mean.clamp(-1, 1).contiguous()
                 env.step(applied)
@@ -121,9 +132,42 @@ def capture(args, saved, features, seed, style, no_gps_fraction):
                     "transitions": transitions.cpu().numpy(), "ended": ended.cpu().numpy(),
                     "start_landed": start_landed.cpu().numpy(), "gps_available": gps_available.cpu().numpy(),
                     "maps": None if maps is None else maps.numpy(),
+                    "saliency": None if saliency is None else saliency.float().cpu().numpy(),
+                    "grid": (patch_h, patch_w),
                     "native": {"control_hz": env.control_hz, "control_mode": env.control_mode,
                                "action_names": list(env.action_names), "city_path": str(env.city_path),
                                "city_fingerprint": env.metadata["city_fingerprint"]}}
+
+
+def diagnose(probs, labels, grid):
+    """Per-episode detection diagnosis from policy saliency against ground truth.
+
+    probs float [L, P+1] (softmax over patches + "not in view"); labels [L, 3] =
+    (visible, ndc_x, ndc_y). A frame counts as detected when the target centre is
+    visible, P(in view) > 0.5 and the most likely patch is within one patch of it.
+    """
+    grid_h, grid_w = grid
+    visible = labels[:, 0] > 0.5
+    column = np.clip(np.floor((labels[:, 1] + 1) / 2 * grid_w), 0, grid_w - 1)
+    row = np.clip(np.floor((1 - labels[:, 2]) / 2 * grid_h), 0, grid_h - 1)
+    best = probs[:, :-1].argmax(-1)
+    near = (np.abs(best // grid_w - row) <= 1) & (np.abs(best % grid_w - column) <= 1)
+    detected = visible & near & (probs[:, -1] < 0.5)
+    first = lambda mask: int(np.flatnonzero(mask)[0]) if mask.any() else None
+    return {"visible_frames": int(visible.sum()), "detected_frames": int(detected.sum()),
+            "first_visible_frame": first(visible), "first_detected_frame": first(detected),
+            "detection_rate": float(detected.sum() / visible.sum()) if visible.any() else None}
+
+
+def failure_kind(outcome, diagnosis):
+    """Coarse cause for a non-success: target never seen, seen but not detected, or detected."""
+    if outcome == "success":
+        return None
+    if diagnosis["visible_frames"] == 0:
+        return "never_visible"
+    if diagnosis["detection_rate"] < 0.5:
+        return "visible_not_detected"
+    return "detected_not_reached"
 
 
 def record(args):
@@ -181,6 +225,18 @@ def record(args):
             map_path = args.out / f"{basename}.encoder"
             np.ascontiguousarray(recording["maps"][:length, index]).tofile(map_path)
             entry["encoder_map"] = map_path.name
+        if recording["saliency"] is not None:
+            probs = recording["saliency"][:length, index]
+            labels = episode[:, len(STATE_INDEX):]
+            entry["diagnosis"] = diagnose(probs, labels, recording["grid"])
+            entry["diagnosis"]["failure_kind"] = failure_kind(outcome, entry["diagnosis"])
+            # uint8 per frame: patch probabilities conditional on "in view", scaled by the
+            # frame maximum, followed by P(in view).
+            patches = probs[:, :-1] / np.maximum(probs[:, :-1].max(-1, keepdims=True), 1e-12)
+            packed = np.concatenate((patches, 1 - probs[:, -1:]), axis=-1)
+            saliency_path = args.out / f"{basename}.saliency"
+            np.round(np.clip(packed, 0, 1) * 255).astype(np.uint8).tofile(saliency_path)
+            entry["saliency"] = saliency_path.name
         environments.append(entry)
     width, height = metadata["width"], metadata["height"]
     manifest = {
@@ -194,6 +250,11 @@ def record(args):
             "width": width // 16, "height": height // 16, "channels": 3, "dtype": "uint8",
             "method": "Unpooled patch tokens of the frozen encoder, same pass the policy consumed; shared "
                       "3-component PCA over all pre-terminal frames, 1st/99th percentile scaled."},
+        "saliency": None if recording["saliency"] is None else {
+            "width": width // 16, "height": height // 16, "dtype": "uint8",
+            "layout": "per frame: width*height patch probabilities conditional on in-view (row-major, scaled "
+                      "by the frame maximum), then P(in view)",
+            "method": "softmax of the policy's TargetSaliency logits on the frame it acted on"},
         "checkpoint": str(args.checkpoint.resolve()), "checkpoint_sha256": sha256(args.checkpoint),
         "native_sha256": metadata["native_library_sha256"], "encoder": metadata["encoder"],
         "actor_inputs": metadata["actor_inputs"], "selected_steps": metadata["steps"],
@@ -215,9 +276,13 @@ def record(args):
     staging.replace(args.out / "manifest.json")
     for env_entry in environments:
         (args.out / env_entry["video"]).with_suffix(".rgb").unlink()
+    kinds = [e["diagnosis"]["failure_kind"] for e in environments if e.get("diagnosis")]
     print(json.dumps({"replay": str(args.out.resolve()), "environments": len(environments),
                       "outcomes": {kind: sum(e["outcome"] == kind for e in environments)
-                                   for kind in ("success", "collision", "out_of_bounds", "timeout")}}, indent=2))
+                                   for kind in ("success", "collision", "out_of_bounds", "timeout")},
+                      "failure_kinds": {kind: kinds.count(kind) for kind in
+                                        ("never_visible", "visible_not_detected", "detected_not_reached")}},
+                     indent=2))
 
 
 def main():

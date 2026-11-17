@@ -16,6 +16,7 @@ const VIEW_ICONS = {
 const mapCanvas = document.createElement("canvas");
 const mapContext = mapCanvas.getContext("2d");
 let encoderMap = null;
+let saliencyMap = null;
 let manifest = null;
 let selected = -1;
 let mode = "split";
@@ -35,11 +36,12 @@ function panels() {
   const first = manifest.views.first_person;
   const third = manifest.views.third_person;
   const encoder = { encoder: true, width: first[2], height: first[3] };
-  const video = (rect) => ({ rect, width: rect[2], height: rect[3] });
+  const video = (rect, overlay = false) => ({ rect, overlay, width: rect[2], height: rect[3] });
   if (mode === "first") return [video(first)];
   if (mode === "third") return [video(third)];
   if (mode === "encoder") return [encoder];
-  return manifest.encoder_map ? [video(first), encoder, video(third)] : [video(first), video(third)];
+  const overlay = Boolean(manifest.saliency);
+  return manifest.encoder_map ? [video(first, overlay), encoder, video(third)] : [video(first, overlay), video(third)];
 }
 
 function resize() {
@@ -70,14 +72,46 @@ function drawEncoder(frame, x, width, height) {
   context.imageSmoothingEnabled = true;
 }
 
+// Policy saliency as a red heat layer (alpha = patch probability x P(in view)), plus a
+// thin ring at the true target centre when it is visible (replay-only ground truth).
+function drawSaliency(frame, x, width, height) {
+  const { width: columns, height: rows } = manifest.saliency;
+  const stride = columns * rows + 1;
+  const base = frame * stride;
+  const inView = saliencyMap[base + columns * rows] / 255;
+  const pixels = mapContext.createImageData(columns, rows);
+  for (let patch = 0; patch < columns * rows; patch += 1) {
+    pixels.data[patch * 4] = 255;
+    pixels.data[patch * 4 + 1] = 40;
+    pixels.data[patch * 4 + 2] = 40;
+    pixels.data[patch * 4 + 3] = Math.round(saliencyMap[base + patch] * inView * 0.7);
+  }
+  mapCanvas.width = columns;
+  mapCanvas.height = rows;
+  mapContext.putImageData(pixels, 0, 0);
+  context.imageSmoothingEnabled = false;
+  context.drawImage(mapCanvas, 0, 0, columns, rows, x, 0, width, height);
+  context.imageSmoothingEnabled = true;
+  const state = environment().states[frame];
+  const field = (name) => state[manifest.state_fields.indexOf(name)];
+  if (field("target_visible") > 0.5) {
+    context.strokeStyle = "rgba(255,255,255,0.9)";
+    context.lineWidth = 1.5;
+    context.beginPath();
+    context.arc(x + (field("target_ndc_x") + 1) / 2 * width, (1 - field("target_ndc_y")) / 2 * height, 9, 0, 2 * Math.PI);
+    context.stroke();
+  }
+}
+
 function present(source, time) {
   if (source !== video || source.seeking || source.readyState < 2 || pendingTarget !== null || failed
-    || (manifest.encoder_map && !encoderMap)) return;
+    || (manifest.encoder_map && !encoderMap) || (manifest.saliency && !saliencyMap)) return;
   const frame = frameAt(time);
   let x = 0;
   for (const panel of panels()) {
     if (panel.encoder) drawEncoder(frame, x, panel.width, panel.height);
     else context.drawImage(source, ...panel.rect, x, 0, panel.width, panel.height);
+    if (panel.overlay) drawSaliency(frame, x, panel.width, panel.height);
     x += panel.width;
   }
   displayedTime = Math.min(time, environment().duration_seconds);
@@ -135,6 +169,7 @@ function chooseEnvironment(index) {
   failed = false;
   sourceReady = false;
   encoderMap = null;
+  saliencyMap = null;
   displayedTime = 0;
   setControls(false);
   busy(true);
@@ -153,24 +188,32 @@ function chooseEnvironment(index) {
   const current = () => token === generation && source === video;
   let metadataReady = false;
   const ready = () => {
-    if (!current() || !metadataReady || (manifest.encoder_map && !encoderMap) || failed) return;
+    if (!current() || !metadataReady || (manifest.encoder_map && !encoderMap)
+      || (manifest.saliency && !saliencyMap) || failed) return;
     sourceReady = true;
     setControls(true);
     present(source, source.currentTime);
   };
-  if (manifest.encoder_map) fetch(`/replay/${encodeURIComponent(env.encoder_map)}`, { cache: "no-store" })
+  const load = (name, bytes, assign) => fetch(`/replay/${encodeURIComponent(name)}`, { cache: "no-store" })
     .then((response) => {
-      if (!response.ok) throw new Error(`${env.encoder_map}: HTTP ${response.status}`);
+      if (!response.ok) throw new Error(`${name}: HTTP ${response.status}`);
       return response.arrayBuffer();
     })
     .then((buffer) => {
       if (!current()) return;
-      const { width, height } = manifest.encoder_map;
-      if (buffer.byteLength !== env.frame_count * width * height * 3) throw new Error(`${env.encoder_map}: wrong size`);
-      encoderMap = new Uint8Array(buffer);
+      if (buffer.byteLength !== bytes) throw new Error(`${name}: wrong size`);
+      assign(new Uint8Array(buffer));
       ready();
     })
     .catch((error) => { if (current()) fail(error.message); });
+  if (manifest.encoder_map) {
+    const { width, height } = manifest.encoder_map;
+    load(env.encoder_map, env.frame_count * width * height * 3, (data) => { encoderMap = data; });
+  }
+  if (manifest.saliency) {
+    const { width, height } = manifest.saliency;
+    load(env.saliency, env.frame_count * (width * height + 1), (data) => { saliencyMap = data; });
+  }
   source.addEventListener("loadedmetadata", () => {
     if (!current()) return;
     if (source.videoWidth !== manifest.video_width || source.videoHeight !== manifest.video_height) return fail("Video dimensions do not match the recording");
