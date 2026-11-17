@@ -72,8 +72,10 @@ function drawEncoder(frame, x, width, height) {
   context.imageSmoothingEnabled = true;
 }
 
-// Policy saliency as a red heat layer (alpha = patch probability x P(in view)), plus a
-// thin ring at the true target centre when it is visible (replay-only ground truth).
+// Policy saliency as a red heat layer (alpha = patch probability x P(in view)). When the
+// policy believes the target is in view (P > 0.5) its most likely patch gets a solid red
+// square outline. A thin white ring marks the TRUE target centre whenever it is visible
+// (replay-only ground truth, never a policy input).
 function drawSaliency(frame, x, width, height) {
   const { width: columns, height: rows } = manifest.saliency;
   const stride = columns * rows + 1;
@@ -92,6 +94,17 @@ function drawSaliency(frame, x, width, height) {
   context.imageSmoothingEnabled = false;
   context.drawImage(mapCanvas, 0, 0, columns, rows, x, 0, width, height);
   context.imageSmoothingEnabled = true;
+  if (inView > 0.5) {
+    let best = 0;
+    for (let patch = 1; patch < columns * rows; patch += 1) {
+      if (saliencyMap[base + patch] > saliencyMap[base + best]) best = patch;
+    }
+    const cellW = width / columns;
+    const cellH = height / rows;
+    context.strokeStyle = "rgba(255,60,60,1)";
+    context.lineWidth = 2;
+    context.strokeRect(x + (best % columns) * cellW, Math.floor(best / columns) * cellH, cellW, cellH);
+  }
   const state = environment().states[frame];
   const field = (name) => state[manifest.state_fields.indexOf(name)];
   if (field("target_visible") > 0.5) {
