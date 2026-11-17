@@ -369,6 +369,21 @@ def cohorts_command(args, started):
     run(args)
 
 
+def mine_command(args, started):
+    from .mine import run
+    run(args)
+
+
+def post_train_command(args, started):
+    from .posttrain import post_train
+    post_train(args)
+
+
+def confusion_probe_command(args, started):
+    from .posttrain import confusion_probe
+    confusion_probe(args)
+
+
 def probe_command(args, started):
     if not args.encoders:
         raise SystemExit("--encoders must name at least one visual arm")
@@ -541,6 +556,57 @@ def parser():
     evaluation.add_argument("--eval-envs", type=int, default=384)
     evaluation.add_argument("--out", type=Path)
     evaluation.set_defaults(func=eval_command)
+
+    mine = commands.add_parser("mine", help="mine perception failures of a frozen visual policy")
+    add_native(mine)
+    mine.add_argument("--checkpoint", type=Path, required=True)
+    mine.add_argument("--allow-task-transfer", action="store_true",
+                      help="mine with an older-task visual policy (perception only; observation contract checked)")
+    mine.add_argument("--splits", nargs="+", choices=("train", "validation", "test"), default=["train", "validation", "test"])
+    mine.add_argument("--num-envs", type=int, default=256)
+    mine.add_argument("--rounds", type=int, default=2, help="fresh resets per split")
+    mine.add_argument("--horizons", type=int, default=2, help="episode horizons flown per round")
+    mine.add_argument("--stride", type=int, default=15, help="control steps between labelled samples")
+    mine.add_argument("--normal-rate", type=float, default=0.1, help="fraction of correct samples kept")
+    mine.add_argument("--appearance", type=float, default=1.0)
+    mine.add_argument("--out", type=Path, required=True)
+    mine.set_defaults(func=mine_command)
+
+    post = commands.add_parser("post-train", help="fine-tune a distilled student + policy saliency head on mined failures")
+    post.add_argument("--base", type=Path, default=ROOT / "runs/mean", help="`visenc distill` run directory")
+    post.add_argument("--policy", type=Path, required=True, help="policy checkpoint whose saliency head initializes")
+    post.add_argument("--allow-task-transfer", action="store_true")
+    post.add_argument("--mined", type=Path, required=True, help="mine output holding train/")
+    post.add_argument("--held-out", type=Path, required=True, help="mine output holding validation/")
+    post.add_argument("--teacher", default="lingbot:large")
+    post.add_argument("--real", type=Path, default=ROOT / "data/uavid/train_rgb.npy",
+                      help="unlabelled real frames for the teacher anchor (UAVid train; val stays held out)")
+    post.add_argument("--sim", type=Path, default=ROOT / "data/train-v2/rgb_random1.npy")
+    post.add_argument("--train-blocks", type=int, default=4)
+    post.add_argument("--steps", type=int, default=3000)
+    post.add_argument("--batch-size", type=int, default=32)
+    post.add_argument("--real-batch", type=int, default=8)
+    post.add_argument("--sim-batch", type=int, default=8)
+    post.add_argument("--lr", type=float, default=2e-5)
+    post.add_argument("--head-lr", type=float, default=3e-4)
+    post.add_argument("--warmup", type=int, default=200)
+    post.add_argument("--anchor-weight", type=float, default=1.0)
+    post.add_argument("--validate-every", type=int, default=500)
+    post.add_argument("--seed", type=int, default=0)
+    post.add_argument("--out", type=Path, required=True)
+    post.set_defaults(func=post_train_command)
+
+    confusion = commands.add_parser("confusion-probe", help="fresh saliency head per frozen encoder on mined frames")
+    confusion.add_argument("--encoders", nargs="+", required=True, help="visenc encoder specs, e.g. run:runs/mean")
+    confusion.add_argument("--mined", type=Path, required=True)
+    confusion.add_argument("--held-out", type=Path, required=True, help="mine output holding test/")
+    confusion.add_argument("--train-frames", type=int, default=8192)
+    confusion.add_argument("--epochs", type=int, default=20)
+    confusion.add_argument("--batch-size", type=int, default=128)
+    confusion.add_argument("--learning-rate", type=float, default=1e-3)
+    confusion.add_argument("--seed", type=int, default=0)
+    confusion.add_argument("--out", type=Path, required=True)
+    confusion.set_defaults(func=confusion_probe_command)
 
     cohorts = commands.add_parser("eval-cohorts", help="paired fixed-goal hidden and far-target evaluations")
     add_native(cohorts)

@@ -128,7 +128,7 @@ Measured on ABI v4 (designed 1.5–2.5 m shapes, held-out designs; `runs/drone-p
 | `baseline` (standard distilled) | 0.894 | 0.629 | 0.861 | 7.6 px |
 | `mean` (paired consistency) | 0.897 | 0.620 | 0.856 | 7.7 px |
 
-## Planned: failure mining and perception post-train (not yet run)
+## Failure mining and perception post-train
 
 1. Simple reward: `(d_prev − d) + 0.1·in_zone − 1·crash/OOB`, γ ≈ 0.997 for the 15 s horizon; sweep the three coefficients.
 2. Wrong-target mining: a frozen policy in large env batches flags frames whose high-confidence saliency peak or approach lands on a non-target object (renderer object IDs), then snapshots sim state, frame, goal crop and distractor ID.
@@ -136,6 +136,39 @@ Measured on ABI v4 (designed 1.5–2.5 m shapes, held-out designs; `runs/drone-p
 4. RL restarts from a fraction of mined states.
 
 **Paper comparison (encoder study):** run step 3 identically for `pretrained`, `baseline` and `mean`, using the same mined failure set. Report before vs. after post-train on held-out mined confusions and the localization probe, plus out-of-domain retention (real-image segmentation, the paper's existing metrics), so the study shows whether hard-negative post-training helps each encoder equally and whether it costs appearance robustness. The mined set comes from one policy's failures, so report the mining policy and keep the evaluation confusions held out (different districts and seeds).
+
+### Results (first round)
+
+Mining (`train.py mine`, `runs/mined-drone6`): `drone6` best policy (`mean` encoder, fixed catalog goals), 256 envs, one labelled sample per 0.5 s. On the held-out validation and test districts (7,680 unbiased samples each), the policy was confidently "in view" on a wrong patch in 10% of samples and confidently "in view" while the target was not visible in 31–37%. Training set: 15,665 frames from train districts (12,992 failures, 2,673 correct).
+
+Post-train (`train.py post-train`): `runs/mean` last 4 ViT blocks + the policy's saliency head (`runs/posttrain-mean-b4`), or the head alone (`runs/posttrain-mean-head`). Loss: policy saliency loss on mined frames (half failures) + cosine distillation to `lingbot:large` through the frozen projection heads on UAVid train and `train-v2` renders. 3,000 steps of 32 frames (~7 min); best validation at step 500 for both.
+
+Held-out test (7,680 samples, separate district). Visible = peak patch on the target when visible; absent = P(in view) < 0.5 when not visible; score = their mean.
+
+| Encoder + head | Visible on target | Absent correct | Score |
+|---|---|---|---|
+| `mean` + original policy head | 0.645 | 0.448 | 0.547 |
+| `mean` + post-trained head | 0.650 | 0.836 | 0.743 |
+| post-trained encoder + head | 0.641 | 0.833 | 0.737 |
+
+Confusion probe (`train.py confusion-probe`; fresh head per frozen encoder, same 8,192 mined training frames, same seed and schedule, same test set):
+
+| Encoder | Visible on target | Absent correct | Score |
+|---|---|---|---|
+| `lingbot:small` (off the shelf) | 0.490 | 0.850 | 0.670 |
+| `lingbot:large` (teacher) | 0.540 | 0.817 | 0.679 |
+| `baseline` (standard distillation) | 0.607 | 0.819 | 0.713 |
+| `mean` (paired consistency) | 0.632 | 0.828 | 0.730 |
+| `mean` post-trained (4 blocks) | 0.624 | 0.766 | 0.695 |
+
+UAVid retention (`visenc real-eval`, 7 val sequences): post-trained vs `mean` sim→real mIoU 0.511 vs 0.516, car AUROC 0.860 vs 0.903, car AP 0.533 vs 0.604 (wide intervals).
+
+Findings:
+- Most mined failures were the policy head's **calibration**, not the encoder: it reported the target in view when it was not. Retraining the head on mined frames moves absent-correct 0.45 → 0.84; visible localization barely moves (0.645 → 0.650).
+- **Encoder post-training added nothing** with this recipe: the joint result matches head-only, the frozen-probe score drops, and real car metrics drop. Not adopted.
+- **Both distilled students already beat their teacher** at goal localization in the city (0.730 / 0.713 vs 0.679; visible on-target 0.632 / 0.607 vs 0.540). Paper-relevant, single seed, no intervals; frames within an episode are correlated.
+- Visible localization plateaus near 0.63–0.65 across encoders and heads. A likely limit is the goal representation: one 768-d vector (CLS + mean patch) cannot keep the details that separate look-alike objects. Next lever: patch-level goal matching in the head, not more encoder tuning.
+
 
 ## Sustained-hold experiment (ABI v6)
 
