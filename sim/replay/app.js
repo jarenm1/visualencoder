@@ -138,7 +138,8 @@ function chooseEnvironment(index) {
   displayedTime = 0;
   setControls(false);
   busy(true);
-  screen.setAttribute("aria-label", `Environment ${env.id}, route ${env.route_id}, ${env.outcome}`);
+  const visibility = ["visible", "partly hidden", "hidden"][env.bucket] ?? "unknown visibility";
+  screen.setAttribute("aria-label", `Environment ${env.id}, ${visibility} start, ${env.outcome}`);
   timeline.max = String(env.duration_seconds);
   timeline.step = String(1 / manifest.control_hz);
   timeline.value = "0";

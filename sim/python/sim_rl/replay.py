@@ -37,9 +37,13 @@ def encoder_maps(tokens, valid):
     """
     device = tokens.device
     generator = torch.Generator(device=device).manual_seed(0)
-    rows = tokens[valid].reshape(-1, tokens.shape[-1]).float()
-    if rows.shape[0] > PCA_SAMPLE:
-        rows = rows[torch.randperm(rows.shape[0], device=device, generator=generator)[:PCA_SAMPLE]]
+    # Sample whole frames before gathering: materialising every valid frame's tokens
+    # in float32 needs several GiB for a 32-env, 450-step recording.
+    frames = valid.nonzero()
+    keep = max(1, PCA_SAMPLE // tokens.shape[2])
+    if frames.shape[0] > keep:
+        frames = frames[torch.randperm(frames.shape[0], device=device, generator=generator)[:keep]]
+    rows = tokens[frames[:, 0], frames[:, 1]].reshape(-1, tokens.shape[-1]).float()
     mean = rows.mean(0)
     _, _, principal = torch.linalg.svd(rows - mean, full_matrices=False)
     axes = principal[:3].T

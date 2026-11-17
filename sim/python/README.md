@@ -20,18 +20,15 @@ nix develop path:sim --command .venv/bin/python sim/python/train.py benchmark \
   --library .sim-target/training/libsim_env.so --out runs/drone-benchmark
 
 nix develop path:sim --command .venv/bin/python sim/python/train.py train \
-  --encoder mean --control velocity --num-envs 64 --eval-envs 384 --width 320 --height 240 \
-  --no-gps-fraction 0.25 --aux-coefficient 0.5 \
-  --total-steps 3000000 --validation-every 1000000 --wall-seconds 3600 \
-  --library .sim-target/training/libsim_env.so --out runs/drone-mean
+  --encoder mean --num-envs 128 --eval-envs 256 \
+  --total-steps 6000000 --validation-every 1000000 --wall-seconds 3300 \
+  --out runs/drone4-mean-seed0
 
 nix develop path:sim --command .venv/bin/python sim/python/train.py eval \
   --checkpoint runs/drone-mean/best.pt --split test \
   --library .sim-target/training/libsim_env.so --out runs/drone-mean-test
 
-nix develop path:sim --command .venv/bin/python sim/python/train.py probe \
-  --encoders mean,baseline,pretrained --train-frames 8192 --test-frames 4096 --epochs 20 \
-  --library .sim-target/training/libsim_env.so --out runs/drone-probe
+nix develop path:sim --command .venv/bin/python sim/python/train.py probe --out runs/drone-probe
 
 nix develop path:sim --command .venv/bin/python sim/python/train.py memory-check \
   --encoder mean --num-envs 64 --eval-envs 384 --repeats 3 \
@@ -54,11 +51,11 @@ Unit tests need no simulator: `cd sim/python && python -m unittest`.
 - GPS: proprioception lanes 14–16 hold the GPS hint (right, up, −forward) in metres / 32; lane 18 is `gps_available`. With GPS denied the hint is zero. `--no-gps-fraction` sets the probability that an episode denies GPS; evaluation reports GPS available and GPS denied separately.
 - Curriculum buckets are `visible`, `partial` and `hidden`. Start weights are (0.8, 0.15, 0.05) with floors (0.10, 0.10, 0.05). Adaptive promotion and demotion use per-bucket EMA success. Evaluation always uses uniform weights. The curriculum tensor is `[w_visible, w_partial, w_hidden, p_no_gps]`.
 - Episodes end on success, collision, out-of-bounds, or the native horizon (`horizon`, 450 steps). Outcomes are exclusive, with priority success > collision > out-of-bounds > timeout.
-- Catalog: at least 4096 candidate designs. Splits use styles `TRAIN=0`, `VALIDATION=1`, `TEST=2`, with validation seed 10001 and test seed 20002.
+- Catalog: 65,536 episodes per split (each bucket ≥512). Targets are 1.5–2.5 m designs, starts 4–20 m away; success radius is the target's enclosing sphere + 1 m. Splits use styles `TRAIN=0`, `VALIDATION=1`, `TEST=2`, with validation seed 10001 and test seed 20002.
 
 ## Policy
 
-Frozen encoder tokens are computed once per control tick and reused by every PPO epoch. Visual arms use `GoalAttention` over patch tokens of shape `[N, 15, 20, D]` (320×240 input) with the goal tokens `concat(CLS, mean patch)` from the goal catalog. The attended output is 396 wide: 256 attended features, 8 expected-xy values, 4 peak logits, and a 128-wide global projection. Proprioception (19) is concatenated after it.
+Frozen encoder tokens are computed once per control tick and reused by every PPO epoch. Visual arms use `TargetSaliency` over patch tokens `[N, 300, D]` (320×240 input, 16 px patches): each patch scores a goal-free linear term plus a low-rank (rank 64) token × goal bilinear term, where the goal is `concat(CLS, mean patch)` of the design's reference image. A "not in view" logit from CLS and goal completes a softmax over 301 classes. The actor receives the saliency-expected target NDC (2), the peak patch logit (1), P(in view) (1), saliency-pooled tokens (64) and a projected CLS + 2×3 pooled context (128), then proprioception (19).
 
 Arms (`--encoder`):
 
@@ -72,7 +69,7 @@ Arms (`--encoder`):
 
 The critic always receives privileged (21) + proprioception (19). The actor is a GRU over the trunk output, with a Gaussian head whose log-std is state-independent (initial -0.5). Memory resets at episode starts. Terminal GAE never bootstraps across a done flag.
 
-Auxiliary losses (visual arms only, `--aux-coefficient`, default 0.5) train the goal-attention encoder on privileged image-space labels that the actor never receives: a visibility binary cross-entropy on privileged lane 14 over all frames, and a smooth-L1 localization loss on the target's NDC centre (lanes 18–19) over visible frames only. Invisible frames contribute nothing to localization, and a batch with no visible frames gives exactly zero.
+The auxiliary loss (visual arms only, `--aux-coefficient`, default 0.5) is cross-entropy over those 301 classes: the patch containing the target centre when privileged lane 14 says it is visible, otherwise "not in view". The actor never receives these privileged labels. The learning curve logs `aux_patch_accuracy` (exact patch on visible frames).
 
 Native tensors are borrowed through DLPack on the native CUDA stream. Reset, step, and rollout never call `.item()`, `.cpu()`, or boolean-mask indexing; readbacks happen only at end-of-rollout and evaluation boundaries.
 
@@ -88,7 +85,28 @@ Blind controls run on the same test seed and style: `hover` and `random` (unifor
 
 ## Localization probe
 
-`train.py probe` is an offline goal-localization probe. It renders frames once per encoder and trains only a probe head on the frozen goal-attention features and auxiliary heads. It reports visibility AUROC and average precision, and centre error in pixels (mean, median, p90) on visible frames, on separate train and test seeds. Frames are shared across encoders. The protocol needs at least 8192 train and 4096 test frames; smaller runs are labelled `"protocol": "smoke"` in `probe.json` and `probe.md`. Probe memory is roughly 2.8 GB of uint8 frames at the protocol size and 320×240.
+`train.py probe` is the offline goal-localization gate run before RL. Each frame is the start view of an independent catalog episode (8,192 train-split, 4,096 test-split frames; test districts and designs are held out), shared across encoders. A fresh `TargetSaliency` is trained on each frozen encoder with the policy's saliency loss (identical seed, 20 epochs, lr 1e-3). It reports visibility AUROC/AP, exact-patch and within-one-patch localization, and pixel error of the predicted patch. Frames from correlated random-action rollouts let probes memorize (≈90% train vs 25% test patch accuracy) and are not used; an earlier learned-position query attention head also memorized and was replaced.
+
+Measured (`runs/drone-probe-saliency`, test split):
+
+| Encoder | Visibility AUROC | Exact patch | Within 1 patch | Median error |
+|---|---|---|---|---|
+| `pretrained` (LingBot ViT-S) | 0.862 | 0.539 | 0.821 | 8.4 px |
+| `baseline` (standard distilled) | 0.894 | 0.629 | 0.861 | 7.6 px |
+| `mean` (paired consistency) | 0.897 | 0.620 | 0.856 | 7.7 px |
+
+## Measured navigation (velocity control, one seed, held-out test split)
+
+256 episodes per GPS mode, uniform visibility buckets; Wilson 95% intervals. Wall times include initialization, training and evaluation on an RTX 5070 Ti shared with an unrelated GPU workload (not controlled). The camera arm stopped at its wall budget with fewer steps than the controls.
+
+| Actor | Steps | Minutes | GPS success | Visible / partial / hidden | No-GPS success | Crash (GPS) |
+|---|---|---|---|---|---|---|
+| Camera + `mean` encoder | 1.98M | 49.5 | 0.449 [0.389, 0.510] | 0.55 / 0.61 / 0.22 | 0.430 [0.371, 0.491] | 0.25 |
+| GPS hint + sensors only (learned) | 6.00M | 34.5 | 0.199 [0.155, 0.252] | 0.23 / 0.33 / 0.07 | 0.078 [0.051, 0.118] | 0.48 |
+| Privileged target state (ceiling) | 6.00M | 34.7 | 0.805 [0.752, 0.849] | 0.91 / 0.87 / 0.64 | 0.746 [0.689, 0.796] | 0.18 |
+| Scripted GPS pursuit | — | — | 0.043 | 0.02 / 0.09 / 0.03 | 0.000 | 0.42 |
+
+The camera policy was trained only with GPS available; its no-GPS score is zero-shot. Results are single-seed and budget-limited, not convergence claims; the camera arm does not yet include the `pretrained`/`baseline` encoder comparison.
 
 ## Checkpoints
 
