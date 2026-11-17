@@ -70,6 +70,24 @@ Arms (`--encoder`):
 | `state` | privileged (29) + proprioception | privileged ceiling; not visual evidence |
 | `hint` | proprioception only | no-vision baseline |
 
+Encoder inference (`--encoder-precision`, recorded in the checkpoint's `preprocessing`; `eval` and replay read it back):
+
+| Precision | Path | Encoder µs/img (batch 128, RTX 5070 Ti) | Patch cosine to FP32 (mean / min) |
+|---|---|---|---|
+| `fp16` (default) | TensorRT 11 FP16 engine, strongly typed ONNX export (RoPE stays FP32) | 190 | 1.00000 / 0.99966 |
+| `bf16` | `torch.compile` under bf16 autocast; numerics of pre-TensorRT checkpoints | 278 | 0.99997 / 0.99948 |
+| (previous eager bf16) | removed | 602 | 0.99997 / 0.99912 |
+
+The engine is built once per encoder fingerprint, input size, GPU and TensorRT version (about 20 s) and cached in `$XDG_CACHE_HOME/visenc/tensorrt`; batches above 256 run in chunks. `torch.compile` needs the `sim` shell's `TRITON_*` paths.
+
+`train.py benchmark --encoder mean` (64 rollout steps, collect + update):
+
+| Path | Transitions/s at 64 envs | Transitions/s at 128 envs | Encoder ms/step at 128 |
+|---|---|---|---|
+| eager bf16 (previous) | 1,413 | 1,334 | 76.8 |
+| `bf16` (`torch.compile`) | 2,164 | 2,391 | 34.8 |
+| `fp16` (TensorRT) | 2,949 | 2,987 | 24.2 |
+
 The critic always receives privileged (29) + proprioception (19). The actor is a GRU over the trunk output, with a tanh-squashed Gaussian head whose log-std is state-independent (initial -0.5). Memory resets at episode starts. Terminal GAE never bootstraps across a done flag. The entropy bonus is a reparameterized estimate of the squashed distribution's entropy; the pre-squash Gaussian entropy grows without bound and drove the first v5 run into saturated bang-bang actions.
 
 The auxiliary loss (visual arms only, `--aux-coefficient`, default 0.5) is cross-entropy over those 301 classes against a soft target: uniform over the patches whose centres fall inside the target box's projection (privileged lanes 25–28, always including the anchor patch) when privileged lane 14 says the target is visible, otherwise "not in view". A single anchor patch was an arbitrary label for large objects (offline within-one-patch localization 0.38). The actor never receives these privileged labels. The learning curve logs `aux_patch_accuracy`: the fraction of visible frames whose peak patch lies on the target's projection.

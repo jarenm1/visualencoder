@@ -10,7 +10,20 @@ from visenc.models import load_encoder
 
 ARMS = {"pretrained": "lingbot:small", "baseline": "run:runs/baseline", "mean": "run:runs/mean",
         "state": "state", "hint": "hint"}
-PREPROCESSING = "native-NCHW-float01/ImageNet/bf16/CLS+patch-grid16/token-LayerNorm/v3"
+# Recorded in checkpoints; each string fixes the encoder numerics the policy was trained on.
+PREPROCESSING = {
+    "bf16": "native-NCHW-float01/ImageNet/bf16/CLS+patch-grid16/token-LayerNorm/v3",
+    "fp16": "native-NCHW-float01/ImageNet/fp16-tensorrt/CLS+patch-grid16/token-LayerNorm/v3",
+}
+PRECISIONS = tuple(PREPROCESSING)
+
+
+def precision_of(preprocessing):
+    """Encoder precision recorded by a checkpoint's ``preprocessing`` string."""
+    for precision, text in PREPROCESSING.items():
+        if text == preprocessing:
+            return precision
+    raise ValueError(f"unknown encoder preprocessing {preprocessing!r}")
 
 
 def crop_goals(images, crops):
@@ -26,11 +39,17 @@ def crop_goals(images, crops):
 
 
 class FrozenFeatures:
-    """Visual arms own a frozen encoder; ``state`` and ``hint`` arms own none."""
+    """Visual arms own a frozen encoder; ``state`` and ``hint`` arms own none.
 
-    def __init__(self, spec, device):
+    ``precision`` selects the inference path: ``bf16`` is the torch.compile'd encoder under bf16
+    autocast (the numerics of every pre-TensorRT checkpoint); ``fp16`` is a TensorRT FP16 engine.
+    """
+
+    def __init__(self, spec, device, precision):
         self.spec = ARMS.get(spec, spec)
         self.device = device
+        self.precision = precision
+        self.preprocessing = PREPROCESSING[precision]
         self.encoder = None
         self.dim = 0
         if self.spec in ("state", "hint"):
@@ -48,7 +67,11 @@ class FrozenFeatures:
             digest.update(tensor.detach().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
         self.fingerprint = digest.hexdigest()
         self.dim = encoder.dim
-        self.encoder = encoder.to(device=device, dtype=torch.bfloat16)
+        if precision == "bf16":
+            self.encoder = torch.compile(encoder.to(device=device, dtype=torch.bfloat16))
+        else:
+            from .tensorrt_encoder import TensorRTEncoder
+            self.encoder = TensorRTEncoder(encoder, self.fingerprint, device)
 
     @property
     def visual(self):
@@ -59,7 +82,10 @@ class FrozenFeatures:
         """images: float32 [m,3,H,W] in [0,1]. Returns layer-normalized (cls f32 [m,D], patches bf16 [m,P,D])."""
         if self.encoder is None:
             raise ValueError(f"{self.spec} arm has no visual encoder")
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        if self.precision == "bf16":
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                cls, patches = self.encoder(images)
+        else:
             cls, patches = self.encoder(images)
         height, width = images.shape[2] // 16, images.shape[3] // 16
         if patches.shape[1] != height * width:

@@ -12,7 +12,7 @@ import torch
 
 from .curriculum import MODES as CURRICULUM_MODES
 from .evaluation import evaluate, heuristics_for
-from .features import ARMS, PREPROCESSING, FrozenFeatures
+from .features import ARMS, PRECISIONS, FrozenFeatures, precision_of
 from .model import ActorCritic
 from .native import ABI_VERSION, CONTROL_MODES, DEFAULT_CITY, HOVER_ACTIONS, TASK, CudaEnv
 from .ppo import BUCKET_WIDTH, LOSS_NAMES, LOSS_WIDTH, RESULT_WIDTH, ROLLOUT_WIDTH, Config, Trainer
@@ -77,7 +77,7 @@ def native_provenance(env, features):
         "control_mode": env.control_mode, "catalog_size": env.catalog_size,
         "width": env.width, "height": env.height,
         "policy_mode": mode, "encoder": features.spec, "feature_dim": features.dim,
-        "encoder_fingerprint": features.fingerprint, "preprocessing": PREPROCESSING,
+        "encoder_fingerprint": features.fingerprint, "preprocessing": features.preprocessing,
         "actor_inputs": ACTOR_INPUTS[mode], "critic_inputs": CRITIC_INPUTS,
         "native_task_contract": env.task_contract, "native_library_sha256": sha256(env.library),
     }
@@ -206,7 +206,7 @@ def train_command(args, started):
     run = args.out
     run.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda:0")
-    features = FrozenFeatures(args.encoder, device)
+    features = FrozenFeatures(args.encoder, device, args.encoder_precision)
     budget_end = started + args.wall_seconds
     curves = (run / "learning-curves.jsonl").open("w")
     validations = []
@@ -315,7 +315,7 @@ def eval_command(args, started):
     saved = load_checkpoint(args.checkpoint)
     metadata = saved["metadata"]
     device = torch.device("cuda:0")
-    features = FrozenFeatures(metadata["encoder"], device)
+    features = FrozenFeatures(metadata["encoder"], device, precision_of(metadata["preprocessing"]))
     seed, style = (VALIDATION_SEED, VALIDATION_STYLE) if args.split == "validation" else (TEST_SEED, TEST_STYLE)
     with open_env_checkpoint(args, metadata, seed, style) as env:
         with env.execution():
@@ -334,7 +334,7 @@ def probe_command(args, started):
     device = torch.device("cuda:0")
     arms = {}
     for spec in args.encoders:
-        arm = FrozenFeatures(spec, device)
+        arm = FrozenFeatures(spec, device, args.encoder_precision)
         if not arm.visual:
             raise SystemExit(f"probe needs a visual encoder; {spec} has none")
         arms[spec] = arm
@@ -370,7 +370,7 @@ def benchmark_command(args, started):
     rows = []
     for n in args.batch_sizes:
         seed_all(args.seed)
-        features = FrozenFeatures(args.encoder, torch.device("cuda:0"))
+        features = FrozenFeatures(args.encoder, torch.device("cuda:0"), args.encoder_precision)
         config = make_config(args)
         with open_env(args, n, args.seed, TRAIN_STYLE) as env:
             with env.execution():
@@ -392,7 +392,7 @@ def benchmark_command(args, started):
 
 def profile_command(args, started):
     seed_all(args.seed)
-    features = FrozenFeatures(args.encoder, torch.device("cuda:0"))
+    features = FrozenFeatures(args.encoder, torch.device("cuda:0"), args.encoder_precision)
     config = make_config(args)
     with open_env(args, args.num_envs, args.seed, TRAIN_STYLE) as env:
         with env.execution():
@@ -405,7 +405,7 @@ def profile_command(args, started):
 
 def memory_check_command(args, started):
     seed_all(args.seed)
-    features = FrozenFeatures(args.encoder, torch.device("cuda:0"))
+    features = FrozenFeatures(args.encoder, torch.device("cuda:0"), args.encoder_precision)
     config = make_config(args)
     allocated = []
     with open_env(args, args.num_envs, args.seed, TRAIN_STYLE) as env:
@@ -443,8 +443,15 @@ def add_control(parser):
                         help="action interface: velocity (default, PX4 offboard style) or rates")
 
 
+def add_precision(parser):
+    parser.add_argument("--encoder-precision", choices=PRECISIONS, default="fp16",
+                        help="frozen-encoder inference: fp16 (TensorRT engine, default) or bf16 (torch.compile; "
+                             "the numerics of pre-TensorRT checkpoints). Evaluation reads it from the checkpoint.")
+
+
 def add_learner(parser):
     parser.add_argument("--encoder", default="mean", help=f"arm: {', '.join(ARMS)} or run:<dir>")
+    add_precision(parser)
     parser.add_argument("--curriculum", choices=CURRICULUM_MODES, default="adaptive")
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--no-gps-fraction", type=float, default=DEFAULTS.no_gps_fraction,
@@ -497,6 +504,7 @@ def parser():
                        default=DEFAULT_ENCODERS.split(","),
                        help="comma-separated visual arms (default: pretrained,baseline,mean)")
     probe.add_argument("--probe-envs", type=int, default=128)
+    add_precision(probe)
     probe.add_argument("--train-frames", type=int, default=8192, help="protocol minimum 8192")
     probe.add_argument("--test-frames", type=int, default=4096, help="protocol minimum 4096")
     probe.add_argument("--epochs", type=int, default=20)

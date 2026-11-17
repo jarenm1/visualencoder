@@ -13,7 +13,7 @@ from PIL import Image, ImageDraw
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "sim/python")]
 from sim_rl.cli import DEFAULT_LIBRARY, TEST_SEED, TEST_STYLE, load_checkpoint  # noqa: E402
-from sim_rl.features import FrozenFeatures  # noqa: E402
+from sim_rl.features import FrozenFeatures, precision_of  # noqa: E402
 from sim_rl.native import DEFAULT_CITY  # noqa: E402
 from sim_rl.replay import OUTCOME_FIELDS, STATE_FIELDS, capture  # noqa: E402
 
@@ -36,7 +36,7 @@ def main() -> None:
         raise ValueError("--no-gps-fraction must be in [0, 1]")
     saved = load_checkpoint(args.checkpoint)
     metadata = saved["metadata"]
-    features = FrozenFeatures(metadata["encoder"], torch.device("cuda:0"))
+    features = FrozenFeatures(metadata["encoder"], torch.device("cuda:0"), precision_of(metadata["preprocessing"]))
     recording = capture(SimpleNamespace(library=args.library, city=args.city, num_envs=1),
                         saved, features, args.seed, TEST_STYLE, args.no_gps_fraction)
     native = recording["native"]

@@ -14,7 +14,7 @@ from PIL import Image
 from .cli import (DEFAULT_LIBRARY, ROOT, TEST_SEED, TEST_STYLE, TRAIN_STYLE, VALIDATION_SEED,
                   VALIDATION_STYLE, build_policy, load_checkpoint, sha256, validate_checkpoint)
 from .curriculum import UNIFORM_WEIGHTS
-from .features import FrozenFeatures, crop_goals
+from .features import FrozenFeatures, crop_goals, precision_of
 from .model import deterministic_action, saliency_targets
 from .native import DEFAULT_CITY, PRIVILEGED_WIDTH, CudaEnv
 
@@ -250,7 +250,7 @@ def record(args):
         raise FileExistsError(f"refusing to overwrite replay: {args.out}")
     saved = load_checkpoint(args.checkpoint)
     metadata = saved["metadata"]
-    features = FrozenFeatures(metadata["encoder"], torch.device("cuda:0"))
+    features = FrozenFeatures(metadata["encoder"], torch.device("cuda:0"), precision_of(metadata["preprocessing"]))
     styles = {"train": TRAIN_STYLE, "validation": VALIDATION_STYLE, "test": TEST_STYLE}
     seeds = {"train": 0, "validation": VALIDATION_SEED, "test": TEST_SEED}
     seed = seeds[args.split] if args.seed is None else args.seed

@@ -2107,6 +2107,33 @@ wheels = [
 ]
 
 [[package]]
+name = "tensorrt-cu13"
+version = "11.4.0.106"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "tensorrt-cu13-bindings" },
+    { name = "tensorrt-cu13-libs" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/57/df/a0044af5a9becb484004fcbfb9bf91758ae7bc42dc85a5a91dd30d0c420a/tensorrt_cu13-11.4.0.106.tar.gz", hash = "sha256:ae8489f9e0b9593eaa67ced3422864f5d5d597bbcb2caafb58f8afb293977271", size = 17970, upload-time = "2026-10-08T18:46:38.79Z" }
+
+[[package]]
+name = "tensorrt-cu13-bindings"
+version = "11.4.0.106"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d3/f6/5083877a6aa6395c7362cc6f42e67d085f9ffe0bead9d9949110c2cb555a/tensorrt_cu13_bindings-11.4.0.106-cp313-none-manylinux_2_28_x86_64.whl", hash = "sha256:bac9a362c9189b5f5dd0444213913846e4b46003237834958e890eff57d86ed5", size = 1262506, upload-time = "2026-10-08T18:51:34.671Z" },
+    { url = "https://files.pythonhosted.org/packages/b2/3c/5bcd76e28b61e2d307e8bb24a358b8e60eb5bb0bc8768bc1033923e9fee3/tensorrt_cu13_bindings-11.4.0.106-cp313-none-manylinux_2_35_aarch64.whl", hash = "sha256:9b070517bbd1ae157a60a07fc6a9f5a055aecf7b160fa3ef679ad08beb440982", size = 1232875, upload-time = "2026-10-08T18:51:59.632Z" },
+    { url = "https://files.pythonhosted.org/packages/a8/c5/f091173571ba742c602d00f92d2cede23bdd7831f91f3455c4042b3e3fb0/tensorrt_cu13_bindings-11.4.0.106-cp313-none-win_amd64.whl", hash = "sha256:9a6027837063208e5f9239640bd7b8f5fad525ab99323a6e8337f091538d6fad", size = 895980, upload-time = "2026-10-08T18:52:19.987Z" },
+    { url = "https://files.pythonhosted.org/packages/b8/bd/ec805df1aa919deb57a4b58ee2145f6255b7e88227a43f5abba6f5b7a3db/tensorrt_cu13_bindings-11.4.0.106-cp313-none-win_arm64.whl", hash = "sha256:227126258fa459944e03d66fc8961d8f9973427066d3ebe5a1a172d7606c1461", size = 832946, upload-time = "2026-10-08T18:52:39.525Z" },
+]
+
+[[package]]
+name = "tensorrt-cu13-libs"
+version = "11.4.0.106"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/3e/a0/328dd4e184ec6e3296a1676a2f7c2d014faf53c32339f3dd4f358ddeb1b1/tensorrt_cu13_libs-11.4.0.106.tar.gz", hash = "sha256:fc29af15a9bb5489567a58a98a56d457de64c16ab3c8ea010ef21447ff29bbea", size = 15508, upload-time = "2026-10-08T18:48:37.773Z" }
+
+[[package]]
 name = "terminado"
 version = "0.18.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2365,6 +2392,7 @@ dependencies = [
     { name = "pillow" },
     { name = "raylib" },
     { name = "safetensors" },
+    { name = "tensorrt-cu13" },
     { name = "torch" },
     { name = "torchvision" },
     { name = "tqdm" },
@@ -2388,6 +2416,7 @@ requires-dist = [
     { name = "pillow" },
     { name = "raylib" },
     { name = "safetensors" },
+    { name = "tensorrt-cu13", specifier = ">=11.4" },
     { name = "torch", specifier = "==2.14.1", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cu130" },
     { name = "tqdm" },
