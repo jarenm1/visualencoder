@@ -122,6 +122,21 @@ Measured on ABI v4 (designed 1.5–2.5 m shapes, held-out designs; `runs/drone-p
 | `baseline` (standard distilled) | 0.894 | 0.629 | 0.861 | 7.6 px |
 | `mean` (paired consistency) | 0.897 | 0.620 | 0.856 | 7.7 px |
 
+## Refreshed-goal run (ABI v5)
+
+`runs/drone6-mean-refresh-seed0`: fresh camera policy, `mean` encoder with TensorRT FP16, seed 0, 128 envs, goal refresh every 30 steps. Reward, horizon, start-distance range and curriculum settings are unchanged from v5. Requested budget was 6M steps without a wall cutoff; stopped at 5,185,536 steps after validation regressed, retaining `best.pt` from 3,006,464 steps.
+
+Validation GPS success at 1M / 2M / 3M / 4M / 5M was 6.6% / 14.5% / 15.6% / 14.8% / 8.6%. No-GPS was 4.7% / 12.1% / 12.9% / 12.9% / 11.3%. The curriculum remained at 85% visible starts. Later training did not improve held-out validation; this is one seed, not evidence for a universal 3M-step cutoff.
+
+Held-out test of the selected 3M checkpoint, 256 episodes per GPS mode, uniform visibility buckets and randomized appearance:
+
+| Goal input | GPS success [Wilson 95%] | No-GPS success [Wilson 95%] | GPS crash | GPS timeout |
+|---|---|---|---|---|
+| Refreshed, simulator boxes | 0.156 [0.117, 0.206] | 0.152 [0.113, 0.201] | 0.363 | 0.391 |
+| Fixed initial reference | 0.117 [0.083, 0.162] | 0.090 [0.061, 0.131] | 0.348 | 0.438 |
+
+These refresh results use oracle simulator boxes, not an LLM detector. They do not establish language-guided search when the object has never been seen. Fixed-goal evaluation removes the additional box observations. Compared with the earlier 2.54M-step v5 run, the training budget and encoder precision also differ; improvements cannot be attributed solely to refresh. Results are in `final-test.json`, validation history in `validation.json`.
+
 ## ABI v5 results (city-object targets)
 
 Camera + `mean` encoder (bf16), velocity control, seed 0, 128 envs, 2.54M steps in the 3300 s budget (49.5 min incl. startup, validation and test; `runs/drone5-mean-seed0`). Held-out test district, 256 episodes per GPS mode, uniform visibility buckets, appearance randomization on; Wilson 95% intervals.
