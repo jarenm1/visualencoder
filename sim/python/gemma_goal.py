@@ -77,14 +77,19 @@ def load_gemma(model_id):
     return model.eval()
 
 
-def choose(model, processor, images, instruction):
-    """Gemma picks one reference image for the instruction -> (index or None, raw answer, seconds)."""
+def choose(model, processor, images, instruction, allow_none=False):
+    """Gemma picks one reference image for the instruction -> (index or None, raw answer, seconds).
+
+    allow_none lets Gemma answer 0 when no option matches (free-text use); the scripted
+    experiment always names one of the options.
+    """
     content = []
     for option, image in enumerate(images, start=1):
         content += [{"type": "text", "text": f"Option {option}:"}, {"type": "image", "image": image}]
+    decline = " If no option matches the instruction, answer 0." if allow_none else ""
     content.append({"type": "text", "text":
                     f"These are reference images of possible targets for a drone. Instruction: \"{instruction}\" "
-                    "Which option is the target? Answer with only the option number."})
+                    f"Which option is the target?{decline} Answer with only the option number."})
     inputs = processor.apply_chat_template([{"role": "user", "content": content}], tokenize=True, return_dict=True,
                                            return_tensors="pt", add_generation_prompt=True).to("cuda")
     start = time.monotonic()
@@ -129,7 +134,7 @@ def resolve(args):
         raise SystemExit("instruction must be 1-300 characters")
     designs, images = library(args.out)
     processor = AutoProcessor.from_pretrained(args.model)
-    chosen, text, latency = choose(load_gemma(args.model), processor, images, args.instruction)
+    chosen, text, latency = choose(load_gemma(args.model), processor, images, args.instruction, allow_none=True)
     print(json.dumps({"instruction": args.instruction, "model": args.model, "design": chosen,
                       "name": None if chosen is None else designs[chosen]["name"], "answer": text,
                       "latency_s": round(latency, 3)}), flush=True)

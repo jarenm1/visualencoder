@@ -31,15 +31,20 @@ VIDEO_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.mp4\Z")
 MAP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.encoder\Z")
 SALIENCY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.saliency\Z")
 BYTE_RANGE = re.compile(r"bytes=(\d*)-(\d*)\Z")
+RECORDING_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
+GOAL_IMAGE = re.compile(r"/goal/(\d{1,3})\.png\Z")
 
 
 def recording(data):
+    """Validate a recording directory -> (name, manifest bytes tagged with "recording", {url: (path, type, root)})."""
     root = data.resolve(strict=True)
+    name = root.name
+    if not RECORDING_NAME.fullmatch(name):
+        raise ValueError(f"recording directory name must match {RECORDING_NAME.pattern}: {name}")
     manifest_path = root / "manifest.json"
     if not manifest_path.resolve(strict=True).is_relative_to(root):
         raise ValueError("manifest.json must stay inside the selected data directory")
-    manifest_bytes = manifest_path.read_bytes()
-    manifest = json.loads(manifest_bytes)
+    manifest = json.loads(manifest_path.read_bytes())
     if manifest.get("format") != "sim-city-replay-v2":
         raise ValueError("expected a sim-city-replay-v2 manifest")
     environments = manifest.get("environments")
@@ -54,33 +59,38 @@ def recording(data):
         kinds.append(("saliency", SALIENCY_NAME, "application/octet-stream"))
     for environment in environments:
         for key, pattern, content_type in kinds:
-            name = environment.get(key)
-            if not isinstance(name, str) or not pattern.fullmatch(name):
-                raise ValueError(f"invalid replay {key} filename: {name!r}")
-            path = (root / name).resolve(strict=True)
+            file_name = environment.get(key)
+            if not isinstance(file_name, str) or not pattern.fullmatch(file_name):
+                raise ValueError(f"invalid replay {key} filename: {file_name!r}")
+            path = (root / file_name).resolve(strict=True)
             if not path.is_relative_to(root) or not path.is_file():
-                raise ValueError(f"{key} must be a file inside the selected data directory: {name}")
+                raise ValueError(f"{key} must be a file inside the selected data directory: {file_name}")
             if path.stat().st_size == 0:
-                raise ValueError(f"{key} is empty: {name}")
-            files["/replay/" + name] = (root / name, content_type)
+                raise ValueError(f"{key} is empty: {file_name}")
+            # Per-recording URLs: a page holding an older manifest can never fetch another recording's clip.
+            files[f"/replay/{name}/{file_name}"] = (root / file_name, content_type, root)
     if not files:
         raise ValueError("manifest lists no replay files")
-    return root, manifest_bytes, files
+    manifest["recording"] = name
+    return name, json.dumps(manifest).encode("utf-8"), files
 
 
 class ReplayServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, root, manifest, files, live=None):
+    def __init__(self, address, loaded, live=None):
         self.lock = threading.Lock()
-        self.current = (root, manifest, files)
+        self.current = loaded[:2]
+        self.files = dict(loaded[2])
         self.live = live
         self.status = {"live": live is not None, "state": "idle"}
         super().__init__(address, ReplayHandler)
 
-    def snapshot(self):
+    def install(self, loaded):
+        """Serve a new recording as current; earlier recordings stay reachable under their own URLs."""
         with self.lock:
-            return self.current
+            self.current = loaded[:2]
+            self.files.update(loaded[2])
 
     def report(self, **fields):
         with self.lock:
@@ -114,19 +124,20 @@ def run_instruction(server, instruction):
                               "--instruction", instruction, "--model", live["model"], timeout=900)
         choice = json.loads(resolved.strip().splitlines()[-1])
         if choice["design"] is None:
-            raise RuntimeError(f"Gemma did not name a target (answer {choice['answer']!r})")
+            raise RuntimeError(f"No target matches \"{instruction}\" (Gemma answered {choice['answer']!r})")
         out = live["out"] / time.strftime("%Y%m%d-%H%M%S")
+        # Fresh scenes per instruction; repeating an instruction must not replay the same episodes.
+        seed = int.from_bytes(os.urandom(7), "little")
         server.report(state="flying", instruction=instruction, design=choice["design"], name=choice["name"],
                       answer=choice["answer"])
         sim_python("sim/python/replay.py", "--checkpoint", str(live["checkpoint"]), "--out", str(out),
-                   "--num-envs", str(live["num_envs"]), "--split", "test", "--design", str(choice["design"]),
-                   "--instruction-json", json.dumps(choice), timeout=1800)
-        new = recording(out)
-        with server.lock:
-            server.current = new
-            server.status = {"live": True, "state": "done", "instruction": instruction, "design": choice["design"],
-                             "name": choice["name"], "answer": choice["answer"], "recording": out.name,
-                             "episodes": len(json.loads(new[1])["environments"])}
+                   "--num-envs", str(live["num_envs"]), "--split", "test", "--seed", str(seed),
+                   "--design", str(choice["design"]), "--instruction-json", json.dumps(choice), timeout=1800)
+        loaded = recording(out)
+        server.install(loaded)
+        server.report(state="done", instruction=instruction, design=choice["design"], name=choice["name"],
+                      answer=choice["answer"], recording=loaded[0],
+                      episodes=len(json.loads(loaded[1])["environments"]))
     except Exception as error:  # Reported to the page; the previous recording stays served.
         server.report(state="error", instruction=instruction, message=str(error))
 
@@ -203,30 +214,36 @@ class ReplayHandler(BaseHTTPRequestHandler):
             self.fail(400, "Invalid request path", head)
             return
 
-        root, manifest, files = self.server.snapshot()
         if path == "/api/status":
             with self.server.lock:
-                status = dict(self.server.status)
+                status = {**self.server.status, "current": self.server.current[0]}
             if head:
                 self.headers_for(200, 0, "application/json; charset=utf-8")
             else:
                 self.json_reply(200, status)
             return
         if path == "/replay/manifest.json":
-            body = manifest
+            with self.server.lock:
+                body = self.server.current[1]
             self.headers_for(200, len(body), "application/json; charset=utf-8")
             if not head:
                 self.wfile.write(body)
             return
+        goal = GOAL_IMAGE.fullmatch(path)
         if path in UI_FILES:
             name, content_type = UI_FILES[path]
             file_path = UI_ROOT / name
             root = UI_ROOT
-        elif path in files:
-            file_path, content_type = files[path]
+        elif goal and self.server.live is not None:
+            root = self.server.live["library"]
+            file_path, content_type = root / f"goal-{int(goal.group(1))}.png", "image/png"
         else:
-            self.fail(404, "Replay resource not found", head)
-            return
+            with self.server.lock:
+                entry = self.server.files.get(path)
+            if entry is None:
+                self.fail(404, "Replay resource not found", head)
+                return
+            file_path, content_type, root = entry
 
         try:
             resolved = file_path.resolve(strict=True)
@@ -306,13 +323,13 @@ def main():
         live = {"library": args.goal_library.resolve(), "checkpoint": args.checkpoint.resolve(), "out": args.live_out.resolve(),
                 "model": args.model, "num_envs": args.live_envs}
     try:
-        root, manifest, files = recording(args.data)
-        server = ReplayServer((args.host, args.port), root, manifest, files, live)
+        loaded = recording(args.data)
+        server = ReplayServer((args.host, args.port), loaded, live)
     except (OSError, ValueError, TypeError, KeyError) as error:
         parser.exit(1, f"Replay server: {error}\n")
     print(f"City replay: http://{args.host}:{args.port}/", flush=True)
-    count = len(json.loads(manifest)["environments"])
-    print(f"Serving {count} recorded environments ({len(files)} files) from {root}", flush=True)
+    count = len(json.loads(loaded[1])["environments"])
+    print(f"Serving recording {loaded[0]}: {count} environments ({len(loaded[2])} files)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -28,6 +28,7 @@ let sourceReady = false;
 let failed = false;
 
 function environment() { return manifest.environments[selected]; }
+function replayUrl(name) { return `/replay/${encodeURIComponent(manifest.recording)}/${encodeURIComponent(name)}`; }
 function frameAt(time) { return Math.min(environment().frame_count - 1, Math.max(0, Math.floor(time * manifest.control_hz + 0.00001))); }
 function setControls(enabled) { playbackIds.forEach((id) => { $(id).disabled = !enabled; }); }
 function busy(value) { document.querySelector("main").setAttribute("aria-busy", String(value)); }
@@ -207,7 +208,7 @@ function chooseEnvironment(index) {
     setControls(true);
     present(source, source.currentTime);
   };
-  const load = (name, bytes, assign) => fetch(`/replay/${encodeURIComponent(name)}`, { cache: "no-store" })
+  const load = (name, bytes, assign) => fetch(replayUrl(name), { cache: "no-store" })
     .then((response) => {
       if (!response.ok) throw new Error(`${name}: HTTP ${response.status}`);
       return response.arrayBuffer();
@@ -248,7 +249,7 @@ function chooseEnvironment(index) {
   source.addEventListener("play", () => { if (current()) playIcon(); });
   source.addEventListener("ended", () => { if (current()) { present(source, env.duration_seconds); playIcon(); } });
   source.addEventListener("error", () => { if (current()) fail(`${env.video}: ${source.error?.message || "media error"}`); });
-  source.src = `/replay/${encodeURIComponent(env.video)}`;
+  source.src = replayUrl(env.video);
   source.load();
   renderLoop(source, token);
 }
@@ -287,6 +288,7 @@ function cycleView() {
 function validateManifest(data) {
   const demand = (condition, message) => { if (!condition) throw new Error(message); };
   demand(data?.format === "sim-city-replay-v2", "Unsupported recording format");
+  demand(typeof data.recording === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(data.recording), "Missing recording id");
   demand(Number.isFinite(data.control_hz) && data.control_hz > 0, "Invalid recording frame rate");
   demand(Number.isInteger(data.video_width) && Number.isInteger(data.video_height), "Missing video dimensions");
   for (const key of ["first_person", "third_person"]) {
@@ -344,25 +346,27 @@ async function loadManifest() {
     MODES = ALL_MODES.filter((name) => name !== "encoder");
     if (mode === "encoder") mode = "split";
   }
+  const goal = $("goal");
+  const chosen = manifest.instruction;
+  goal.hidden = !chosen;
+  if (chosen) {
+    goal.src = `/goal/${Number(chosen.design)}.png`;
+    goal.alt = goal.title = `"${chosen.instruction}" → ${chosen.name}`;
+  }
   resize();
   chooseEnvironment(0);
 }
 
 // Live mode: the server resolves typed instructions with Gemma, records the policy, then swaps recordings.
 const instruction = $("instruction");
-let lastRecording = null;
-
-function describeChoice(status) {
-  return status.name ? `${status.name} (Gemma: ${status.answer})` : "";
-}
 
 function showStatus(status) {
   const working = status.state === "resolving" || status.state === "flying";
   instruction.disabled = working;
   $("send").disabled = working;
   if (status.state === "resolving") instruction.placeholder = `Gemma reading: ${status.instruction}`;
-  else if (status.state === "flying") instruction.placeholder = `${describeChoice(status)} - flying`;
-  else if (status.state === "done") instruction.placeholder = `${describeChoice(status)} - ${status.episodes} episodes`;
+  else if (status.state === "flying") instruction.placeholder = `${status.instruction} → ${status.name} - flying`;
+  else if (status.state === "done") instruction.placeholder = `${status.instruction} → ${status.name} - ${status.episodes} episodes`;
   else if (status.state === "error") instruction.placeholder = status.message;
   if (working) instruction.value = "";
   return working;
@@ -375,11 +379,8 @@ async function pollStatus() {
   if (!status.live) return;
   $("instruct").hidden = false;
   const working = showStatus(status);
-  if (status.state === "done" && status.recording !== lastRecording) {
-    const first = lastRecording === null;
-    lastRecording = status.recording;
-    if (!first) await loadManifest();
-  }
+  // The server's current recording is the source of truth; switch whenever it differs from the one shown.
+  if (status.current !== manifest?.recording) await loadManifest();
   if (working) setTimeout(() => pollStatus().catch((error) => fail(error.message)), 1500);
 }
 
@@ -391,7 +392,6 @@ $("instruct").addEventListener("submit", async (event) => {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ instruction: text }),
   });
   if (!response.ok && response.status !== 409) return fail(`Instruction rejected: HTTP ${response.status}`);
-  if (lastRecording === null) lastRecording = "";
   pollStatus().catch((error) => fail(error.message));
 });
 
