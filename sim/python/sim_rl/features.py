@@ -43,6 +43,13 @@ class FrozenFeatures:
             return env.privileged
         if self.spec == "proprio":
             return env.proprio[:, :0]
+        return self.encode(env)[0]
+
+    @torch.no_grad()
+    def encode(self, env):
+        """Policy tokens plus the unpooled [N, D, H/16, W/16] patch grid from one encoder pass."""
+        if self.encoder is None:
+            raise ValueError(f"{self.spec} arm has no visual encoder")
         with torch.autocast("cuda", dtype=torch.bfloat16):
             cls, patches = self.encoder(env.obs)
         height, width = env.height // 16, env.width // 16
@@ -51,4 +58,4 @@ class FrozenFeatures:
         grid = patches.float().transpose(1, 2).reshape(env.n, -1, height, width)
         pooled = F.adaptive_avg_pool2d(grid, (2, 3)).flatten(2).transpose(1, 2)
         tokens = torch.cat((cls.float().unsqueeze(1), pooled), dim=1)
-        return F.layer_norm(tokens, (tokens.shape[-1],)).flatten(1)
+        return F.layer_norm(tokens, (tokens.shape[-1],)).flatten(1), grid

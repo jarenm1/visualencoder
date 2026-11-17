@@ -22,6 +22,8 @@ def capture(args, saved, seed, style):
     width, height, n = metadata["width"], metadata["height"], args.num_envs
     with CudaEnv(args.library, n, seed, width, height, style, args.city) as env, env.execution():
         features = FrozenFeatures(metadata["encoder"], env.device)
+        if features.encoder is None:
+            raise ValueError("replay encoder maps require a visual-policy checkpoint")
         validate_checkpoint(saved, env, features)
         policy = Policy(features.dim, env.action_count, metadata["ppo"]["hidden_size"]).to(env.device).eval()
         policy.load_state_dict(saved["policy"], strict=True)
@@ -33,19 +35,60 @@ def capture(args, saved, seed, style):
         images = torch.empty((env.horizon, n, height, width, 3), dtype=torch.uint8, device=env.device)
         states = torch.empty((env.horizon, n, 8), device=env.device)
         transitions = torch.empty((env.horizon, n, 5), device=env.device)
+        grids = None
         for step in range(env.horizon):
             states[step].copy_(env.diagnostics)
             images[step].copy_((env.obs.permute(0, 2, 3, 1) * 255).round().clamp(0, 255).to(torch.uint8))
-            logits, _, hidden = policy(features(env), env.proprio, hidden, starts)
+            tokens, grid = features.encode(env)
+            if grids is None:
+                grids = torch.empty((env.horizon, *grid.shape), dtype=torch.float16, device=env.device)
+            grids[step].copy_(grid)
+            logits, _, hidden = policy(tokens, env.proprio, hidden, starts)
             actions.copy_(logits.argmax(-1))
             env.step(actions)
             transitions[step].copy_(torch.stack(
                 (actions.float(), env.reward, env.done, env.success, env.collision), -1))
             starts.copy_(env.done)
+        done = transitions[:, :, 2]
+        maps = encoder_maps(grids, (done.cumsum(0) - done) == 0)
         # Replay export intentionally reads back once after collection. It does
         # not alter the simulator's GPU-only training/rollout transport contract.
         env.stream.synchronize()
-        return images.cpu().numpy(), states.cpu().numpy(), transitions.cpu().numpy(), dict(env.metadata)
+        return (images.cpu().numpy(), states.cpu().numpy(), transitions.cpu().numpy(),
+                maps.cpu().numpy(), dict(env.metadata))
+
+
+def encoder_maps(grids, valid):
+    """Project every recorded patch token onto one shared 3-component PCA basis.
+
+    grids: [T, N, D, H, W] unpooled patch tokens; valid: [T, N] pre-terminal frames.
+    The basis and per-channel 1st/99th-percentile ranges come from all valid
+    frames, so colours are comparable across time and environments.
+    Returns uint8 [T, N, H, W, 3].
+    """
+    dim = grids.shape[2]
+    total = torch.zeros(dim, dtype=torch.float64, device=grids.device)
+    outer = torch.zeros((dim, dim), dtype=torch.float64, device=grids.device)
+    count = 0
+    for step, mask in zip(grids, valid):
+        tokens = step[mask].permute(0, 2, 3, 1).reshape(-1, dim).double()
+        total += tokens.sum(0)
+        outer += tokens.T @ tokens
+        count += tokens.shape[0]
+    mean = total / count
+    _, vectors = torch.linalg.eigh(outer / count - torch.outer(mean, mean))
+    basis = vectors[:, -3:].flip(1)
+    # eigh signs are arbitrary; fix them so reruns give identical colours.
+    basis *= torch.sign(basis.gather(0, basis.abs().argmax(0, keepdim=True)))
+    basis, mean = basis.float(), mean.float()
+    projected = torch.stack([
+        torch.einsum("ndhw,dc->nhwc", step.float() - mean[:, None, None], basis) for step in grids])
+    samples = projected[valid].reshape(-1, 3)
+    if samples.shape[0] > 1 << 24:
+        samples = samples[torch.randperm(samples.shape[0], device=samples.device)[: 1 << 24]]
+    low, high = torch.quantile(samples, 0.01, dim=0), torch.quantile(samples, 0.99, dim=0)
+    scaled = (projected - low) / (high - low).clamp_min(1e-6)
+    return (scaled.clamp(0, 1) * 255).round().to(torch.uint8)
 
 
 def record(args):
@@ -63,7 +106,7 @@ def record(args):
     seed = seeds[args.split] if args.seed is None else args.seed
     if not 0 <= seed < 2**64:
         raise ValueError("seed must fit unsigned 64 bits")
-    images, states, transitions, native = capture(args, saved, seed, styles[args.split])
+    images, states, transitions, maps, native = capture(args, saved, seed, styles[args.split])
     torch.cuda.empty_cache()  # Release this exporter's unused memory before the renderer process.
     if not np.isfinite(states).all() or not np.isfinite(transitions).all():
         raise RuntimeError("native recording contains non-finite state or transitions")
@@ -83,10 +126,11 @@ def record(args):
         with (args.out / f"{basename}.rgb").open("wb") as stream:
             for frame in images[:length, index]:
                 stream.write(memoryview(frame))
+        maps[:length, index].tofile(args.out / f"{basename}.encoder")
         environments.append({
             "id": index, "route_id": int(episode[0, 6]), "frame_count": length,
             "duration_seconds": length / native["control_hz"], "outcome": outcome,
-            "video": f"{basename}.mp4", "states": episode.tolist(),
+            "video": f"{basename}.mp4", "encoder_map": f"{basename}.encoder", "states": episode.tolist(),
             "transitions": transitions[:length, index].tolist(),
         })
     width, height = metadata["width"], metadata["height"]
@@ -95,6 +139,9 @@ def record(args):
         "control_hz": native["control_hz"], "frame_width": width, "frame_height": height,
         "video_width": width * 2, "video_height": height,
         "views": {"first_person": [0, 0, width, height], "third_person": [width, 0, width, height]},
+        "encoder_map": {"width": maps.shape[3], "height": maps.shape[2], "channels": 3, "dtype": "uint8",
+                        "method": "Unpooled patch tokens of the frozen policy encoder, same pass the policy consumed; "
+                                  "shared 3-component PCA over all recorded pre-terminal frames, 1st/99th percentile scaled."},
         "checkpoint": str(args.checkpoint.resolve()), "checkpoint_sha256": sha256(args.checkpoint),
         "native_sha256": metadata["native_sha256"], "encoder": metadata["encoder"],
         "actor_inputs": metadata["actor_inputs"], "selected_steps": saved["steps"],
@@ -128,7 +175,7 @@ def main():
     parser.add_argument("--renderer", type=Path, default=ROOT / ".sim-target/training/sim-replay-render")
     parser.add_argument("--city", type=Path, default=DEFAULT_CITY)
     parser.add_argument("--out", type=Path, default=ROOT / "runs/city-replay")
-    parser.add_argument("--num-envs", type=int, default=16)
+    parser.add_argument("--num-envs", type=int, default=32)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--split", choices=("train", "validation", "test"), default="test")
     record(parser.parse_args())

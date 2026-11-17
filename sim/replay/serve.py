@@ -19,6 +19,7 @@ UI_FILES = {
     "/style.css": ("style.css", "text/css; charset=utf-8"),
 }
 VIDEO_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.mp4\Z")
+MAP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.encoder\Z")
 BYTE_RANGE = re.compile(r"bytes=(\d*)-(\d*)\Z")
 
 
@@ -34,27 +35,29 @@ def recording(data):
     environments = manifest.get("environments")
     if not isinstance(environments, list) or not environments:
         raise ValueError("manifest contains no recorded environments")
-    videos = {}
+    files = {}
     for environment in environments:
-        name = environment.get("video")
-        if not isinstance(name, str) or not VIDEO_NAME.fullmatch(name):
-            raise ValueError(f"invalid replay video filename: {name!r}")
-        path = (root / name).resolve(strict=True)
-        if not path.is_relative_to(root) or not path.is_file():
-            raise ValueError(f"video must be a file inside the selected data directory: {name}")
-        if path.stat().st_size == 0:
-            raise ValueError(f"video is empty: {name}")
-        videos["/replay/" + name] = root / name
-    return root, manifest_bytes, videos
+        for key, pattern, content_type in (("video", VIDEO_NAME, "video/mp4"),
+                                           ("encoder_map", MAP_NAME, "application/octet-stream")):
+            name = environment.get(key)
+            if not isinstance(name, str) or not pattern.fullmatch(name):
+                raise ValueError(f"invalid replay {key} filename: {name!r}")
+            path = (root / name).resolve(strict=True)
+            if not path.is_relative_to(root) or not path.is_file():
+                raise ValueError(f"{key} must be a file inside the selected data directory: {name}")
+            if path.stat().st_size == 0:
+                raise ValueError(f"{key} is empty: {name}")
+            files["/replay/" + name] = (root / name, content_type)
+    return root, manifest_bytes, files
 
 
 class ReplayServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, root, manifest, videos):
+    def __init__(self, address, root, manifest, files):
         self.data_root = root
         self.manifest = manifest
-        self.videos = videos
+        self.files = files
         super().__init__(address, ReplayHandler)
 
 
@@ -111,10 +114,9 @@ class ReplayHandler(BaseHTTPRequestHandler):
             name, content_type = UI_FILES[path]
             file_path = UI_ROOT / name
             root = UI_ROOT
-        elif path in self.server.videos:
-            file_path = self.server.videos[path]
+        elif path in self.server.files:
+            file_path, content_type = self.server.files[path]
             root = self.server.data_root
-            content_type = "video/mp4"
         else:
             self.fail(404, "Replay resource not found", head)
             return
@@ -183,12 +185,12 @@ def main():
     parser.add_argument("--port", type=int, default=8787)
     args = parser.parse_args()
     try:
-        root, manifest, videos = recording(args.data)
-        server = ReplayServer((args.host, args.port), root, manifest, videos)
+        root, manifest, files = recording(args.data)
+        server = ReplayServer((args.host, args.port), root, manifest, files)
     except (OSError, ValueError, TypeError, KeyError) as error:
         parser.exit(1, f"Replay server: {error}\n")
     print(f"City replay: http://{args.host}:{args.port}/", flush=True)
-    print(f"Serving {len(videos)} recorded clips from {root}", flush=True)
+    print(f"Serving {len(files) // 2} recorded environments from {root}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
