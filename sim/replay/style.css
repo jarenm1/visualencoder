@@ -17,3 +17,11 @@ button:disabled { color: #555; cursor: default; }
 svg { width: 100%; height: 100%; display: block; fill: currentColor; }
 #timeline { flex: 1; margin: 0 8px; accent-color: #9a9a9a; height: 32px; cursor: pointer; }
 #timeline:disabled { cursor: default; }
+#instruct { display: flex; align-items: center; gap: 4px; }
+#instruct[hidden] { display: none; }
+#instruction {
+  flex: 1; height: 32px; padding: 0 10px; border: 1px solid #333; border-radius: 4px;
+  background: #151515; color: #d6d6d6; font: inherit; font-size: 14px;
+}
+#instruction::placeholder { color: #6a6a6a; }
+#instruction:disabled { color: #8a8a8a; }

@@ -205,6 +205,9 @@ def record(args):
         episode = states[:length, index]
         if not np.all(episode[:, 10] == episode[0, 10]) or not np.array_equal(episode[:, 11], np.arange(length)):
             raise RuntimeError(f"environment {index} recording crosses an autoreset boundary")
+        # One target per scene: an instruction selects episodes whose scene holds that design.
+        if args.design is not None and int(episode[0, 10]) != args.design:
+            continue
         final = transitions[length - 1, index]
         outcome = ("success" if final[6] else "collision" if final[7]
                    else "out_of_bounds" if final[8] else "timeout")
@@ -213,7 +216,7 @@ def record(args):
             for frame in recording["images"][:length, index]:
                 stream.write(memoryview(np.ascontiguousarray(frame)))
         entry = {
-            "id": index, "frame_count": length, "duration_seconds": length / recording["native"]["control_hz"],
+            "id": len(environments), "frame_count": length, "duration_seconds": length / recording["native"]["control_hz"],
             "outcome": outcome, "bucket": int(recording["ended"][length - 1, index]),
             "start_landed": bool(recording["start_landed"][index] > 0.5),
             "gps_available": bool(recording["gps_available"][index] > 0.5),
@@ -238,8 +241,11 @@ def record(args):
             np.round(np.clip(packed, 0, 1) * 255).astype(np.uint8).tofile(saliency_path)
             entry["saliency"] = saliency_path.name
         environments.append(entry)
+    if not environments:
+        raise RuntimeError(f"no recorded episode has target design {args.design}; record more environments")
     width, height = metadata["width"], metadata["height"]
     manifest = {
+        "instruction": None if args.instruction_json is None else json.loads(args.instruction_json),
         "format": "sim-city-replay-v2", "title": "City drone goal replay", "style": styles[args.split],
         "split": args.split, "control_hz": recording["native"]["control_hz"],
         "control_mode": recording["native"]["control_mode"], "action_names": action_names,
@@ -297,4 +303,7 @@ def main():
     parser.add_argument("--split", choices=("train", "validation", "test"), default="test")
     parser.add_argument("--no-gps-fraction", type=float, default=0.0,
                         help="probability that the replayed episodes run without GPS")
+    parser.add_argument("--design", type=int,
+                        help="keep only episodes whose target is this split-local design (instruction-driven replays)")
+    parser.add_argument("--instruction-json", help="resolution record of the instruction, stored in the manifest")
     record(parser.parse_args())

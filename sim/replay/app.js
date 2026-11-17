@@ -326,24 +326,79 @@ document.addEventListener("keydown", (event) => {
   if (action) { event.preventDefault(); action(); }
 });
 
+async function loadManifest() {
+  const response = await fetch("/replay/manifest.json", { cache: "no-store" });
+  if (!response.ok) throw new Error(`Manifest request returned HTTP ${response.status}`);
+  manifest = validateManifest(await response.json());
+  failed = false;
+  const multiple = manifest.environments.length > 1;
+  $("previous-env").disabled = !multiple;
+  $("next-env").disabled = !multiple;
+  $("random-env").disabled = !multiple;
+  $("view").disabled = false;
+  if (manifest.encoder_map) {
+    mapCanvas.width = manifest.encoder_map.width;
+    mapCanvas.height = manifest.encoder_map.height;
+    MODES = ALL_MODES;
+  } else {
+    MODES = ALL_MODES.filter((name) => name !== "encoder");
+    if (mode === "encoder") mode = "split";
+  }
+  resize();
+  chooseEnvironment(0);
+}
+
+// Live mode: the server resolves typed instructions with Gemma, records the policy, then swaps recordings.
+const instruction = $("instruction");
+let lastRecording = null;
+
+function describeChoice(status) {
+  return status.name ? `${status.name} (Gemma: ${status.answer})` : "";
+}
+
+function showStatus(status) {
+  const working = status.state === "resolving" || status.state === "flying";
+  instruction.disabled = working;
+  $("send").disabled = working;
+  if (status.state === "resolving") instruction.placeholder = `Gemma reading: ${status.instruction}`;
+  else if (status.state === "flying") instruction.placeholder = `${describeChoice(status)} - flying`;
+  else if (status.state === "done") instruction.placeholder = `${describeChoice(status)} - ${status.episodes} episodes`;
+  else if (status.state === "error") instruction.placeholder = status.message;
+  if (working) instruction.value = "";
+  return working;
+}
+
+async function pollStatus() {
+  const response = await fetch("/api/status", { cache: "no-store" });
+  if (!response.ok) return;
+  const status = await response.json();
+  if (!status.live) return;
+  $("instruct").hidden = false;
+  const working = showStatus(status);
+  if (status.state === "done" && status.recording !== lastRecording) {
+    const first = lastRecording === null;
+    lastRecording = status.recording;
+    if (!first) await loadManifest();
+  }
+  if (working) setTimeout(() => pollStatus().catch((error) => fail(error.message)), 1500);
+}
+
+$("instruct").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const text = instruction.value.trim();
+  if (!text) return;
+  const response = await fetch("/api/instruct", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ instruction: text }),
+  });
+  if (!response.ok && response.status !== 409) return fail(`Instruction rejected: HTTP ${response.status}`);
+  if (lastRecording === null) lastRecording = "";
+  pollStatus().catch((error) => fail(error.message));
+});
+
 (async () => {
   try {
-    const response = await fetch("/replay/manifest.json", { cache: "no-store" });
-    if (!response.ok) throw new Error(`Manifest request returned HTTP ${response.status}`);
-    manifest = validateManifest(await response.json());
-    const multiple = manifest.environments.length > 1;
-    $("previous-env").disabled = !multiple;
-    $("next-env").disabled = !multiple;
-    $("random-env").disabled = !multiple;
-    $("view").disabled = false;
-    if (manifest.encoder_map) {
-      mapCanvas.width = manifest.encoder_map.width;
-      mapCanvas.height = manifest.encoder_map.height;
-    } else {
-      MODES = ALL_MODES.filter((name) => name !== "encoder");
-    }
-    resize();
-    chooseEnvironment(0);
+    await loadManifest();
+    await pollStatus();
   } catch (error) {
     fail(error.message);
   }

@@ -108,6 +108,20 @@ Measured (`runs/drone-probe-saliency`, test split):
 
 The camera policy was trained only with GPS available; its no-GPS score is zero-shot. Results are single-seed and budget-limited, not convergence claims; the camera arm does not yet include the `pretrained`/`baseline` encoder comparison.
 
+### Language goals via Gemma 4 (no retraining)
+
+`gemma_goal.py` (stages `dump`, `pick`, `resolve`, `fly`) lets Gemma 4 E4B-it choose the goal: it sees the 8 held-out reference images as numbered options plus one instruction and answers an option number (bf16 on GPU, 5.6 GB per-layer embedding table kept on CPU; ~0.75 s per answer). The chosen design's embedding replaces the true goal; the camera policy above flies 256 test episodes per condition (`runs/gemma-goal/flight.json`).
+
+| Goal source | Pick accuracy (8) | Success |
+|---|---|---|
+| True goal | 1.00 | 0.449 [0.389, 0.510] |
+| Gemma, colour only ("Go to the green one") | 0.75 | 0.418 [0.359, 0.479] |
+| Gemma, riddle ("…shaped like a donut") | 0.75 | 0.367 [0.311, 0.428] |
+| Gemma, full name ("Fly to the checkered green octahedron") | 0.625 | 0.344 [0.288, 0.404] |
+| Wrong design (ablation) | 0 | 0.121 |
+
+Every Gemma miss confused two designs that share colour and pattern but differ in shape (octahedron/torus, cube/cylinder). Colour-only instructions are ambiguous in this split (two green, two blue designs) but scored higher than full names.
+
 ## Checkpoints
 
 Format `sim-drone-ppo-v2`. A checkpoint records task, ABI version, control mode, encoder spec and fingerprint, policy mode, control rate, city fingerprint, native library hash (provenance only, not compared, so rebuilds stay valid), seeds, PPO settings, `no_gps_fraction` and `aux_coefficient`. Loading rejects v1, v2 and v3 checkpoints and any ABI other than 4.
@@ -116,7 +130,9 @@ Format `sim-drone-ppo-v2`. A checkpoint records task, ABI version, control mode,
 
 `scripts/render_navigation.py --checkpoint runs/drone-mean/best.pt [--no-gps-fraction 1]` renders one first-episode rollout (`rollout.gif`, `contact.png`, `path.png`, `path.json`, `rollout.json`). `rollout.json` records control mode, action names, GPS mode and outcome. `scripts/show_navigation.py --runs runs/drone-mean runs/drone-pretrained ...` writes `report/city-drone-goal.typ` and `.json` from completed runs only, with GPS-available and GPS-denied columns. Both reject results with fewer than 256 episodes per mode or a different task or ABI.
 
-Replay export (`sim_rl.replay`) writes format `sim-city-replay-v2`: a manifest (including `control_mode`, `action_names`, `no_gps_fraction` and per-environment `gps_available`) plus per-environment states (`world_x, world_y, world_z, quat_x..w, target_x, target_y, target_z, design, clock, landed`) and transitions (`action_names` followed by `reward, done, success, collision, out_of_bounds`), trimmed to the first done frame. Run it from `sim/python` with `PYTHONPATH=. ../../.venv/bin/python -m sim_rl.replay --checkpoint ... --library ... [--no-gps-fraction 0.5]`.
+Replay export (`sim_rl.replay`) writes format `sim-city-replay-v2`: a manifest (including `control_mode`, `action_names`, `no_gps_fraction` and per-environment `gps_available`) plus per-environment states (`world_x, world_y, world_z, quat_x..w, target_x, target_y, target_z, design, clock, landed`) and transitions (`action_names` followed by `reward, done, success, collision, out_of_bounds`), trimmed to the first done frame. Run it from `sim/python` with `PYTHONPATH=. ../../.venv/bin/python -m sim_rl.replay --checkpoint ... --library ... [--no-gps-fraction 0.5]`. `--design K` keeps only episodes whose target is split-local design `K`; `--instruction-json` stores the instruction record in the manifest.
+
+Typed goals in the replay site: start the server inside the root dev shell (Gemma needs its libraries) with `nix develop --command .venv/bin/python sim/replay/serve.py --data runs/city-replay-saliency --live` after `gemma_goal.py dump --out runs/gemma-goal`. The page then shows an instruction field; each instruction runs Gemma `resolve`, records the policy on `--live-envs` (default 32) held-out environments, keeps those whose scene holds the chosen design (about 1 in 8), and swaps the recording in (~35 s). Scenes hold one target, so the instruction selects which object the drone seeks, not one object among distractors.
 
 ## Resource notes
 
