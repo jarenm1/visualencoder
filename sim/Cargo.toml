@@ -7,6 +7,7 @@ members = [
     "crates/sim-physics",
     "crates/sim-env",
     "apps/sim-smoke",
+    "apps/sim-replay-render",
 ]
 # Ordinary host iteration never invokes the device compiler.
 default-members = ["crates/sim-state", "crates/sim-interop", "crates/sim-render", "crates/sim-scene"]

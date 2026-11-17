@@ -31,7 +31,7 @@
       '';
       shell = extra: pkgs.mkShell {
         inputsFrom = [ cuda-rust.devShells.${system}.default ];
-        packages = with pkgs; [ mold pkg-config vulkan-loader vulkan-tools vulkan-validation-layers git ] ++ extra;
+        packages = with pkgs; [ mold pkg-config vulkan-loader vulkan-tools vulkan-validation-layers ffmpeg-headless git ] ++ extra;
         shellHook = ''
           export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [ pkgs.vulkan-loader ]}:''${LD_LIBRARY_PATH:-}
           export VK_LAYER_PATH=${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d

@@ -1,0 +1,18 @@
+[package]
+name = "sim-replay-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+wgpu.workspace = true
+sim-state.workspace = true
+sim-interop.workspace = true
+sim-render.workspace = true
+sim-scene = { path = "../../crates/sim-scene" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

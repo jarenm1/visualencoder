@@ -1202,6 +1202,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sim-replay-render"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "glam",
+ "serde",
+ "serde_json",
+ "sim-interop",
+ "sim-render",
+ "sim-scene",
+ "sim-state",
+ "wgpu",
+]
+
+[[package]]
 name = "sim-scene"
 version = "0.1.0"
 dependencies = [
