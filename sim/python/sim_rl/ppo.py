@@ -9,14 +9,15 @@ from torch.profiler import record_function
 
 from .curriculum import MODES as CURRICULUM_MODES, Curriculum
 from .features import RefreshedGoals
+from .memory import CANDIDATE_WIDTH, CHANNELS, EGO, SpatialMemory, observe as observe_memory
 from .model import saliency_loss, squashed_entropy, squashed_log_prob
 from .native import HOVER_ACTIONS, PRIVILEGED_WIDTH, PROPRIO_WIDTH
 
 # finish_rollout layout: rollout totals, PPO losses, bucket totals, used/next weights, EMAs.
-ROLLOUT_WIDTH, LOSS_WIDTH, BUCKET_WIDTH = 5, 8, 12
+ROLLOUT_WIDTH, LOSS_WIDTH, BUCKET_WIDTH = 5, 9, 12
 RESULT_WIDTH = ROLLOUT_WIDTH + LOSS_WIDTH + BUCKET_WIDTH + 3 + 3 + 3
 LOSS_NAMES = ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction", "grad_norm",
-              "aux_saliency_loss", "aux_patch_accuracy")
+              "aux_saliency_loss", "aux_patch_accuracy", "aux_memory_loss")
 
 
 @contextmanager
@@ -127,6 +128,12 @@ class Trainer:
             self.tokens = torch.empty((t, n, patches, features.dim), device=env.device, dtype=torch.bfloat16)
         else:
             self.goals = self.cls = self.tokens = None
+        if policy.spatial:
+            self.spatial = SpatialMemory(n, env.height // 16, env.width // 16, env.metadata["camera"], env.device)
+            self.memory_ego = torch.empty((t, n, CHANNELS, EGO, EGO), device=env.device, dtype=torch.bfloat16)
+            self.memory_candidate = allocate(t, n, CANDIDATE_WIDTH)
+        else:
+            self.spatial = None
         self.current_cls = self.current_tokens = None
         self._sequence_offsets = torch.arange(config.sequence_length, device=env.device).unsqueeze(1)
         self._observe()
@@ -135,9 +142,16 @@ class Trainer:
         if self.features.visual:
             self.current_cls, self.current_tokens = self.features.observe(self.env)
 
-    def _inputs(self, cls, tokens, goal, proprio, privileged):
-        """Use the exact goal seen at collection, including any in-episode refresh."""
-        return self.policy.actor_inputs_and_features(cls, tokens, goal, proprio, privileged)
+    def _inputs(self, cls, tokens, goal, proprio, privileged, memory=None):
+        """Use the exact goal and memory seen at collection, including any in-episode refresh."""
+        return self.policy.actor_inputs_and_features(cls, tokens, goal, proprio, privileged, memory)
+
+    def _memory(self, goal):
+        """Spatial-memory tick for the current observation (None without spatial memory)."""
+        if self.spatial is None:
+            return None
+        return observe_memory(self.policy, self.spatial, self.current_cls, self.current_tokens, goal,
+                              self.env.proprio, self.next_start)
 
     @torch.no_grad()
     def warmup(self, seed, iterations=3):
@@ -146,7 +160,7 @@ class Trainer:
         for _ in range(iterations):
             goal = self.goal_source.step(self.next_start) if self.features.visual else None
             inputs, _ = self._inputs(self.current_cls, self.current_tokens, goal,
-                                     self.env.proprio, self.env.privileged)
+                                     self.env.proprio, self.env.privileged, self._memory(goal))
             self.policy.step(inputs, self.memory, self.next_start)
             self.env.step(hover)
             self._observe()
@@ -176,16 +190,20 @@ class Trainer:
                     self.rollout_goals[t].copy_(self.goal_source.step(self.next_start))
                     self.cls[t].copy_(self.current_cls)
                     self.tokens[t].copy_(self.current_tokens)
+                memory = self._memory(self.rollout_goals[t].float() if self.features.visual else None)
+                if memory is not None:
+                    self.memory_ego[t].copy_(memory[0])
+                    self.memory_candidate[t].copy_(memory[1])
                 inputs, _ = self._inputs(self.cls[t] if self.features.visual else None,
                                          self.tokens[t] if self.features.visual else None,
                                          self.rollout_goals[t].float() if self.features.visual else None,
-                                         self.proprio[t], self.privileged[t])
-                mean, memory = self.policy.step(inputs, self.memory, self.next_start)
+                                         self.proprio[t], self.privileged[t], memory)
+                mean, hidden = self.policy.step(inputs, self.memory, self.next_start)
                 raw = mean + log_std.exp() * torch.randn_like(mean)
                 self.actions[t].copy_(raw)
                 self.logprobs[t].copy_(squashed_log_prob(mean, log_std, raw))
                 self.values[t].copy_(self.policy.value(self.privileged[t], self.proprio[t]))
-                self.memory.copy_(memory)
+                self.memory.copy_(hidden)
                 # The simulator receives the squashed command; rollouts keep the pre-squash
                 # sample, whose log-probability includes the tanh Jacobian.
                 torch.tanh(raw, out=self.applied)
@@ -230,10 +248,13 @@ class Trainer:
                     privileged = self.privileged[times, env_ids]
                     length_b, batch = times.shape
                     if self.features.visual:
+                        memory = ((self.memory_ego[times, env_ids].flatten(0, 1),
+                                   self.memory_candidate[times, env_ids].flatten(0, 1))
+                                  if self.spatial is not None else None)
                         inputs, attended = self._inputs(self.cls[times, env_ids].flatten(0, 1),
                                                         self.tokens[times, env_ids].flatten(0, 1),
                                                         self.rollout_goals[times, env_ids].flatten(0, 1).float(),
-                                                        proprio.flatten(0, 1), privileged.flatten(0, 1))
+                                                        proprio.flatten(0, 1), privileged.flatten(0, 1), memory)
                     else:
                         inputs, attended = self._inputs(None, None, None, proprio.flatten(0, 1),
                                                         privileged.flatten(0, 1))
@@ -256,8 +277,10 @@ class Trainer:
                             self.policy.attention.grid_w)
                     else:
                         aux_saliency = aux_accuracy = torch.zeros((), device=self.env.device)
+                    aux_memory = (self.policy.memory_loss(inputs, privileged.flatten(0, 1)) if self.spatial is not None
+                                  else torch.zeros((), device=self.env.device))
                     loss = (policy_loss + cfg.value_coefficient * value_loss - cfg.entropy * entropy
-                            + cfg.aux_coefficient * aux_saliency)
+                            + cfg.aux_coefficient * (aux_saliency + aux_memory))
                     self.optimizer.zero_grad(set_to_none=True)
                     loss.backward()
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.max_grad_norm, foreach=True)
@@ -266,7 +289,7 @@ class Trainer:
                         losses.add_(torch.stack((policy_loss, value_loss, entropy,
                                                  ((ratio - 1) - logratio).mean(),
                                                  ((ratio - 1).abs() > cfg.clip).float().mean(), grad_norm,
-                                                 aux_saliency.detach(), aux_accuracy)))
+                                                 aux_saliency.detach(), aux_accuracy, aux_memory.detach())))
                     batches += 1
             losses.div_(batches)
         return losses
@@ -285,7 +308,7 @@ class Trainer:
     def finish_rollout(self, length, losses):
         """GPU-only end-of-rollout bookkeeping: curriculum update for the next rollout and metrics.
 
-        Returns float32 [RESULT_WIDTH] (34): rollout totals (5), PPO losses (8, see LOSS_NAMES),
+        Returns float32 [RESULT_WIDTH] (35): rollout totals (5), PPO losses (9, see LOSS_NAMES),
         bucket totals (12, row-major [4,3]), weights used this rollout (3), weights for the
         next rollout (3), success EMAs (3).
         """

@@ -36,6 +36,7 @@ from sim_rl.cli import (DEFAULT_LIBRARY, TEST_STYLE, build_policy, load_checkpoi
                         validate_checkpoint)
 from sim_rl.curriculum import UNIFORM_WEIGHTS  # noqa: E402
 from sim_rl.features import checkpoint_features, crop_goals, square_goal_box  # noqa: E402
+from sim_rl.memory import CELL, GRID, SpatialMemory, observe as observe_memory  # noqa: E402
 from sim_rl.model import deterministic_action  # noqa: E402
 from sim_rl.native import CudaEnv  # noqa: E402
 
@@ -43,6 +44,7 @@ PAGE = ROOT / "sim/live"
 PAGES = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
          "/style.css": ("style.css", "text/css; charset=utf-8")}
 TARGET_CLASSES = ("building", "vehicle", "vegetation", "prop")
+MEMORY_IMAGE_EVERY = 6           # control ticks between spatial-memory map images (5 Hz at 30 Hz)
 
 
 def jpeg(image):
@@ -94,11 +96,13 @@ class Pilot:
         self.retarget = None
         with self.env.execution():
             validate_checkpoint(saved, self.env, self.features)
-            self.policy = build_policy(self.env, self.features)
-            self.policy.load_state_dict(saved["model"])
+            self.policy = build_policy(self.env, self.features, saved)
             self.policy.eval()
             self.hidden = torch.zeros((1, self.policy.hidden_size), device=self.device)
             self.starts = torch.ones(1, device=self.device)
+            self.spatial = (SpatialMemory(1, self.env.height // 16, self.env.width // 16, self.env.metadata["camera"],
+                                          self.device) if self.policy.spatial else None)
+            self.memory_image, self.memory_info = b"", None
             self.lanes = torch.tensor(UNIFORM_WEIGHTS + (0.0, args.appearance), device=self.device)
             self.env.write_curriculum(self.lanes)
             self.env.set_free_flight(True)
@@ -179,8 +183,13 @@ class Pilot:
     @torch.no_grad()
     def tick(self):
         cls, tokens = self.features.observe(self.env)
-        inputs, logits = self.policy.actor_inputs_and_features(cls, tokens, self.goal, self.env.proprio,
-                                                               self.env.privileged)
+        if self.paused:
+            # The memory integrates motion, so it only advances while flying.
+            _, logits = self.policy.attention(self.goal, cls, tokens)
+        else:
+            memory = self.remember(cls, tokens) if self.spatial is not None else None
+            inputs, logits = self.policy.actor_inputs_and_features(cls, tokens, self.goal, self.env.proprio,
+                                                                   self.env.privileged, memory)
         probs = logits.softmax(-1)[0]
         frame = jpeg(self.env.obs[0])
         privileged = self.env.privileged[0].cpu().numpy()
@@ -203,6 +212,29 @@ class Pilot:
         if bool(self.env.done[0] > 0.5):
             # Publish the pre-action frame with its own goal before adopting the reset episode.
             self.catalog_goal()
+
+    def remember(self, cls, tokens):
+        """Spatial-memory tick; the map image for the viewer is refreshed every MEMORY_IMAGE_EVERY ticks.
+        Its placement on the overhead map uses the simulator pose at the memory's reset (display only)."""
+        if bool(self.starts[0] > 0.5):
+            d = self.env.diagnostics[0].cpu().numpy()
+            q = d[6:10]
+            forward = -np.array([2 * (q[0] * q[2] + q[3] * q[1]), 1 - 2 * (q[0] ** 2 + q[1] ** 2)])
+            self.memory_info = {"origin": [float(d[0]), float(d[2])],
+                                "forward": (forward / max(np.linalg.norm(forward), 1e-6)).round(5).tolist(),
+                                "cell_m": CELL, "grid": GRID, "revision": 0}
+        memory = observe_memory(self.policy, self.spatial, cls, tokens, self.goal, self.env.proprio, self.starts)
+        if self.frame_id % MEMORY_IMAGE_EVERY == 0:
+            evidence, seen = self.spatial.map[0].clamp(0, 1).cpu().numpy()
+            rgba = np.zeros((GRID, GRID, 4), dtype=np.uint8)
+            rgba[..., :3] = np.where(evidence[..., None] > 0.05, [255, 190, 40], [70, 120, 190])
+            rgba[..., 3] = np.round(np.maximum(evidence * 230, seen * 70)).astype(np.uint8)
+            buffer = io.BytesIO()
+            Image.fromarray(rgba, "RGBA").save(buffer, "PNG")
+            with self.lock:
+                self.memory_image = buffer.getvalue()
+                self.memory_info = {**self.memory_info, "revision": self.frame_id}
+        return memory
 
     def publish(self, frame, privileged, diagnostics, peak, in_view, outcome, action=None):
         p, c, h = diagnostics[0:3], diagnostics[3:6], diagnostics[24:27]
@@ -235,7 +267,7 @@ class Pilot:
                 "action": None if action is None else [round(a, 2) for a in action],
                 "goal": {**self.goal_info, "age_s": round(time.monotonic() - self.goal_started, 1)},
                 "checkpoint": self.checkpoint, "last_outcome": self.last_outcome,
-                "gemma": self.gemma is not None,
+                "gemma": self.gemma is not None, "memory": self.memory_info,
             }
 
     def run(self):
@@ -280,6 +312,10 @@ class Handler(BaseHTTPRequestHandler):
             with pilot.lock:
                 body = pilot.goal_image
             return self.send(200, body, "image/jpeg")
+        if path == "/memory.png":
+            with pilot.lock:
+                body = pilot.memory_image
+            return self.send(200 if body else 404, body or b"no spatial memory\n", "image/png" if body else "text/plain")
         if path == "/stream":
             return self.stream(pilot)
         self.send(404, b"not found\n", "text/plain")

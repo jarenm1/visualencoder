@@ -54,7 +54,8 @@ enum sim_env_field {
     SIM_ENV_FIELD_GOAL_CROPS = 15,
     /* float32 [n, 3]: current/terminal unique tiles, terminal consecutive hold steps; diagnostic only. */
     SIM_ENV_FIELD_EPISODE_DIAGNOSTICS = 16,
-    /* float32 [n, P], P = (H/16)(W/16): mean planar depth (m) per 16x16 patch, 0 if no geometry.
+    /* float32 [n, P], P = (H/16)(W/16): mean planar depth (m) of the patch's object samples (all hits
+     * if it names no object), 0 if no geometry.
      * Training label only, never actor input. */
     SIM_ENV_FIELD_PATCH_DEPTH = 17,
     /* int32 [n, P]: city layout object most of the patch shows, -1 if none. Training label only. */

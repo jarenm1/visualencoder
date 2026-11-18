@@ -150,7 +150,7 @@ pub(crate) struct LabelArgs {
     pub cell_start: *const u32,
     pub cell_objects: *const u32,
     pub cells: u32,
-    /// n x P mean planar depth of the patch's hit samples (0: no geometry).
+    /// n x P mean planar depth of the patch object's samples (all hits if none; 0: no geometry).
     pub patch_depth: *mut f32,
     /// n x P layout object index hit by most samples (-1: none or too few).
     pub patch_object: *mut i32,
@@ -1103,8 +1103,9 @@ pub(crate) mod device {
     }
 
     /// Per-patch labels of the current observation, one thread per (env, patch): LABEL_SIDE^2
-    /// samples through the same lens mapping as the image (without blur) give the mean planar
-    /// depth of the hits and the layout object most samples land on. Training labels only.
+    /// samples through the same lens mapping as the image (without blur) give the layout object
+    /// most samples land on and the mean planar depth of that object's samples (of all hits when
+    /// the patch names no object). Training labels only.
     #[kernel]
     pub unsafe fn patch_labels(buffers: Buffers, config: Config, args: ImageArgs, labels: LabelArgs) {
         let index = thread::index_1d().get();
@@ -1126,6 +1127,7 @@ pub(crate) mod device {
         let plane = (args.width * args.height) as usize;
         let step = PATCH / LABEL_SIDE;
         let mut ids = [u32::MAX; (LABEL_SIDE * LABEL_SIDE) as usize];
+        let mut depths = [0.0f32; (LABEL_SIDE * LABEL_SIDE) as usize];
         let mut depth_sum = 0.0f32;
         let mut hits = 0u32;
         let mut sample = 0u32;
@@ -1144,6 +1146,7 @@ pub(crate) mod device {
                 // Planar depth along `forward`: the unnormalized ray has unit forward component.
                 let hit = add(eye, scale(add(forward, add(scale(right, nx), scale(up, ny))), depth));
                 ids[sample as usize] = unsafe { object_at(labels, config, hit) };
+                depths[sample as usize] = depth;
                 depth_sum += depth;
                 hits += 1;
             }
@@ -1167,9 +1170,19 @@ pub(crate) mod device {
             }
             a += 1;
         }
+        // A patch that names an object takes the depth of that object's samples only: averaging in
+        // the background behind an edge would place the object metres too far away.
+        let named = best_count >= LABEL_MIN_HITS;
+        let mut object_depth = 0.0f32;
+        let mut c = 0usize;
+        while c < ids.len() {
+            if named && ids[c] == best { object_depth += depths[c]; }
+            c += 1;
+        }
         unsafe {
-            *labels.patch_depth.add(index) = if hits > 0 { depth_sum / hits as f32 } else { 0.0 };
-            *labels.patch_object.add(index) = if best_count >= LABEL_MIN_HITS { best as i32 } else { -1 };
+            *labels.patch_depth.add(index) = if named { object_depth / best_count as f32 }
+                else if hits > 0 { depth_sum / hits as f32 } else { 0.0 };
+            *labels.patch_object.add(index) = if named { best as i32 } else { -1 };
         }
     }
 

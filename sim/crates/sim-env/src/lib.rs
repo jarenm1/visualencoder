@@ -659,7 +659,7 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, district: &drone::D
     });
     if let Some(fields) = json["fields"].as_array_mut() {
         fields.push(serde_json::json!({"index": 17, "name": "patch_depth", "dtype": "float32", "shape": ["n", "P"],
-            "layout": "training label, never actor input: mean planar depth (m) of the patch's hit samples, 0 if none"}));
+            "layout": "training label, never actor input: mean planar depth (m) of the samples on the patch's object (of all hits if it names none), 0 if no geometry"}));
         fields.push(serde_json::json!({"index": 18, "name": "patch_object", "dtype": "int32", "shape": ["n", "P"],
             "layout": "training label, never actor input: layout object index hit by most samples, -1 if none"}));
     }

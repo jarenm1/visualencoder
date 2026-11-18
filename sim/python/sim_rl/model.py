@@ -8,7 +8,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .memory import CANDIDATE_WIDTH, CHANNELS
 from .native import PRIVILEGED_WIDTH, PROPRIO_WIDTH
+from .perception import PatchHeads
 
 LOG_TWO_PI = math.log(2 * math.pi)
 MODES = ("visual", "state", "hint")
@@ -20,6 +22,7 @@ HIDDEN = 256
 INITIAL_LOG_STD = -0.5
 # expected NDC (2), peak patch logit (1), P(in view) (1), pooled value, global projection
 VISUAL_WIDTH = 2 + 1 + 1 + VALUE + GLOBAL   # 196
+MEMORY_FEATURES = 64            # encoded spatial-memory crop (plus the candidate lanes)
 # Privileged lanes used by the auxiliary localization target: anchor visibility, anchor NDC,
 # and the target box's screen bounds [x_min, y_min, x_max, y_max] (NDC, y up).
 VISIBLE_LANE, NDC_LANES, BOX_LANES = 14, slice(18, 20), slice(25, 29)
@@ -164,6 +167,20 @@ def saliency_loss(logits, privileged, grid_h, grid_w):
     return loss, accuracy
 
 
+class MemoryEncoder(nn.Module):
+    """Ego-centric spatial-memory crop [B, C, 32, 32] + strongest candidate [B, 4] -> [B, 64 + 4]."""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.conv = nn.Sequential(nn.Conv2d(channels, 16, 3, stride=2, padding=1), nn.GELU(),
+                                  nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.GELU(),
+                                  nn.Conv2d(32, 32, 3, stride=2, padding=1), nn.GELU())
+        self.projection = _orthogonal(nn.Linear(32 * 4 * 4, MEMORY_FEATURES), math.sqrt(2))
+
+    def forward(self, ego, candidate):
+        return torch.cat((torch.tanh(self.projection(self.conv(ego.float()).flatten(1))), candidate), dim=-1)
+
+
 class ActorCritic(nn.Module):
     """Tanh-squashed Gaussian actor (GRU) over one of three information modes, plus a privileged critic.
 
@@ -171,16 +188,21 @@ class ActorCritic(nn.Module):
     clipping. (Clipping an unbounded mean removed the gradient once the mean left the box, which
     left the v4 policy pinned at full yaw rate.)
 
-    visual: target saliency over frozen tokens + proprioception (+ saliency auxiliary loss).
+    visual: target saliency over frozen tokens + proprioception (+ saliency auxiliary loss);
+            with ``memory``, also the spatial-memory crop (memory.py), built from frozen per-patch
+            depth heads (``perception``) and the saliency, with an auxiliary loss that decodes the
+            target's body-frame offset from the memory features.
     state:  privileged + proprioception (no vision).
     hint:   proprioception only.
     The critic always sees privileged + proprioception (asymmetric training).
     """
 
-    def __init__(self, mode, token_dim, goal_dim, grid_h, grid_w, action_dim=4, goal="global"):
+    def __init__(self, mode, token_dim, goal_dim, grid_h, grid_w, action_dim=4, goal="global", memory=False):
         super().__init__()
         if mode not in MODES:
             raise ValueError(f"unknown policy mode {mode}")
+        if memory and mode != "visual":
+            raise ValueError("spatial memory needs a visual policy")
         self.mode, self.action_dim, self.hidden_size = mode, action_dim, HIDDEN
         if mode != "visual":
             self.attention = None
@@ -188,8 +210,14 @@ class ActorCritic(nn.Module):
             self.attention = PatchMatchSaliency(token_dim, grid_h, grid_w)
         else:
             self.attention = TargetSaliency(token_dim, goal_dim, grid_h, grid_w)
-        width = {"visual": VISUAL_WIDTH + PROPRIO_WIDTH, "state": PRIVILEGED_WIDTH + PROPRIO_WIDTH,
-                 "hint": PROPRIO_WIDTH}[mode]
+        self.memory_width = 0
+        if memory:
+            self.perception = PatchHeads(token_dim, grid_h, grid_w).requires_grad_(False)
+            self.memory_encoder = MemoryEncoder(CHANNELS)
+            self.memory_width = MEMORY_FEATURES + CANDIDATE_WIDTH
+            self.memory_probe = nn.Linear(self.memory_width, 3)
+        width = {"visual": VISUAL_WIDTH + self.memory_width + PROPRIO_WIDTH,
+                 "state": PRIVILEGED_WIDTH + PROPRIO_WIDTH, "hint": PROPRIO_WIDTH}[mode]
         self.trunk = nn.Sequential(_orthogonal(nn.Linear(width, HIDDEN), math.sqrt(2)),
                                    nn.LayerNorm(HIDDEN), nn.Tanh())
         self.recurrent = nn.GRUCell(HIDDEN, HIDDEN)
@@ -200,17 +228,30 @@ class ActorCritic(nn.Module):
             _orthogonal(nn.Linear(HIDDEN, HIDDEN), math.sqrt(2)), nn.Tanh(),
             _orthogonal(nn.Linear(HIDDEN, 1), 1.0))
 
-    def actor_inputs(self, cls, tokens, goal, proprio, privileged):
-        return self.actor_inputs_and_features(cls, tokens, goal, proprio, privileged)[0]
+    @property
+    def spatial(self):
+        return self.memory_width > 0
 
-    def actor_inputs_and_features(self, cls, tokens, goal, proprio, privileged):
-        """Returns (actor inputs, saliency logits or None) so training reuses one saliency pass."""
+    def actor_inputs(self, cls, tokens, goal, proprio, privileged, memory=None):
+        return self.actor_inputs_and_features(cls, tokens, goal, proprio, privileged, memory)[0]
+
+    def actor_inputs_and_features(self, cls, tokens, goal, proprio, privileged, memory=None):
+        """Returns (actor inputs, saliency logits or None) so training reuses one saliency pass.
+        ``memory`` is (ego crop, candidate) from memory.observe when the policy has spatial memory."""
         if self.mode == "visual":
             features, logits = self.attention(goal, cls, tokens)
+            if self.spatial:
+                features = torch.cat((features, self.memory_encoder(*memory)), dim=-1)
             return torch.cat((features, proprio), dim=-1), logits
         if self.mode == "state":
             return torch.cat((privileged, proprio), dim=-1), None
         return proprio, None
+
+    def memory_loss(self, inputs, privileged):
+        """Auxiliary: decode the target's body-frame offset (privileged lanes 0-2, /32 m) from the
+        memory features, so the encoder keeps where the goal was seen."""
+        features = inputs[:, VISUAL_WIDTH:VISUAL_WIDTH + self.memory_width]
+        return F.smooth_l1_loss(self.memory_probe(features), privileged[:, 0:3].clamp(-3, 3))
 
     def value(self, privileged, proprio):
         return self.critic(torch.cat((privileged, proprio), dim=-1)).squeeze(-1)

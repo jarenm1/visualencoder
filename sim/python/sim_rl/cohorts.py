@@ -38,8 +38,7 @@ def run(args):
                 for name, saved, transfer in checkpoints:
                     features = features_of[name]
                     validate_checkpoint(saved, env, features, for_task_transfer=transfer)
-                    policy = build_policy(env, features)
-                    policy.load_state_dict(saved['model'])
+                    policy = build_policy(env, features, saved)
                     for cohort, weights in cohorts:
                         cell = {}
                         for mode, no_gps in (('gps', 0.), ('no_gps', 1.)):

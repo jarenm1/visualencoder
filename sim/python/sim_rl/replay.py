@@ -15,6 +15,7 @@ from .cli import (DEFAULT_LIBRARY, ROOT, TEST_SEED, TEST_STYLE, TRAIN_STYLE, VAL
                   VALIDATION_STYLE, build_policy, load_checkpoint, sha256, validate_checkpoint)
 from .curriculum import UNIFORM_WEIGHTS
 from .features import RefreshedGoals, checkpoint_features, crop_goals, square_goal_box
+from .memory import CHANNELS, EGO, EGO_RADIUS, SpatialMemory, observe as observe_memory
 from .model import deterministic_action, saliency_targets
 from .native import DEFAULT_CITY, PRIVILEGED_WIDTH, CudaEnv
 
@@ -37,34 +38,31 @@ OUTCOME_FIELDS = ["reward", "done", "success", "collision", "out_of_bounds"]
 START_LANDED_INDEX = 19
 GPS_AVAILABLE_INDEX = 23
 PCA_SAMPLE = 65536
+CHUNK = 64                       # frames buffered on the GPU before each copy to host memory
 TORQUE_NOTE = "Goal-facing visualization proxy; the task has no rotor/aerodynamic attitude state."
 
 
 @torch.no_grad()
-def encoder_maps(tokens, valid):
-    """tokens bf16 [T,N,P,D] -> uint8 [T,N,h,w,3].
-
-    One shared 3-component PCA basis fit on valid (pre-terminal) frames, scaled by the
-    1st/99th percentile of the valid projections. Patch grid h x w is read from the tokens' P axis.
-    """
-    device = tokens.device
-    generator = torch.Generator(device=device).manual_seed(0)
-    # Sample whole frames before gathering: materialising every valid frame's tokens
-    # in float32 needs several GiB for a 32-env, 450-step recording.
-    frames = valid.nonzero()
-    keep = max(1, PCA_SAMPLE // tokens.shape[2])
-    if frames.shape[0] > keep:
-        frames = frames[torch.randperm(frames.shape[0], device=device, generator=generator)[:keep]]
-    rows = tokens[frames[:, 0], frames[:, 1]].reshape(-1, tokens.shape[-1]).float()
+def pca_basis(tokens):
+    """3-component PCA basis (mean [D], axes [D, 3]) of one frame batch's patch tokens [N, P, D]."""
+    rows = tokens.reshape(-1, tokens.shape[-1]).float()
+    if rows.shape[0] > PCA_SAMPLE:
+        rows = rows[torch.randperm(rows.shape[0], device=rows.device,
+                                   generator=torch.Generator(device=rows.device).manual_seed(0))[:PCA_SAMPLE]]
     mean = rows.mean(0)
     _, _, principal = torch.linalg.svd(rows - mean, full_matrices=False)
-    axes = principal[:3].T
-    projected = torch.stack([(tokens[t].float() - mean) @ axes for t in range(tokens.shape[0])])
-    sample = projected[valid]
+    return mean, principal[:3].T
+
+
+@torch.no_grad()
+def encoder_maps(projected, valid):
+    """PCA projections [T, N, P, 3] -> uint8 maps, scaled by the 1st/99th percentile of valid frames."""
+    generator = torch.Generator(device=projected.device).manual_seed(0)
+    sample = projected[valid].reshape(-1, 3).float()
     if sample.shape[0] > PCA_SAMPLE:
-        sample = sample[torch.randperm(sample.shape[0], device=device, generator=generator)[:PCA_SAMPLE]]
+        sample = sample[torch.randperm(sample.shape[0], device=sample.device, generator=generator)[:PCA_SAMPLE]]
     low, high = torch.quantile(sample, 0.01, dim=0), torch.quantile(sample, 0.99, dim=0)
-    scaled = ((projected - low) / (high - low).clamp_min(1e-6)).clamp(0, 1)
+    scaled = ((projected.float() - low) / (high - low).clamp_min(1e-6)).clamp(0, 1)
     return (scaled * 255).round().to(torch.uint8)
 
 
@@ -113,11 +111,14 @@ def ground_goals(env, features, grounded):
 
 @torch.no_grad()
 def capture(args, saved, features, seed, style, no_gps_fraction, appearance, grounded=None):
-    """Roll out the deterministic policy (tanh of the mean) over the full horizon.
+    """Roll out the deterministic policy (tanh of the mean) until every environment's first episode
+    has ended (at most the horizon).
 
     Buckets are uniform; episodes run without GPS with probability ``no_gps_fraction`` and
     goal crops are rendered at ``appearance`` strength. With ``grounded`` (gemma_goal.py
-    boxes.json), envs with a box use the start-frame crop at that box as their goal.
+    boxes.json), envs with a box use the start-frame crop at that box as their goal. Frames move
+    to host memory every CHUNK steps; encoder maps are projected onto a PCA basis fit on the first
+    frame, and spatial-memory policies also record their ego-centric memory crop.
     """
     metadata = saved["metadata"]
     n = args.num_envs
@@ -125,8 +126,7 @@ def capture(args, saved, features, seed, style, no_gps_fraction, appearance, gro
                  metadata["control_mode"], args.city) as env:
         with env.execution():
             validate_checkpoint(saved, env, features)
-            policy = build_policy(env, features)
-            policy.load_state_dict(saved["model"])
+            policy = build_policy(env, features, saved)
             policy.eval()
             device, horizon = env.device, env.horizon
             h, w = env.height, env.width
@@ -147,31 +147,44 @@ def capture(args, saved, features, seed, style, no_gps_fraction, appearance, gro
             index = torch.tensor(STATE_INDEX, device=device)
             outcome_width = len(OUTCOME_FIELDS)
             action_width = env.action_dim
-            images = torch.empty((horizon, n, h, w, 3), dtype=torch.uint8, device=device)
+            images = torch.empty((horizon, n, h, w, 3), dtype=torch.uint8)  # host memory
+            chunk = torch.empty((CHUNK, n, h, w, 3), dtype=torch.uint8, device=device)
             states = torch.empty((horizon, n, len(STATE_INDEX) + len(LABEL_INDEX)), device=device)
             label_index = torch.tensor(LABEL_INDEX, device=device)
             transitions = torch.empty((horizon, n, action_width + outcome_width), device=device)
             ended = torch.empty((horizon, n), device=device)
-            tokens = (torch.empty((horizon, n, patch_h * patch_w, features.dim), dtype=torch.bfloat16, device=device)
-                      if features.visual else None)
+            projected = (torch.empty((horizon, n, patch_h * patch_w, 3), dtype=torch.float16, device=device)
+                         if features.visual else None)
             # Policy target saliency: softmax over P patches + "not in view".
             saliency = (torch.empty((horizon, n, patch_h * patch_w + 1), dtype=torch.float16, device=device)
                         if features.visual else None)
+            spatial = (SpatialMemory(n, patch_h, patch_w, env.metadata["camera"], device) if policy.spatial else None)
+            memory_maps = (torch.empty((horizon, n, CHANNELS, EGO, EGO), dtype=torch.uint8, device=device)
+                           if spatial is not None else None)
             starts = torch.ones(n, device=device)
+            finished = torch.zeros(n, dtype=torch.bool, device=device)
             hidden = torch.zeros((n, policy.hidden_size), device=device)
+            basis = None
             for t in range(horizon):
-                images[t].copy_((env.obs.clamp(0, 1) * 255).round().to(torch.uint8).permute(0, 2, 3, 1))
+                chunk[t % CHUNK].copy_((env.obs.clamp(0, 1) * 255).round().to(torch.uint8).permute(0, 2, 3, 1))
                 states[t, :, :len(STATE_INDEX)].copy_(env.diagnostics.index_select(1, index))
                 states[t, :, len(STATE_INDEX):].copy_(env.privileged.index_select(1, label_index))
                 if features.visual:
                     cls, patch_tokens = features.observe(env)
-                    tokens[t].copy_(patch_tokens)
+                    if basis is None:
+                        basis = pca_basis(patch_tokens)
+                    projected[t].copy_((patch_tokens.float() - basis[0]) @ basis[1])
                     goal = goal_source.step(starts)
                     if grounded is not None:
                         goal = torch.where(has_box[:, None], grounded_goals, goal)
                 else:
                     cls, patch_tokens, goal = None, None, None
-                inputs, logits = policy.actor_inputs_and_features(cls, patch_tokens, goal, env.proprio, env.privileged)
+                memory = (observe_memory(policy, spatial, cls, patch_tokens, goal, env.proprio, starts)
+                          if spatial is not None else None)
+                if memory is not None:
+                    memory_maps[t].copy_((memory[0].clamp(0, 1) * 255).round().to(torch.uint8))
+                inputs, logits = policy.actor_inputs_and_features(cls, patch_tokens, goal, env.proprio,
+                                                                  env.privileged, memory)
                 if saliency is not None:
                     saliency[t].copy_(logits.softmax(-1))
                 mean, hidden = policy.step(inputs, hidden, starts)
@@ -185,17 +198,26 @@ def capture(args, saved, features, seed, style, no_gps_fraction, appearance, gro
                 transitions[t, :, 8].copy_(env.out_of_bounds)
                 ended[t].copy_(env.ended_bucket)
                 starts.copy_(env.done)
+                finished |= env.done.bool()
+                if (t + 1) % CHUNK == 0 or t + 1 == horizon:
+                    first = t - t % CHUNK
+                    images[first:t + 1].copy_(chunk[:t + 1 - first])  # Export boundary: one copy per chunk.
+                    if bool(finished.all()):
+                        break
+            length = t + 1
+            states, transitions, ended = states[:length], transitions[:length], ended[:length]
             done = transitions[:, :, 5]
             # Frame t is pre-terminal when no episode ended strictly before it.
             valid = (torch.cumsum(done, 0) - done) == 0
-            maps = encoder_maps(tokens, valid).cpu() if features.visual else None
+            maps = encoder_maps(projected[:length], valid).cpu() if features.visual else None
             env.stream.synchronize()  # Explicit export boundary: one readback of the recording.
-            return {"images": images.cpu().numpy(), "states": states.cpu().numpy(),
+            return {"images": images[:length].numpy(), "states": states.cpu().numpy(),
                     "transitions": transitions.cpu().numpy(), "ended": ended.cpu().numpy(),
                     "start_landed": start_landed.cpu().numpy(), "gps_available": gps_available.cpu().numpy(),
                     "goal_images": goal_images.cpu().numpy(),
                     "maps": None if maps is None else maps.numpy(),
-                    "saliency": None if saliency is None else saliency.float().cpu().numpy(),
+                    "saliency": None if saliency is None else saliency[:length].float().cpu().numpy(),
+                    "memory": None if memory_maps is None else memory_maps[:length].cpu().numpy(),
                     "grid": (patch_h, patch_w),
                     "native": {"control_hz": env.control_hz, "control_mode": env.control_mode,
                                "goal_refresh_steps": refresh_steps,
@@ -334,6 +356,10 @@ def record(args):
             saliency_path = args.out / f"{basename}.saliency"
             np.round(np.clip(packed, 0, 1) * 255).astype(np.uint8).tofile(saliency_path)
             entry["saliency"] = saliency_path.name
+        if recording["memory"] is not None:
+            memory_path = args.out / f"{basename}.memory"
+            np.ascontiguousarray(recording["memory"][:length, index]).tofile(memory_path)
+            entry["memory_map"] = memory_path.name
         environments.append(entry)
     if not environments:
         raise RuntimeError("no recorded episode matches the --target-class filter or has a grounded goal box")
@@ -352,8 +378,12 @@ def record(args):
         "views": {"first_person": [0, 0, width, height], "third_person": [width, 0, width, height]},
         "encoder_map": None if recording["maps"] is None else {
             "width": width // 16, "height": height // 16, "channels": 3, "dtype": "uint8",
-            "method": "Unpooled patch tokens of the frozen encoder, same pass the policy consumed; shared "
-                      "3-component PCA over all pre-terminal frames, 1st/99th percentile scaled."},
+            "method": "Unpooled patch tokens of the frozen encoder, same pass the policy consumed; "
+                      "3-component PCA basis fit on the first frame, 1st/99th percentile of pre-terminal frames."},
+        "memory_map": None if recording["memory"] is None else {
+            "width": EGO, "height": EGO, "channels": CHANNELS, "dtype": "uint8", "radius_m": EGO_RADIUS,
+            "layout": "per frame: channel-major [goal evidence, looked-at] x rows x columns, 0-255",
+            "method": "the policy's spatial-memory input: top-down, heading-aligned (forward up), drone at the centre"},
         "saliency": None if recording["saliency"] is None else {
             "width": width // 16, "height": height // 16, "dtype": "uint8",
             "layout": "per frame: width*height patch probabilities conditional on in-view (row-major, scaled "

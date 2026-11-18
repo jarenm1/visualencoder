@@ -31,6 +31,7 @@ UI_FILES = {
 VIDEO_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.mp4\Z")
 MAP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.encoder\Z")
 SALIENCY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.saliency\Z")
+MEMORY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.memory\Z")
 GOAL_FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*-goal\.png\Z")
 BYTE_RANGE = re.compile(r"bytes=(\d*)-(\d*)\Z")
 RECORDING_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
@@ -58,6 +59,8 @@ def recording(data):
         kinds.append(("encoder_map", MAP_NAME, "application/octet-stream"))
     if manifest.get("saliency") is not None:
         kinds.append(("saliency", SALIENCY_NAME, "application/octet-stream"))
+    if manifest.get("memory_map") is not None:
+        kinds.append(("memory_map", MEMORY_NAME, "application/octet-stream"))
     for environment in environments:
         for key, pattern, content_type in kinds:
             file_name = environment.get(key)

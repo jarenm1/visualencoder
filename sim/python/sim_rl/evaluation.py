@@ -5,6 +5,7 @@ import torch
 
 from .curriculum import BUCKETS, UNIFORM_WEIGHTS
 from .features import RefreshedGoals
+from .memory import SpatialMemory, observe as observe_memory
 from .model import deterministic_action
 from .native import HOVER_ACTIONS
 from .ppo import gpu_range
@@ -96,6 +97,8 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
     starts = torch.ones(n, device=device)
     actions = torch.empty((n, env.action_dim), device=device)
     hidden = torch.zeros((n, policy.hidden_size), device=device) if policy is not None else None
+    spatial = (SpatialMemory(n, env.height // 16, env.width // 16, env.metadata["camera"], device)
+               if policy is not None and policy.spatial else None)
     hover = torch.tensor(HOVER_ACTIONS[env.control_mode], device=device).expand(n, -1)
     generator = torch.Generator(device=device).manual_seed(seed)
     if policy is not None:
@@ -107,7 +110,9 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
             if policy is not None:
                 cls, tokens = features.observe(env) if features.visual else (None, None)
                 goal = goal_source.step(starts) if goal_source is not None else None
-                inputs, _ = policy.actor_inputs_and_features(cls, tokens, goal, env.proprio, env.privileged)
+                memory = (observe_memory(policy, spatial, cls, tokens, goal, env.proprio, starts)
+                          if spatial is not None else None)
+                inputs, _ = policy.actor_inputs_and_features(cls, tokens, goal, env.proprio, env.privileged, memory)
                 mean, hidden = policy.step(inputs, hidden, starts)
                 actions.copy_(deterministic_action(mean))
             elif heuristic == "hover":

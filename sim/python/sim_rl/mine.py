@@ -63,8 +63,7 @@ def mine_split(args, saved, features, split):
     with CudaEnv(args.library, args.num_envs, seed, metadata["width"], metadata["height"], style,
                  metadata["control_mode"], args.city) as env, env.execution():
         validate_checkpoint(saved, env, features, for_task_transfer=args.allow_task_transfer)
-        policy = build_policy(env, features)
-        policy.load_state_dict(saved["model"])
+        policy = build_policy(env, features, saved)
         policy.eval()
         grid_h, grid_w = env.height // 16, env.width // 16
         env.write_curriculum(torch.tensor(UNIFORM_WEIGHTS + (0.0, args.appearance), device=env.device))

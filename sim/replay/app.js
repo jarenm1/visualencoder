@@ -17,6 +17,7 @@ const mapCanvas = document.createElement("canvas");
 const mapContext = mapCanvas.getContext("2d");
 let encoderMap = null;
 let saliencyMap = null;
+let memoryMap = null;
 let manifest = null;
 let selected = -1;
 let mode = "split";
@@ -37,12 +38,14 @@ function panels() {
   const first = manifest.views.first_person;
   const third = manifest.views.third_person;
   const encoder = { encoder: true, width: first[2], height: first[3] };
+  const memory = { memory: true, width: first[3], height: first[3] };
   const video = (rect, overlay = false) => ({ rect, overlay, width: rect[2], height: rect[3] });
   if (mode === "first") return [video(first)];
   if (mode === "third") return [video(third)];
   if (mode === "encoder") return [encoder];
   const overlay = Boolean(manifest.saliency);
-  return manifest.encoder_map ? [video(first, overlay), encoder, video(third)] : [video(first, overlay), video(third)];
+  return [video(first, overlay), ...(manifest.encoder_map ? [encoder] : []),
+    ...(manifest.memory_map ? [memory] : []), video(third)];
 }
 
 function resize() {
@@ -120,13 +123,68 @@ function drawSaliency(frame, x, width, height) {
   }
 }
 
+// The policy's spatial memory: top-down, forward up, drone at the centre (white triangle).
+// Warm = goal evidence, dim blue = looked at, black = never seen. The white ring is the TRUE
+// target position (replay-only ground truth, never a policy input).
+function drawMemory(frame, x, width, height) {
+  const { width: columns, height: rows, radius_m: radius } = manifest.memory_map;
+  const plane = columns * rows;
+  const base = frame * 2 * plane;
+  mapCanvas.width = columns;
+  mapCanvas.height = rows;
+  const pixels = mapContext.createImageData(columns, rows);
+  for (let cell = 0; cell < plane; cell += 1) {
+    const evidence = memoryMap[base + cell] / 255;
+    const seen = memoryMap[base + plane + cell] / 255;
+    pixels.data[cell * 4] = Math.round(30 * seen + 225 * evidence);
+    pixels.data[cell * 4 + 1] = Math.round(45 * seen + 170 * evidence);
+    pixels.data[cell * 4 + 2] = Math.round(70 * seen * (1 - evidence));
+    pixels.data[cell * 4 + 3] = 255;
+  }
+  mapContext.putImageData(pixels, 0, 0);
+  context.imageSmoothingEnabled = false;
+  context.drawImage(mapCanvas, 0, 0, columns, rows, x, 0, width, height);
+  context.imageSmoothingEnabled = true;
+  const cx = x + width / 2;
+  const cy = height / 2;
+  context.fillStyle = "rgba(255,255,255,0.95)";
+  context.beginPath();
+  context.moveTo(cx, cy - 7);
+  context.lineTo(cx - 5, cy + 5);
+  context.lineTo(cx + 5, cy + 5);
+  context.fill();
+  const state = environment().states[frame];
+  const field = (name) => state[manifest.state_fields.indexOf(name)];
+  const [qx, qy, qz, qw] = ["quat_x", "quat_y", "quat_z", "quat_w"].map(field);
+  let fx = -2 * (qx * qz + qw * qy);
+  let fz = -(1 - 2 * (qx * qx + qy * qy));
+  const norm = Math.hypot(fx, fz) || 1;
+  fx /= norm;
+  fz /= norm;
+  const dx = field("target_x") - field("world_x");
+  const dz = field("target_z") - field("world_z");
+  const forward = dx * fx + dz * fz;
+  const right = -dx * fz + dz * fx;
+  const scale = width / 2 / radius;
+  context.strokeStyle = "rgba(255,255,255,0.9)";
+  context.lineWidth = 1.5;
+  context.beginPath();
+  context.arc(cx + right * scale, cy - forward * scale, 6, 0, 2 * Math.PI);
+  context.stroke();
+  context.fillStyle = "rgba(255,255,255,0.75)";
+  context.font = "11px sans-serif";
+  context.fillText(`memory ±${radius} m`, x + 6, height - 8);
+}
+
 function present(source, time) {
   if (source !== video || source.seeking || source.readyState < 2 || pendingTarget !== null || failed
-    || (manifest.encoder_map && !encoderMap) || (manifest.saliency && !saliencyMap)) return;
+    || (manifest.encoder_map && !encoderMap) || (manifest.saliency && !saliencyMap)
+    || (manifest.memory_map && !memoryMap)) return;
   const frame = frameAt(time);
   let x = 0;
   for (const panel of panels()) {
     if (panel.encoder) drawEncoder(frame, x, panel.width, panel.height);
+    else if (panel.memory) drawMemory(frame, x, panel.width, panel.height);
     else context.drawImage(source, ...panel.rect, x, 0, panel.width, panel.height);
     if (panel.overlay) drawSaliency(frame, x, panel.width, panel.height);
     x += panel.width;
@@ -187,6 +245,7 @@ function chooseEnvironment(index) {
   sourceReady = false;
   encoderMap = null;
   saliencyMap = null;
+  memoryMap = null;
   displayedTime = 0;
   setControls(false);
   busy(true);
@@ -212,7 +271,7 @@ function chooseEnvironment(index) {
   let metadataReady = false;
   const ready = () => {
     if (!current() || !metadataReady || (manifest.encoder_map && !encoderMap)
-      || (manifest.saliency && !saliencyMap) || failed) return;
+      || (manifest.saliency && !saliencyMap) || (manifest.memory_map && !memoryMap) || failed) return;
     sourceReady = true;
     setControls(true);
     present(source, source.currentTime);
@@ -236,6 +295,10 @@ function chooseEnvironment(index) {
   if (manifest.saliency) {
     const { width, height } = manifest.saliency;
     load(env.saliency, env.frame_count * (width * height + 1), (data) => { saliencyMap = data; });
+  }
+  if (manifest.memory_map) {
+    const { width, height, channels } = manifest.memory_map;
+    load(env.memory_map, env.frame_count * channels * width * height, (data) => { memoryMap = data; });
   }
   source.addEventListener("loadedmetadata", () => {
     if (!current()) return;
@@ -307,12 +370,15 @@ function validateManifest(data) {
   }
   demand(data.encoder_map == null || (Number.isInteger(data.encoder_map.width) && data.encoder_map.width > 0
     && Number.isInteger(data.encoder_map.height) && data.encoder_map.height > 0), "Invalid encoder map layout");
+  demand(data.memory_map == null || (Number.isInteger(data.memory_map.width) && Number.isInteger(data.memory_map.height)
+    && data.memory_map.channels === 2 && data.memory_map.radius_m > 0), "Invalid memory map layout");
   demand(Array.isArray(data.environments) && data.environments.length > 0, "Recording has no environments");
   for (const env of data.environments) {
     demand(Number.isInteger(env.frame_count) && env.frame_count > 0, `Invalid frame count for environment ${env.id}`);
     demand(Math.abs(env.duration_seconds - env.frame_count / data.control_hz) < 0.0001, `Invalid duration for environment ${env.id}`);
     demand(typeof env.video === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]*\.mp4$/.test(env.video), "Unsafe recording video filename");
     demand(data.encoder_map == null || (typeof env.encoder_map === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]*\.encoder$/.test(env.encoder_map)), "Unsafe encoder map filename");
+    demand(data.memory_map == null || (typeof env.memory_map === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]*\.memory$/.test(env.memory_map)), "Unsafe memory map filename");
     demand(typeof env.goal === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]*-goal\.png$/.test(env.goal), "Unsafe goal image filename");
   }
   return data;

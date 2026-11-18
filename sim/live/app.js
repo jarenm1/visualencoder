@@ -74,6 +74,27 @@ function drawOverlay() {
 }
 
 const MAP_SPAN = 160;   // metres shown around the drone
+const memoryImage = new Image();
+let memoryRevision = null;
+
+// The policy's spatial memory (top-down, in the frame where it last reset): amber = goal evidence,
+// blue = looked at. Placed with the simulator pose at that reset, so drift in the drone's own
+// dead reckoning shows as misalignment with the city.
+function drawMemory(px, pz, s) {
+  const memory = state.memory;
+  if (!memory || !memoryImage.complete || memoryImage.naturalWidth === 0) return;
+  const [fx, fz] = memory.forward;
+  const [ox, oz] = memory.origin;
+  const k = s * memory.cell_m;
+  const half = memory.grid / 2;
+  // Image column = memory forward axis, row = memory left axis; world left of forward is (fz, -fx).
+  mapCtx.save();
+  mapCtx.setTransform(k * fx, k * fz, k * fz, -k * fx,
+                      px(ox) - k * half * (fx + fz), pz(oz) - k * half * (fz - fx));
+  mapCtx.imageSmoothingEnabled = false;
+  mapCtx.drawImage(memoryImage, 0, 0);
+  mapCtx.restore();
+}
 
 function drawMap() {
   if (!layout || !state) return;
@@ -93,6 +114,7 @@ function drawMap() {
     mapCtx.fillStyle = CLASS_COLOURS[cls] ?? "#444";
     mapCtx.fillRect(px(ox - hx), pz(oz - hz), 2 * hx * s, 2 * hz * s);
   }
+  drawMemory(px, pz, s);
   const t = state.target;
   mapCtx.strokeStyle = "#e6e6e6";
   mapCtx.lineWidth = 1.5;
@@ -136,6 +158,10 @@ async function poll() {
       goalRevision = goal.revision;
       $("goal").src = `/goal.jpg?${goalRevision}`;
     }
+    if (state.memory && state.memory.revision !== memoryRevision) {
+      memoryRevision = state.memory.revision;
+      memoryImage.src = `/memory.png?${memoryRevision}`;
+    }
     $("goal").title = goal.source || "";
     const target = state.target, prediction = state.saliency;
     const match = goal.match_iou == null ? "catalog reference" : `box match IoU ${goal.match_iou.toFixed(2)}`;
@@ -156,7 +182,8 @@ async function poll() {
     const checkpoint = state.checkpoint;
     $("checkpoint-detail").textContent = `${(checkpoint.steps / 1e6).toFixed(2)}M checkpoint · ` +
       `fixed live goal (no automatic refresh) · ${checkpoint.path}`;
-    $("checkpoint-detail").textContent += " · training success = final 3 s within 6 m, ≤1 m/s, facing";
+    $("checkpoint-detail").textContent += " · training success = first 3 s hold within 6 m, ≤1 m/s, facing" +
+      (state.memory ? " · map: amber = goal evidence, blue = looked at (spatial memory)" : "");
     drawMap();
   } catch (_) { /* server restarting */ }
   setTimeout(poll, 100);

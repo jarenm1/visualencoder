@@ -31,6 +31,7 @@ class LiveDiagnosticsTest(unittest.TestCase):
                              8: {'asset': 'house', 'object_index': 8}}
         pilot.checkpoint = {'steps': 3006464, 'live_goal_refresh': False}
         pilot.gemma = None
+        pilot.spatial, pilot.memory_image, pilot.memory_info = None, b"", None
         return pilot
 
     def test_patch_agreement_uses_y_up_and_requires_comparable_ground_truth(self):

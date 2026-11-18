@@ -15,6 +15,7 @@ from .evaluation import evaluate, heuristics_for
 from .features import ARMS, GOALS, PRECISIONS, FrozenFeatures, checkpoint_features
 from .model import ActorCritic
 from .native import ABI_VERSION, CONTROL_MODES, DEFAULT_CITY, HOVER_ACTIONS, TASK, CudaEnv
+from .perception import load_heads
 from .ppo import BUCKET_WIDTH, LOSS_NAMES, LOSS_WIDTH, RESULT_WIDTH, ROLLOUT_WIDTH, Config, Trainer
 from .probe import collect_frames, protocol_of, run_encoder, write_markdown
 from .profiling import capture, verify_trace
@@ -65,10 +66,18 @@ def mode_of(features):
     return "visual" if features.visual else features.spec
 
 
-def build_policy(env, features):
-    """Visual arms attend over the frozen patch grid; the grid is height//16 x width//16."""
-    return ActorCritic(mode_of(features), features.dim, features.goal_dim,
-                       env.height // 16, env.width // 16, env.action_dim, features.goal).to(env.device)
+def build_policy(env, features, saved=None, memory_heads=None):
+    """Visual arms attend over the frozen patch grid; the grid is height//16 x width//16.
+    ``saved`` loads a checkpoint (its recorded spatial memory included); ``memory_heads`` starts a
+    new spatial-memory policy from frozen perception heads trained on this exact encoder."""
+    memory = memory_heads is not None or bool(saved and saved["metadata"].get("memory"))
+    policy = ActorCritic(mode_of(features), features.dim, features.goal_dim, env.height // 16, env.width // 16,
+                         env.action_dim, features.goal, memory).to(env.device)
+    if memory_heads is not None:
+        policy.perception.load_state_dict(load_heads(memory_heads, features, env.device).state_dict())
+    if saved is not None:
+        policy.load_state_dict(saved["model"])
+    return policy
 
 
 def native_provenance(env, features):
@@ -90,10 +99,16 @@ def provenance(env, features, training):
 
 
 def training_settings(args):
+    from .memory import CELL, EGO, EGO_RADIUS, GRID  # noqa: PLC0415 (keeps the CLI import graph flat)
+    memory = None if args.memory_heads is None else {
+        "heads": str(args.memory_heads), "heads_sha256": sha256(args.memory_heads),
+        "grid": GRID, "cell_m": CELL, "ego": EGO, "ego_radius_m": EGO_RADIUS,
+        "pose": "dead reckoning from noisy gyro and body velocity", "depth": "frozen monocular patch heads"}
     return {"curriculum": args.curriculum, "no_gps_fraction": args.no_gps_fraction,
             "aux_coefficient": args.aux_coefficient, "appearance": args.appearance,
             "goal_refresh_steps": args.goal_refresh_steps,
-            "goal_box_source": "simulator" if args.goal_refresh_steps else None}
+            "goal_box_source": "simulator" if args.goal_refresh_steps else None,
+            "start_distance": args.start_distance, "memory": memory}
 
 
 def checkpoint(policy, metadata, steps):
@@ -153,7 +168,9 @@ def make_config(args):
 
 
 def open_env(args, n, seed, style):
-    return CudaEnv(args.library, n, seed, args.width, args.height, style, args.control, args.city)
+    start = getattr(args, "start_distance", None)
+    return CudaEnv(args.library, n, seed, args.width, args.height, style, args.control, args.city,
+                   start_distance=tuple(start) if start else None)
 
 
 def open_env_checkpoint(args, metadata, seed, style):
@@ -240,7 +257,7 @@ def train_command(args, started):
     with open_env(args, args.num_envs, args.seed, TRAIN_STYLE) as env, \
             open_env(args, args.eval_envs, VALIDATION_SEED, VALIDATION_STYLE) as validation_env:
         with env.execution():
-            policy = build_policy(env, features)
+            policy = build_policy(env, features, memory_heads=args.memory_heads)
             trainer = Trainer(env, features, policy, config)
             trainer.warmup(args.seed)
             metadata = provenance(env, features, training_settings(args))
@@ -259,6 +276,7 @@ def train_command(args, started):
         eval_seconds = time.monotonic() - started_eval
         reserve = max(args.final_reserve_seconds, eval_seconds * 3.8 + 5)
         next_validation = args.validation_every
+        stale = 0
         while trainer.steps < config.total_steps and time.monotonic() < budget_end - reserve:
             with env.execution():
                 length = trainer.collect(config.rollout_steps)
@@ -275,9 +293,15 @@ def train_command(args, started):
                 emit({"validations": validations}, run / "validation.json")
                 print(json.dumps({"validation_steps": trainer.steps, "result": result}), flush=True)
                 if result["selection_success"] > best_success:
-                    best_success = result["selection_success"]
+                    best_success, stale = result["selection_success"], 0
                     torch.save(checkpoint(policy, metadata, trainer.steps), best_path)
+                else:
+                    stale += 1
                 torch.save(checkpoint(policy, metadata, trainer.steps), last_path)
+                if args.patience and stale >= args.patience:
+                    print(json.dumps({"stopped": "validation stalled", "steps": trainer.steps,
+                                      "validations_without_improvement": stale}), flush=True)
+                    break
         curves.close()
         final = validate()
         validations.append({"steps": trainer.steps, "result": final, "final": True})
@@ -290,8 +314,7 @@ def train_command(args, started):
     saved = load_checkpoint(best_path)
     with open_env(args, args.eval_envs, TEST_SEED, TEST_STYLE) as test_env:
         with test_env.execution():
-            policy = build_policy(test_env, features)
-            policy.load_state_dict(saved["model"])
+            policy = build_policy(test_env, features, saved)
             test = gps_modes(test_env, features, policy, TEST_SEED,
                              goal_refresh_steps=config.goal_refresh_steps)
             fixed_goal_test = (gps_modes(test_env, features, policy, TEST_SEED, heuristics=False)
@@ -362,8 +385,7 @@ def eval_command(args, started):
     with open_env_checkpoint(args, metadata, seed, style) as env:
         with env.execution():
             validate_checkpoint(saved, env, features)
-            policy = build_policy(env, features)
-            policy.load_state_dict(saved["model"])
+            policy = build_policy(env, features, saved)
             results = gps_modes(env, features, policy, seed,
                                 goal_refresh_steps=metadata.get("goal_refresh_steps", 0))
     payload = {"checkpoint": str(args.checkpoint), "checkpoint_sha256": sha256(args.checkpoint),
@@ -389,6 +411,11 @@ def post_train_command(args, started):
 def confusion_probe_command(args, started):
     from .posttrain import confusion_probe
     confusion_probe(args)
+
+
+def perception_command(args, started):
+    from .perception import perception_command as run
+    run(args, started)
 
 
 def probe_command(args, started):
@@ -437,7 +464,7 @@ def benchmark_command(args, started):
         config = make_config(args)
         with open_env(args, n, args.seed, TRAIN_STYLE) as env:
             with env.execution():
-                policy = build_policy(env, features)
+                policy = build_policy(env, features, memory_heads=args.memory_heads)
                 trainer = Trainer(env, features, policy, config)
                 trainer.warmup(args.seed)
                 hover = torch.tensor(HOVER_ACTIONS[env.control_mode], device=env.device).expand(n, -1).contiguous()
@@ -459,7 +486,7 @@ def profile_command(args, started):
     config = make_config(args)
     with open_env(args, args.num_envs, args.seed, TRAIN_STYLE) as env:
         with env.execution():
-            policy = build_policy(env, features)
+            policy = build_policy(env, features, memory_heads=args.memory_heads)
             trainer = Trainer(env, features, policy, config)
             trainer.warmup(args.seed)
             result = capture(trainer, args.out, args.iterations)
@@ -473,7 +500,7 @@ def memory_check_command(args, started):
     allocated = []
     with open_env(args, args.num_envs, args.seed, TRAIN_STYLE) as env:
         with env.execution():
-            policy = build_policy(env, features)
+            policy = build_policy(env, features, memory_heads=args.memory_heads)
             trainer = Trainer(env, features, policy, config)
             trainer.warmup(args.seed)
             for _ in range(args.repeats):
@@ -518,6 +545,8 @@ def add_learner(parser):
                         help="goal representation: patch (goal-crop patches matched against frame patches) "
                              "or global (one CLS + mean-patch vector; earlier checkpoints)")
     add_precision(parser)
+    parser.add_argument("--memory-heads", type=Path,
+                        help="perception heads (train.py perception) for this encoder: enables the spatial memory")
     parser.add_argument("--curriculum", choices=CURRICULUM_MODES, default="adaptive")
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--no-gps-fraction", type=float, default=DEFAULTS.no_gps_fraction,
@@ -529,6 +558,9 @@ def add_learner(parser):
     parser.add_argument("--goal-refresh-steps", type=int, default=DEFAULTS.goal_refresh_steps,
                         help="refresh the goal from a visible simulator target box every N control steps "
                              "(0 = fixed reference); no scripted actions")
+    parser.add_argument("--start-distance", type=float, nargs=2, metavar=("MIN", "MAX"),
+                        help="start box-distance range in metres for training, validation and test "
+                             "(default: the native 8-30 m)")
     parser.add_argument("--total-steps", type=int, default=DEFAULTS.total_steps)
     parser.add_argument("--rollout-steps", type=int, default=DEFAULTS.rollout_steps)
     parser.add_argument("--sequence-length", type=int, default=DEFAULTS.sequence_length)
@@ -557,6 +589,8 @@ def parser():
     train.add_argument("--wall-seconds", type=float, default=3600,
                        help="wall budget in seconds; 0 trains to --total-steps without a time cutoff")
     train.add_argument("--final-reserve-seconds", type=float, default=300)
+    train.add_argument("--patience", type=int, default=0,
+                       help="stop after this many validations without a new best (0: never)")
     train.set_defaults(func=train_command)
 
     evaluation = commands.add_parser("eval")
@@ -619,6 +653,22 @@ def parser():
     confusion.add_argument("--seed", type=int, default=0)
     confusion.add_argument("--out", type=Path, required=True)
     confusion.set_defaults(func=confusion_probe_command)
+
+    perception = commands.add_parser("perception", help="per-patch depth and class heads on frozen encoders")
+    add_native(perception)
+    add_precision(perception)
+    perception.add_argument("--encoders", nargs="+", default=["mean"], help=f"arms: {', '.join(ARMS)} or run:<dir>")
+    perception.add_argument("--num-envs", type=int, default=64)
+    perception.add_argument("--train-frames", type=int, default=12288)
+    perception.add_argument("--test-frames", type=int, default=3072)
+    perception.add_argument("--stride", type=int, default=15, help="control steps between kept frames")
+    perception.add_argument("--start-distance", type=float, nargs=2, default=[8.0, 60.0], metavar=("MIN", "MAX"))
+    perception.add_argument("--appearance", type=float, default=1.0)
+    perception.add_argument("--epochs", type=int, default=8)
+    perception.add_argument("--batch-size", type=int, default=64)
+    perception.add_argument("--learning-rate", type=float, default=2e-3)
+    perception.add_argument("--out", type=Path, required=True)
+    perception.set_defaults(func=perception_command)
 
     cohorts = commands.add_parser("eval-cohorts", help="paired fixed-goal hidden and far-target evaluations")
     add_native(cohorts)
