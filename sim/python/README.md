@@ -181,6 +181,21 @@ By family, hits are cars 41/49, buildings and trees 49/81, street props 4/20 (li
 
 
 
+## Patch-goal run (ABI v6)
+
+`runs/drone9-mean-patch-seed0`: `drone8`'s exact settings (fresh seed 0, TensorRT FP16 `mean`, 128 envs, oracle refresh every 30 steps, 2M steps, sustained-hold task, unchanged reward) with one change: `--goal patch`, the patch-matching saliency head. 2,007,040 steps in 1409 s. Validation GPS success at 0.5M / 1M / 1.5M / 2M: 4.3% / 5.5% / 14.5% / 12.5%; `best.pt` = 1.5M.
+
+Paired fixed-goal cohorts (`eval-cohorts`, test seed 20002, 256 episodes per cell, no oracle refresh), success % GPS / no GPS:
+
+| Cohort | `drone9` patch (1.5M) | `drone8` global (1.0M) | `drone6` global, ABI 5 (3.0M) |
+|---|---|---|---|
+| standard | 14.5 / 12.1 | 2.7 / 2.3 | 12.1 / 10.9 |
+| hidden | 2.0 / 0.8 | 0.4 / 0.4 | 2.7 / 0.8 |
+| far | 1.6 / 2.7 | 0.4 / 0.4 | 1.6 / 0.4 |
+| hidden+far | 0 / 0 | 0 / 0 | 0 / 0 |
+
+At the same budget and task the patch goal is a 5× gain over `drone8` on standard episodes (the matched comparison). It matches `drone6`, which trained 3M steps on the easier early-arrival task. Hidden and hidden+far stay near zero: a target out of view at the start is a search-and-memory problem, not a matching one.
+
 ## Sustained-hold experiment (ABI v6)
 
 `runs/drone8-mean-hold-seed0`: fresh seed-0 visual policy, frozen TensorRT FP16 `mean` encoder, 128 envs, oracle goal-box refresh every 30 steps, unchanged flight limits, PPO settings, 8–30 m starts and adaptive curriculum. Completed 2,007,040 steps in 1371 s (22.9 min including initialization, validation and standard test). Validation selected `best.pt` at 1,007,616 steps; `last.pt` retains the full-budget policy.
