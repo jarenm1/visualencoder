@@ -5,9 +5,10 @@ a goal image, gives the agent one instruction and runs until the agent answers, 
 leaves the city, or the time limit passes. Gemma plans (simulated time waits while it thinks); the
 policy flies every step.
 
-  count    "How many cars are in this area? ..." -> the first number in the answer, against the
-           distinct cars actually seen during the flight (labelled object of >= 2 patches in >= 3
-           frames, as count-eval). Also reports the memory's own track count at answer time.
+  count    "How many cars are in this area? ..." -> the number in the answer ("no cars" = 0), against
+           the distinct cars actually seen within the tracker's range during the flight (labelled
+           object of >= 2 patches closer than MAX_RANGE_M in >= 3 frames, as count-eval; cars seen
+           at any range are reported too). Also reports the memory's own track count at answer time.
   find     "Fly to the <name>." naming the episode's target -> success = the native reach-and-hold
            of that target before the time limit.
   explore  "Explore this area." -> ground area the memory marked looked-at after EXPLORE_SECONDS.
@@ -35,7 +36,7 @@ from live import Pilot  # noqa: E402
 from sim_rl.counting import TRUE_PATCHES, VEHICLE  # noqa: E402
 from sim_rl.memory import CELL  # noqa: E402
 from sim_rl.perception import object_classes  # noqa: E402
-from sim_rl.tracks import CONFIRM_HITS  # noqa: E402
+from sim_rl.tracks import CONFIRM_HITS, MAX_RANGE_M  # noqa: E402
 
 EXPLORE_SECONDS = 40.0
 NUMBERS = {word: value for value, word in enumerate(
@@ -47,12 +48,13 @@ INSTRUCTIONS = {
 
 
 def parse_count(text):
-    """First number (digits or a word up to twelve) in ``text``, else None."""
-    match = re.search(r"\b(\d+|" + "|".join(NUMBERS) + r")\b", (text or "").lower())
-    if match is None:
-        return None
-    word = match.group(1)
-    return int(word) if word.isdigit() else NUMBERS[word]
+    """First number (digits or a word up to twelve) in ``text``; 0 for "no cars"-style answers; else None."""
+    text = (text or "").lower()
+    match = re.search(r"\b(\d+|" + "|".join(NUMBERS) + r")\b", text)
+    if match is not None:
+        word = match.group(1)
+        return int(word) if word.isdigit() else NUMBERS[word]
+    return 0 if re.search(r"\bno cars?\b|\bnone\b|(not|n't) (see|seen|found|find) any", text) else None
 
 
 def run_episode(pilot, task, seed, lookup):
@@ -65,14 +67,16 @@ def run_episode(pilot, task, seed, lookup):
     pilot.instruct(instruction)
     # The agent's last plan, at TIME_LIMIT_SECONDS, only accepts an answer; explore stops earlier.
     limit = EXPLORE_SECONDS if task == "explore" else TIME_LIMIT_SECONDS + 1.0
-    seen_frames = torch.zeros(lookup.shape[0], device=pilot.device)
+    seen_frames = torch.zeros((2, lookup.shape[0]), device=pilot.device)   # within MAX_RANGE_M, any range
     agent, outcome, started = pilot.agent, "time limit", time.monotonic()
     while agent.elapsed(pilot.steps) < limit:
         before = pilot.last_outcome
         pilot.tick()
         objects = pilot.env.patch_object[0].long()
         vehicle = (objects >= 0) & (lookup[objects.clamp_min(0)] == VEHICLE)
-        hits = torch.zeros_like(seen_frames).scatter_add_(0, objects.clamp_min(0), vehicle.float())
+        near = vehicle & (pilot.env.patch_depth[0] <= MAX_RANGE_M)
+        hits = torch.zeros_like(seen_frames).scatter_add_(
+            1, objects.clamp_min(0).expand(2, -1), torch.stack((near, vehicle)).float())
         seen_frames.add_((hits >= TRUE_PATCHES).float())
         if pilot.agent is None:   # crash or exit: tick reset the episode
             outcome = pilot.last_outcome if pilot.last_outcome != before else "ended"
@@ -91,7 +95,8 @@ def run_episode(pilot, task, seed, lookup):
            "decisions": [h["action"] for h in agent.history], "wall_s": round(time.monotonic() - started, 1),
            "transcript": agent.transcript}
     if task == "count":
-        row.update(truth=int((seen_frames >= CONFIRM_HITS).sum()), estimate=parse_count(agent.answer),
+        seen = (seen_frames >= CONFIRM_HITS).sum(-1)
+        row.update(truth=int(seen[0]), truth_any_range=int(seen[1]), estimate=parse_count(agent.answer),
                    memory_count=int(pilot.tracks.count()[0]))
     if task == "explore":
         row["seen_m2"] = round(float(pilot.spatial.map[0, 1].sum()) * CELL * CELL)
