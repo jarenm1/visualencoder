@@ -204,7 +204,15 @@ Without the ground prior `mean` reaches 0.214 / 0.70.
 
 **Agent** (`sim/python/agent.py`, live play with `--gemma` and a memory checkpoint): a typed instruction starts a loop in which Gemma sees the camera frame and a text summary of the memory (area looked at, confirmed cars with offsets, goal evidence) and answers `explore`, `go` (a box in the current frame, which becomes the goal crop) or `answer`. It replans every 5 simulated seconds or when a skill ends; simulated time waits while Gemma thinks. Switching goals keeps the map and the car tracks.
 
-**Gemma grounding post-train** (`sim/python/gemma_tune.py`): exploratory-flight frames with per-patch object labels give "Fly to the [nearest] <name>." → box examples and absent names → `[]`; LoRA on the language model's projections; `eval` compares base and tuned hit and false-box rates on held-out districts.
+**Gemma grounding post-train** (`sim/python/gemma_tune.py`): exploratory-flight frames with per-patch object labels give "Fly to the [nearest] <name>." → box examples and absent names → `[]`; QLoRA (rank 16, 4-bit NF4 base) on the language model's projections; `eval` compares base and tuned hit and false-box rates on 400 held-out examples. **Negative so far**: the adapter stops boxing absent objects but also declines half the visible ones, and the share of absent training examples is not the cause.
+
+| Model | Visible hit (IoU ≥ 0.3) | Visible boxed | Absent false box |
+|---|---|---|---|
+| base, 4-bit | 43.5% | 91% | 50.5% |
+| LoRA, 50% absent (`lora`) | 32.5% | 50% | 0% |
+| LoRA, 25% absent (`lora-a25`) | 28.5% | 50% | 0% |
+
+The agent keeps the base model; the patch matcher already vetoes boxes the policy cannot match.
 
 ### Memory policy run (`runs/drone10-v4-memory-seed0`)
 
@@ -231,6 +239,12 @@ Held-out test of `best.pt` (256 episodes per mode, 8–60 m): **16.4% with GPS, 
 | `drone10-nomem` | 12.1% | 10.9% | 4.3% / 3.5% |
 
 Memory adds about 4 points on the refreshed test and about 5 on fixed goal (single seed, 256 episodes per cell; the 95% interval of a 15% rate is about ±4.5 points). The explore command keeps goal success while its own validation coverage grew from 285 to 1,556 observed tiles per episode (1M→8M) and explore-command collisions fell from 42% to 18%. Patience selects on goal success only, so it stopped `drone11` while coverage was still improving.
+
+### Multi-city training
+
+After 2M steps every single-city run kept improving on its training districts while held-out success fell and collisions rose: the policy memorizes one layout. `--train-cities DIR...` trains on `--city` plus more cities built by `scene/build_city.py` (`blender -b --python scene/build_city.py -- --assets assets/kenney --out assets/geometry/train-103 --seed 103 --family train`, about 45 s each; `heldout-*` builds are never trained on). `sim_rl/cities.py` `CityPool` runs one native environment per city (n/K drones each, own CUDA stream) and gathers their fields into the trainer's [n, ...] buffers with device copies; catalogue indices are offset per city so the concatenated goal tables index as before. Each city gets a smaller episode catalogue (`--city-catalog-size`, default 16384; a 65536-entry goal table is 2.3 GiB). Each extra city costs about 0.3 GiB of device memory besides its table. Validation and the final test stay on `--city`'s held-out districts; `eval --city assets/geometry/heldout-10001` tests an unseen city.
+
+City identity (`city_fingerprint`, landable geometry, catalogue size) is no longer part of the checkpoint contract; checkpoints record their training cities under `cities`. The TensorRT encoder now orders each call after the previous one: sharing its execution context across two streams at once (per-city goal tables) corrupted about 9% of goal embeddings with NaN.
 
 ## Patch-goal run (ABI v6)
 
