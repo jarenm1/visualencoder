@@ -15,9 +15,10 @@ is placed within 3 m of its box in every case; with predicted depth in about hal
 being range rather than bearing.
 
 *Counting.* Patches the class head calls vehicle (within 35 m) are clustered per frame, associated to
-tracks with a range-dependent gate (3 m + 0.25 × range), merged when tracks converge and confirmed after
-three frames. On 128 held-out 15 s exploratory flights the count is unbiased (mean 1.77 against 1.77 cars
-actually seen), with mean absolute error 0.81; 44% of flights are exact and 80% within one.
+tracks with a range-dependent gate (3 m + 0.25 × the larger of the observation's and the track's range),
+merged when tracks converge and confirmed after three frames. On 128 held-out 15 s exploratory flights
+the mean count is 1.70 against 1.77 cars actually seen, with mean absolute error 0.76; 46% of flights are
+exact and 83% within one.
 
 *Language planning.* Gemma 4 E4B sees the camera frame and a text summary of the memory (area looked
 at, confirmed cars and their offsets, goal evidence) and chooses the next skill: explore, go to an object
