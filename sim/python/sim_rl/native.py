@@ -1,4 +1,4 @@
-"""Borrowed CUDA tensors over the sim_env C ABI v6; no observation transport."""
+"""Borrowed CUDA tensors over the sim_env C ABI v7; no observation transport."""
 from __future__ import annotations
 
 import ctypes as ct
@@ -10,18 +10,20 @@ from pathlib import Path
 import torch
 
 DEFAULT_CITY = Path(__file__).resolve().parents[3] / "assets" / "city"
-TASK = "city-drone-goal-v3"
-ABI_VERSION = 6
+TASK = "city-drone-goal-v4"
+ABI_VERSION = 7
 ACTION_DIM = 4
-HORIZON = 450
+HORIZON = 1200
 CONTROL_HZ = 30
 CONTROL_MODES = {"velocity": 0, "rates": 1}
 # Zero velocity commands hover; rates mode keeps the v3 hover throttle bias.
 HOVER_ACTIONS = {"velocity": (0.0, 0.0, 0.0, 0.0), "rates": (-0.2, 0.0, 0.0, 0.0)}
 # Fields: 0 obs, 1 proprio, 2 reward, 3 done, 4 success, 5 privileged, 6 collision,
 # 7 episodes, 8 diagnostics, 9 catalog index, 10 goal views, 11 curriculum (writable),
-# 12 ended bucket, 13 out_of_bounds, 14 ended gps_available, 15 goal crops, 16 episode diagnostics.
-FIELD_COUNT = 17
+# 12 ended bucket, 13 out_of_bounds, 14 ended gps_available, 15 goal crops, 16 episode diagnostics,
+# 17 patch depth, 18 patch object (both training labels, never actor input).
+FIELD_COUNT = 19
+PATCH = 16
 DIAGNOSTICS_WIDTH = 28
 CURRICULUM_WIDTH = 5  # w_visible, w_partial, w_hidden, p_no_gps, appearance strength
 PROPRIO_WIDTH = 19
@@ -84,7 +86,7 @@ class CudaEnv:
             try:
                 function = getattr(self.lib, name)
             except AttributeError as error:
-                raise RuntimeError(f"city navigation requires sim_env ABI v6 symbol {name}") from error
+                raise RuntimeError(f"city navigation requires sim_env ABI v{ABI_VERSION} symbol {name}") from error
             function.argtypes, function.restype = args, result
         create_args = (n, seed, width, height, style, CONTROL_MODES[control_mode], os.fsencode(self.city_path))
         if start_distance is None:
@@ -100,7 +102,7 @@ class CudaEnv:
                 raise RuntimeError(f"native city metadata unavailable: {self.error()}")
             self.metadata = json.loads(raw_metadata.decode("utf-8"))
             if self.metadata.get("abi_version") != ABI_VERSION or self.metadata.get("task") != TASK:
-                raise ValueError("city navigation requires sim_env ABI v6 task city-drone-goal-v3; "
+                raise ValueError(f"city navigation requires sim_env ABI v{ABI_VERSION} task {TASK}; "
                                  "older libraries are incompatible")
             missing = [key for key in REQUIRED_METADATA if key not in self.metadata]
             if missing:
@@ -116,7 +118,7 @@ class CudaEnv:
             self.action_names = tuple(self.metadata["action_names"])
             self.action_scales = tuple(float(value) for value in self.metadata["action_scales"])
             if (self.action_dim, self.horizon, self.control_hz) != (ACTION_DIM, HORIZON, CONTROL_HZ):
-                raise ValueError("unsupported city-drone-goal-v3 action/horizon/control contract")
+                raise ValueError(f"unsupported {TASK} action/horizon/control contract")
             if len(self.action_names) != ACTION_DIM or len(self.action_scales) != ACTION_DIM:
                 raise ValueError("native metadata must name and scale exactly four control channels")
             # Location and split-specific content (district, catalog, field shapes) are
@@ -132,6 +134,7 @@ class CudaEnv:
             # never part of the collection range or its zero-staging claim.
             self.stream.synchronize()
             image_shape = (n, 3, height, width)
+            patches = (height // PATCH) * (width // PATCH)
             specifications = [
                 (image_shape, "<f4"),                  # 0 obs
                 ((n, PROPRIO_WIDTH), "<f4"),           # 1 proprio
@@ -150,6 +153,8 @@ class CudaEnv:
                 ((n,), "<f4"),                         # 14 ended gps_available
                 ((n, 4), "<f4"),                       # 15 goal crops
                 ((n, 3), "<f4"),                       # 16 episode diagnostics, never actor input
+                ((n, patches), "<f4"),                 # 17 patch depth (label)
+                ((n, patches), "<i4"),                 # 18 patch object (label)
             ]
             with self.execution():
                 for field, (shape, typestr) in enumerate(specifications):
@@ -166,7 +171,7 @@ class CudaEnv:
             (self.obs, self.proprio, self.reward, self.done, self.success, self.privileged,
              self.collision, self.episode_counts, self.diagnostics, self.catalog_index, self.goal_views,
              self.curriculum, self.ended_bucket, self.out_of_bounds, self.ended_gps, self.goal_crops,
-             self.episode_diagnostics) = self.tensors
+             self.episode_diagnostics, self.patch_depth, self.patch_object) = self.tensors
         except BaseException:
             self.close()
             raise

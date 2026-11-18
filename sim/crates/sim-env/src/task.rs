@@ -1,9 +1,9 @@
-//! Constants and counter-based hashing for city-drone-goal-v3 (ABI v6).
+//! Constants and counter-based hashing for city-drone-goal-v4 (ABI v7).
 //!
 //! Plain integer and constant definitions shared by the host and the CUDA kernels.
 
-pub const TASK_NAME: &str = "city-drone-goal-v3";
-pub const ABI_VERSION: u32 = 6;
+pub const TASK_NAME: &str = "city-drone-goal-v4";
+pub const ABI_VERSION: u32 = 7;
 pub const ACTION_DIM: usize = 4;
 pub const SENSOR_DIM: usize = 19;
 pub const PRIVILEGED_DIM: usize = 29;
@@ -11,7 +11,17 @@ pub const DIAGNOSTIC_DIM: usize = 28;
 pub const CATALOG_SIZE: usize = 65536;
 /// Floats per camera slot: view (16), view-projection (16), eye (4).
 pub const CAMERA_FLOATS: usize = 36;
-pub const FIELD_COUNT: usize = 17;
+pub const FIELD_COUNT: usize = 19;
+/// Patch size of the frozen encoders' token grid; per-patch labels use the same grid.
+pub const PATCH: u32 = 16;
+/// Per-patch label samples per side (LABEL_SIDE^2 pixels per patch).
+pub const LABEL_SIDE: u32 = 4;
+/// A patch names an object only if at least this many of its samples hit it.
+pub const LABEL_MIN_HITS: u32 = 2;
+/// Object boxes are grown by this margin (metres) when assigning depth hits to objects.
+pub const LABEL_MARGIN: f32 = 0.2;
+/// Cell size (metres) of the x/z grid that lists layout objects for label lookup.
+pub const LABEL_CELL: f32 = 8.0;
 /// Curriculum lanes: bucket weights (3), no-GPS probability, appearance strength.
 pub const CURRICULUM_LANES: usize = 5;
 
@@ -19,6 +29,15 @@ pub const CURRICULUM_LANES: usize = 5;
 pub const DISTRICT_MARGIN: f32 = 2.0;
 /// Salt of the per-catalog-entry appearance stream (shared by episodes and their goal views).
 pub const APPEARANCE_SALT: u64 = 0x5EED_A99E_A2A9_CE01;
+
+/// Monocular camera effects at full appearance strength (each scaled by a per-episode uniform):
+/// radial distortion k (r normalized by the half-diagonal), vignette darkening at the corners,
+/// exposure time (motion blur, s) and rolling-shutter readout time (top to bottom row, s).
+pub const LENS_DISTORTION: f32 = 0.05;
+pub const LENS_VIGNETTE: f32 = 0.35;
+pub const LENS_EXPOSURE: f32 = 1.0 / 60.0;
+pub const LENS_READOUT: f32 = 1.0 / 30.0;
+pub const LENS_BLUR_TAPS: u32 = 5;
 
 pub const EVENT_CRASH: u32 = 1;
 pub const EVENT_OOB: u32 = 2;

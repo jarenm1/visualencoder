@@ -1,4 +1,4 @@
-//! GPU-resident city drone visual-goal environment (city-drone-goal-v3, ABI v6).
+//! GPU-resident city drone visual-goal environment (city-drone-goal-v4, ABI v7).
 //! See `sim_env.h` for the ABI. Build with cargo oxide and device-codegen-crate sim_physics,sim_env.
 //!
 //! Targets are placed objects of the imported city (buildings, vehicles, vegetation, props);
@@ -20,7 +20,7 @@ use sim_state::BodyState;
 use sim_state::collision::{BvhNode, Triangle};
 use sim_state::drone as dynamics;
 use sim_state::drone::EpisodeSpec;
-use kernels::{Buffers, Config, EnvState, ImageArgs};
+use kernels::{Buffers, Config, EnvState, ImageArgs, LabelArgs};
 use task::*;
 
 /// Fixed visibility and projection aspect (width / height).
@@ -37,6 +37,7 @@ struct TaskKernels {
     appearance: Function,
     retarget: Function,
     coverage: Function,
+    patch_labels: Function,
 }
 
 impl TaskKernels {
@@ -52,6 +53,7 @@ impl TaskKernels {
             appearance: module.load_function(kernels::device::appearance_CUDA_SIGNATURE.entry)?,
             retarget: module.load_function(kernels::device::retarget_CUDA_SIGNATURE.entry)?,
             coverage: module.load_function(kernels::device::coverage_CUDA_SIGNATURE.entry)?,
+            patch_labels: module.load_function(kernels::device::patch_labels_CUDA_SIGNATURE.entry)?,
         })
     }
 
@@ -91,6 +93,21 @@ impl TaskKernels {
         }
         Ok(())
     }
+
+    unsafe fn launch_labels(&self, stream: &CudaStream, mut buffers: Buffers, mut config: Config,
+        mut image: ImageArgs, mut labels: LabelArgs, patches: u32) -> Result<()> {
+        let mut args = [
+            (&raw mut buffers).cast::<c_void>(),
+            (&raw mut config).cast::<c_void>(),
+            (&raw mut image).cast::<c_void>(),
+            (&raw mut labels).cast::<c_void>(),
+        ];
+        unsafe {
+            launch_kernel_on_stream(&self.patch_labels, ((config.n * patches).div_ceil(128), 1, 1),
+                (128, 1, 1), 0, stream, &mut args)?;
+        }
+        Ok(())
+    }
 }
 
 /// Owns all device allocations for one batch. Calls must be serialized by the
@@ -113,6 +130,10 @@ pub struct Env {
     materials: DeviceBuffer<u8>,
     keys: DeviceBuffer<u8>,
     coverage_seen: DeviceBuffer<u8>,
+    label_boxes: DeviceBuffer<u8>,
+    label_cell_start: DeviceBuffer<u8>,
+    label_cell_objects: DeviceBuffer<u8>,
+    label_cells: u32,
     outputs: [DeviceBuffer<u8>; FIELD_COUNT],
     config: Config,
     width: u32,
@@ -139,6 +160,8 @@ impl Env {
             "image must be 4:3 (width * 3 == height * 4), got {width}x{height}");
         ensure!(width > 0 && u64::from(width) * u64::from(height) * u64::from(n) <= u64::from(u32::MAX),
             "image batch exceeds the u32 pixel index");
+        ensure!(width % PATCH == 0 && height % PATCH == 0,
+            "image dimensions must be multiples of the {PATCH}-pixel label patch, got {width}x{height}");
         let city_path = city_path.canonicalize()?;
         let mut city = CityScene::load(&city_path)?;
         ensure!(!city.triangles.is_empty() && !city.nodes.is_empty(), "city collision geometry is empty");
@@ -193,6 +216,10 @@ impl Env {
         }
         let exclusions = DeviceBuffer::from_host(stream, bytemuck::cast_slice(&exclusion_rects))?;
         let lanes = DeviceBuffer::from_host(stream, bytemuck::cast_slice(&DEFAULT_LANES))?;
+        let (boxes, cell_start, cell_objects, label_cells) = label_grid(&city.objects, city.half_extent);
+        let label_boxes = DeviceBuffer::from_host(stream, bytemuck::cast_slice(&boxes))?;
+        let label_cell_start = DeviceBuffer::from_host(stream, bytemuck::cast_slice(&cell_start))?;
+        let label_cell_objects = DeviceBuffer::from_host(stream, bytemuck::cast_slice(&cell_objects))?;
 
         let count = n as usize;
         let allocate = |bytes: usize| -> Result<DeviceBuffer<u8>> {
@@ -202,6 +229,7 @@ impl Env {
         let states = allocate(count * size_of::<EnvState>())?;
         let keys = allocate(count * 4)?;
         let coverage_seen = allocate(count * 512 * 4)?;
+        let patches = (width / PATCH * (height / PATCH)) as usize;
         let outputs: [DeviceBuffer<u8>; FIELD_COUNT] = [
             allocate(rgb_bytes)?,
             allocate(count * SENSOR_DIM * 4)?,
@@ -220,6 +248,8 @@ impl Env {
             allocate(count * 4)?,
             allocate(count * 4 * 4)?,
             allocate(count * 3 * 4)?,
+            allocate(count * patches * 4)?,
+            allocate(count * patches * 4)?,
         ];
 
         let exchange = Exchange::new(gpu.clone(), vec![state.clone(), cameras.clone(), rendered.clone()])?;
@@ -263,6 +293,10 @@ impl Env {
             materials,
             keys,
             coverage_seen,
+            label_boxes,
+            label_cell_start,
+            label_cell_objects,
+            label_cells,
             outputs,
             config,
             width,
@@ -383,30 +417,46 @@ impl Env {
 
 
     /// Renders every camera slot, then applies the randomized appearance into `field`
-    /// (0: observation, 10: goal views).
+    /// (0: observation, 10: goal views). Observation renders also write the per-patch labels.
     fn render_into(&mut self, field: usize, track_coverage: bool) -> Result<()> {
         let mut encoder = self.gpu.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("city rendered observation"),
         });
         self.renderer.render(&mut encoder, &self.bindings);
         self.frame = self.frame.wrapping_add(1);
+        let observation = field == 0;
         let args = ImageArgs {
             rendered: self.rendered.device_ptr() as *const u32,
             output: self.outputs[field].cu_deviceptr() as *mut f32,
             keys: self.keys.cu_deviceptr() as *const u32,
             materials: self.materials.cu_deviceptr() as *const u32,
             lanes: self.outputs[11].cu_deviceptr() as *const f32,
+            bodies: self.state.device_ptr() as *const BodyState,
             width: self.width,
             height: self.height,
             pixels: self.width * self.height * self.config.n,
             mesh_count: self.mesh_count,
             frame: self.frame,
+            moving: observation as u32,
+            tan_half_vfov: self.config.tan_half_vfov,
         };
+        let labels = LabelArgs {
+            boxes: self.label_boxes.cu_deviceptr() as *const [f32; 8],
+            cell_start: self.label_cell_start.cu_deviceptr() as *const u32,
+            cell_objects: self.label_cell_objects.cu_deviceptr() as *const u32,
+            cells: self.label_cells,
+            patch_depth: self.outputs[17].cu_deviceptr() as *mut f32,
+            patch_object: self.outputs[18].cu_deviceptr() as *mut i32,
+        };
+        let patches = (self.width / PATCH) * (self.height / PATCH);
         let buffers = self.buffers();
         let config = self.config;
         unsafe {
             self.exchange.cycle(encoder, || {
                 self.kernels.launch_appearance(self.gpu.cuda_stream(), args)?;
+                if observation {
+                    self.kernels.launch_labels(self.gpu.cuda_stream(), buffers, config, args, labels, patches)?;
+                }
                 if track_coverage {
                     self.kernels.launch_coverage(self.gpu.cuda_stream(), buffers, config, args)?;
                 }
@@ -498,14 +548,14 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, district: &drone::D
         "success": {
             "standoff_max_m": dynamics::STANDOFF_MAX, "hold_speed_mps": dynamics::HOLD_SPEED,
             "hold_steps": dynamics::HOLD_STEPS, "arrival_steps": dynamics::ARRIVAL_STEPS,
-            "timing": "training succeeds only at horizon after the final three-second uninterrupted hold; no early success termination",
+            "timing": "success is the first three-second uninterrupted hold and ends the episode; the 40 s horizon otherwise fails it",
             "facing": "anchor (target-box point nearest the camera ray) inside the frustum, sight line clear to 2 cm before the box",
         },
         "landing": {"max_speed_mps": dynamics::LANDING_SPEED, "max_tilt_rad": dynamics::LANDING_TILT_RAD},
         "ceiling_m": dynamics::CEILING,
         "reward": {
             "terms": "(max(d_prev, 3) - max(d_box, 3)) - 0.01 + 0.1*near*clamp(1 - speed/3, 0, 1) + 10*terminal_success - 10*terminal_failure; near = within 6 m of the box and facing it",
-            "done": "crash || oob || step >= horizon; no bootstrap; success requires hold_steps at horizon",
+            "done": "success || crash || oob || step >= horizon; no bootstrap",
         },
         "sensors": {
             "dim": SENSOR_DIM,
@@ -607,7 +657,56 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, district: &drone::D
         "sky": "vertical gradient, blue/overcast top, warm horizon", "fog": "1 - exp(-k depth), k <= 0.02 per m, horizon colour",
         "unchanged": "sun direction and shadows",
     });
+    if let Some(fields) = json["fields"].as_array_mut() {
+        fields.push(serde_json::json!({"index": 17, "name": "patch_depth", "dtype": "float32", "shape": ["n", "P"],
+            "layout": "training label, never actor input: mean planar depth (m) of the patch's hit samples, 0 if none"}));
+        fields.push(serde_json::json!({"index": 18, "name": "patch_object", "dtype": "int32", "shape": ["n", "P"],
+            "layout": "training label, never actor input: layout object index hit by most samples, -1 if none"}));
+    }
+    json["camera_effects"] = serde_json::json!({
+        "scope": "monocular lens and sensor timing, each a per-episode uniform times appearance strength",
+        "distortion": format!("radial, source r = r (1 + k r^2), r over the half-diagonal, k <= {LENS_DISTORTION}"),
+        "vignette": format!("brightness x (1 - v r^2), v <= {LENS_VIGNETTE}"),
+        "motion_blur": format!("{LENS_BLUR_TAPS} taps over exposure <= {LENS_EXPOSURE:.4} s of first-order image motion from body rates"),
+        "rolling_shutter": format!("row time offset over readout <= {LENS_READOUT:.4} s, same image motion"),
+        "goal_views": "same distortion and vignette, no motion",
+        "labels": "patch labels follow the same distortion and rolling shutter; privileged target NDC and boxes stay undistorted",
+    });
+    json["patch_labels"] = serde_json::json!({
+        "patch_px": PATCH, "samples": LABEL_SIDE * LABEL_SIDE, "min_hits": LABEL_MIN_HITS,
+        "object_margin_m": LABEL_MARGIN,
+        "object": "smallest layout box (grown by the margin) containing the depth hit point",
+    });
     json["city_fingerprint"] = city.fingerprint.clone().into();
     json["city_path"] = city_path.display().to_string().into();
     Ok(CString::new(json.to_string())?)
+}
+
+/// Layout object boxes [centre xyz, class, half xyz, 0] and a CSR x/z grid of LABEL_CELL metres
+/// over the city listing every object whose grown footprint overlaps each cell.
+fn label_grid(objects: &[sim_scene::CityObject], half_extent: f32) -> (Vec<[f32; 8]>, Vec<u32>, Vec<u32>, u32) {
+    let cells = (2.0 * half_extent / LABEL_CELL).ceil() as u32;
+    let cell_of = |x: f32| (((x + half_extent) / LABEL_CELL).floor().max(0.0) as u32).min(cells - 1);
+    let mut lists = vec![Vec::new(); (cells * cells) as usize];
+    let boxes = objects.iter().enumerate().map(|(index, object)| {
+        let (lo, hi) = (object.center - object.half - LABEL_MARGIN, object.center + object.half + LABEL_MARGIN);
+        for z in cell_of(lo.z)..=cell_of(hi.z) {
+            for x in cell_of(lo.x)..=cell_of(hi.x) {
+                lists[(z * cells + x) as usize].push(index as u32);
+            }
+        }
+        [object.center.x, object.center.y, object.center.z, object.class as f32,
+         object.half.x, object.half.y, object.half.z, 0.0]
+    }).collect();
+    let mut start = Vec::with_capacity(lists.len() + 1);
+    let mut flat = Vec::new();
+    for list in &lists {
+        start.push(flat.len() as u32);
+        flat.extend_from_slice(list);
+    }
+    start.push(flat.len() as u32);
+    if flat.is_empty() {
+        flat.push(0);
+    }
+    (boxes, start, flat, cells)
 }

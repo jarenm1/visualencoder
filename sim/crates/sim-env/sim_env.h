@@ -1,4 +1,4 @@
-/* city-drone-goal-v3, C ABI v6.
+/* city-drone-goal-v4, C ABI v7.
  *
  * All tensor storage is CUDA device memory on the stream returned by
  * sim_env_stream(). Buffers are valid until sim_env_destroy(). Calls must be
@@ -14,7 +14,7 @@
 extern "C" {
 #endif
 
-#define SIM_ENV_ABI_VERSION 6
+#define SIM_ENV_ABI_VERSION 7
 
 /* Field identifiers for sim_env_buffer(). */
 enum sim_env_field {
@@ -54,7 +54,12 @@ enum sim_env_field {
     SIM_ENV_FIELD_GOAL_CROPS = 15,
     /* float32 [n, 3]: current/terminal unique tiles, terminal consecutive hold steps; diagnostic only. */
     SIM_ENV_FIELD_EPISODE_DIAGNOSTICS = 16,
-    SIM_ENV_FIELD_COUNT = 17
+    /* float32 [n, P], P = (H/16)(W/16): mean planar depth (m) per 16x16 patch, 0 if no geometry.
+     * Training label only, never actor input. */
+    SIM_ENV_FIELD_PATCH_DEPTH = 17,
+    /* int32 [n, P]: city layout object most of the patch shows, -1 if none. Training label only. */
+    SIM_ENV_FIELD_PATCH_OBJECT = 18,
+    SIM_ENV_FIELD_COUNT = 19
 };
 
 /* Creates an environment batch of n drones.

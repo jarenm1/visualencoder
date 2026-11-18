@@ -1,8 +1,8 @@
-//! CUDA kernels for city-drone-goal-v3 (ABI v6).
+//! CUDA kernels for city-drone-goal-v4 (ABI v7).
 //!
 //! Each env thread owns one environment `i`. It writes only drone body `i`, camera
 //! matrices `i`, and row `i` of every per-env field. The appearance kernel owns one
-//! output pixel per thread.
+//! output pixel per thread; the label kernel owns one (env, patch) per thread.
 
 use cuda_device::cuda_module;
 use sim_state::BodyState;
@@ -125,23 +125,47 @@ pub(crate) struct ImageArgs {
     pub materials: *const u32,
     /// Curriculum lanes; lane 4 is the appearance strength in [0, 1].
     pub lanes: *const f32,
+    /// Drone bodies; camera slot `i` is env `i`'s body camera when `moving` is 1.
+    pub bodies: *const BodyState,
     pub width: u32,
     pub height: u32,
     pub pixels: u32,
     pub mesh_count: u32,
     /// Render counter: decorrelates sensor noise between frames.
     pub frame: u32,
+    /// 1 for body-camera observations (motion blur and rolling shutter from body rates), 0 for
+    /// static goal reference views.
+    pub moving: u32,
+    pub tan_half_vfov: f32,
+}
+
+/// Per-patch training labels (never actor input): metric depth and the layout object hit.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct LabelArgs {
+    /// Layout objects: [centre x, y, z, layout class, half x, y, z, 0].
+    pub boxes: *const [f32; 8],
+    /// CSR over a `cells` x `cells` x/z grid of LABEL_CELL metres: cell c lists
+    /// `cell_objects[cell_start[c] .. cell_start[c + 1]]`.
+    pub cell_start: *const u32,
+    pub cell_objects: *const u32,
+    pub cells: u32,
+    /// n x P mean planar depth of the patch's hit samples (0: no geometry).
+    pub patch_depth: *mut f32,
+    /// n x P layout object index hit by most samples (-1: none or too few).
+    pub patch_object: *mut i32,
 }
 
 #[cuda_module]
 pub(crate) mod device {
-    use super::{Buffers, Config, EnvState, ImageArgs};
+    use super::{Buffers, Config, EnvState, ImageArgs, LabelArgs};
     use crate::task::{
         APPEARANCE_SALT, CAMERA_FLOATS, COS_LANDING_TILT, CONTROL_RATES, DIAGNOSTIC_DIM, DISTRICT_MARGIN,
         EVENT_CRASH, EVENT_OOB, GPS_MAX_RADIUS, GPS_MIN_RADIUS, GPS_SCALE, GPS_VERTICAL, HEIGHT_SCALE,
-        LANE_BUCKET, LANE_CATALOG, LANE_GPS_ANGLE, LANE_GPS_AVAILABLE, LANE_GPS_RADIUS,
-        LANE_GPS_VERTICAL, LANE_GYRO, LANE_HEIGHT, LANE_VELOCITY, NOISE_GYRO, NOISE_HEIGHT,
-        NOISE_VELOCITY, PRIVILEGED_DIM, RATE_SCALE, SENSOR_DIM, SETTLE_RATE, VELOCITY_SCALE, mix,
+        LABEL_CELL, LABEL_MARGIN, LABEL_MIN_HITS, LABEL_SIDE, LANE_BUCKET, LANE_CATALOG, LANE_GPS_ANGLE,
+        LANE_GPS_AVAILABLE, LANE_GPS_RADIUS, LANE_GPS_VERTICAL, LANE_GYRO, LANE_HEIGHT, LANE_VELOCITY,
+        LENS_BLUR_TAPS, LENS_DISTORTION, LENS_EXPOSURE, LENS_READOUT, LENS_VIGNETTE, NOISE_GYRO, NOISE_HEIGHT,
+        NOISE_VELOCITY, PATCH, PRIVILEGED_DIM, RATE_SCALE, SENSOR_DIM, SETTLE_RATE, VELOCITY_SCALE, mix,
         stream, unit,
     };
     use cuda_device::{float, kernel, thread};
@@ -814,8 +838,8 @@ pub(crate) mod device {
         }
     }
 
-    // The policy must approach, brake and retain its goal through the fixed episode horizon.
-    // No action override or early-success reset: success requires the final three-second hold.
+    // The policy must approach, brake and hold. Success is the first sustained three-second hold
+    // and ends the episode; the 40 s deadline otherwise fails it. No action override.
     #[inline(always)]
     unsafe fn finish_env(buffers: Buffers, config: Config, i: usize) {
         let mut st = unsafe { *buffers.states.add(i) };
@@ -899,9 +923,78 @@ pub(crate) mod device {
         [y2 + 0.956 * i2 + 0.621 * q2, y2 - 0.272 * i2 - 0.647 * q2, y2 - 1.106 * i2 + 1.703 * q2]
     }
 
+    /// Per-camera monocular lens and sensor timing for one frame (all zero at appearance 0).
+    #[derive(Clone, Copy)]
+    struct Lens {
+        /// Radial distortion: source radius = r (1 + k r^2), r normalized by the half-diagonal.
+        k: f32,
+        vignette: f32,
+        exposure: f32,
+        readout: f32,
+        /// Image motion from body rates: pan and tilt (pixels/s) and roll (rad/s).
+        pan: f32,
+        tilt: f32,
+        roll: f32,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+    }
+
+    #[inline(always)]
+    unsafe fn lens(args: ImageArgs, camera: usize, s: f32) -> Lens {
+        let key = unsafe { *args.keys.add(camera) };
+        let cx = 0.5 * args.width as f32;
+        let cy = 0.5 * args.height as f32;
+        let (mut pan, mut tilt, mut roll) = (0.0, 0.0, 0.0);
+        if args.moving != 0 && s > 0.0 {
+            let body = unsafe { *args.bodies.add(camera) };
+            let (_, forward, up) = camera_basis(body.rotation);
+            let w = xyz(body.angular_velocity);
+            let focal = cy / args.tan_half_vfov;
+            pan = dot(w, up) * focal;
+            tilt = dot(w, cross(forward, up)) * focal;
+            roll = dot(w, forward);
+        }
+        Lens {
+            k: s * LENS_DISTORTION * appearance_unit(key, 0, 10),
+            vignette: s * LENS_VIGNETTE * appearance_unit(key, 0, 11),
+            exposure: s * LENS_EXPOSURE * appearance_unit(key, 0, 12),
+            readout: s * LENS_READOUT * appearance_unit(key, 0, 13),
+            pan, tilt, roll, cx, cy,
+            radius: float::sqrt_rn_f32(cx * cx + cy * cy),
+        }
+    }
+
+    // Render pixel (camera-local index) seen by output pixel centre (u, v) at time t after the
+    // render instant: radial distortion, then the first-order image motion of a rotating camera.
+    #[inline(always)]
+    fn lens_source(l: Lens, width: u32, height: u32, u: f32, v: f32, t: f32) -> usize {
+        let du = u - l.cx;
+        let dv = v - l.cy;
+        let g = 1.0 + l.k * (du * du + dv * dv) / (l.radius * l.radius);
+        let flow_u = -l.pan - l.roll * dv;
+        let flow_v = -l.tilt + l.roll * du;
+        let su = clampf(l.cx + du * g - flow_u * t, 0.0, width as f32 - 1.0) as usize;
+        let sv = clampf(l.cy + dv * g - flow_v * t, 0.0, height as f32 - 1.0) as usize;
+        sv * width as usize + su
+    }
+
+    // Rolling shutter: row v is read `readout` seconds apart from top to bottom.
+    #[inline(always)]
+    fn row_time(l: Lens, height: u32, v: f32) -> f32 {
+        (v / height as f32 - 0.5) * l.readout
+    }
+
+    #[inline(always)]
+    fn unpack_rgb(word: u32) -> [f32; 3] {
+        [(word & 0xff) as f32 / 255.0, ((word >> 8) & 0xff) as f32 / 255.0, ((word >> 16) & 0xff) as f32 / 255.0]
+    }
+
     // Per-pixel randomized appearance, keyed by the catalog entry so an episode and its goal
-    // view share one look: per-material hue/saturation/value, sky gradient, depth fog, exposure,
-    // white balance, contrast, gamma and sensor noise. Strength 0 reproduces the plain render.
+    // view share one look: monocular lens (radial distortion, vignette, motion blur and rolling
+    // shutter from body rates), per-material hue/saturation/value, sky gradient, depth fog,
+    // exposure, white balance, contrast, gamma and sensor noise. Strength 0 reproduces the plain
+    // render.
     #[kernel]
     pub unsafe fn appearance(args: ImageArgs) {
         let index = thread::index_1d().get();
@@ -912,13 +1005,29 @@ pub(crate) mod device {
         let camera = index / plane;
         let pixel = index - camera * plane;
         let row = pixel / args.width as usize;
-        let word = unsafe { *args.rendered.add(index) };
-        let mut c = [(word & 0xff) as f32 / 255.0, ((word >> 8) & 0xff) as f32 / 255.0, ((word >> 16) & 0xff) as f32 / 255.0];
         let raw = unsafe { *args.lanes.add(4) };
         let s = if raw != raw { 0.0 } else { clampf(raw, 0.0, 1.0) };
+        let l = unsafe { lens(args, camera, s) };
+        let u = (pixel - row * args.width as usize) as f32 + 0.5;
+        let v = row as f32 + 0.5;
+        let t_row = row_time(l, args.height, v);
+        let source = camera * plane + lens_source(l, args.width, args.height, u, v, t_row);
+        let mut c = unpack_rgb(unsafe { *args.rendered.add(source) });
+        if l.exposure > 0.0 && (l.pan != 0.0 || l.tilt != 0.0 || l.roll != 0.0) {
+            c = [0.0; 3];
+            let mut tap = 0u32;
+            while tap < LENS_BLUR_TAPS {
+                let t = t_row + l.exposure * ((tap as f32 + 0.5) / LENS_BLUR_TAPS as f32 - 0.5);
+                let sample = camera * plane + lens_source(l, args.width, args.height, u, v, t);
+                let rgb = unpack_rgb(unsafe { *args.rendered.add(sample) });
+                c = [c[0] + rgb[0], c[1] + rgb[1], c[2] + rgb[2]];
+                tap += 1;
+            }
+            c = scale(c, 1.0 / LENS_BLUR_TAPS as f32);
+        }
         if s > 0.0 {
-            let depth = f32::from_bits(unsafe { *args.rendered.add(args.pixels as usize + index) });
-            let id = unsafe { *args.rendered.add(2 * args.pixels as usize + index) };
+            let depth = f32::from_bits(unsafe { *args.rendered.add(args.pixels as usize + source) });
+            let id = unsafe { *args.rendered.add(2 * args.pixels as usize + source) };
             let key = unsafe { *args.keys.add(camera) };
             // Sky: blue to overcast grey at the top, warmer and lighter toward the horizon.
             let top = lerp3([0.35, 0.55, 0.85], [0.70, 0.72, 0.75], appearance_unit(key, 0, 0));
@@ -936,7 +1045,10 @@ pub(crate) mod device {
                 let fog = 1.0 - float::ex2_approx_f32(-density * depth * core::f32::consts::LOG2_E);
                 c = lerp3(c, horizon, fog);
             }
-            let exposure = float::ex2_approx_f32(s * signed(appearance_unit(key, 0, 3)) * 0.6);
+            let du = (u - l.cx) / l.radius;
+            let dv = (v - l.cy) / l.radius;
+            let shade = 1.0 - l.vignette * (du * du + dv * dv);
+            let exposure = float::ex2_approx_f32(s * signed(appearance_unit(key, 0, 3)) * 0.6) * shade;
             let contrast = 1.0 + s * signed(appearance_unit(key, 0, 7)) * 0.2;
             let gamma = float::ex2_approx_f32(s * signed(appearance_unit(key, 0, 8)) * 0.3);
             let sigma = s * appearance_unit(key, 0, 9) * 0.03;
@@ -954,6 +1066,110 @@ pub(crate) mod device {
         while k < 3 {
             unsafe { *args.output.add((camera * 3 + k) * plane + pixel) = c[k] };
             k += 1;
+        }
+    }
+
+    // Smallest layout object whose box (grown by LABEL_MARGIN) contains `hit`, or u32::MAX.
+    #[inline(always)]
+    unsafe fn object_at(labels: LabelArgs, config: Config, hit: [f32; 3]) -> u32 {
+        let h = config.city_half_extent;
+        if !(hit[0] >= -h && hit[0] < h && hit[2] >= -h && hit[2] < h) {
+            return u32::MAX;
+        }
+        let cx = ((hit[0] + h) / LABEL_CELL) as u32;
+        let cz = ((hit[2] + h) / LABEL_CELL) as u32;
+        if cx >= labels.cells || cz >= labels.cells {
+            return u32::MAX;
+        }
+        let cell = (cz * labels.cells + cx) as usize;
+        let (start, end) = unsafe { (*labels.cell_start.add(cell), *labels.cell_start.add(cell + 1)) };
+        let mut best = u32::MAX;
+        let mut best_volume = f32::MAX;
+        let mut j = start;
+        while j < end {
+            let object = unsafe { *labels.cell_objects.add(j as usize) };
+            let b = unsafe { *labels.boxes.add(object as usize) };
+            let inside = (hit[0] - b[0]).abs() <= b[4] + LABEL_MARGIN
+                && (hit[1] - b[1]).abs() <= b[5] + LABEL_MARGIN
+                && (hit[2] - b[2]).abs() <= b[6] + LABEL_MARGIN;
+            let volume = b[4] * b[5] * b[6];
+            if inside && volume < best_volume {
+                best = object;
+                best_volume = volume;
+            }
+            j += 1;
+        }
+        best
+    }
+
+    /// Per-patch labels of the current observation, one thread per (env, patch): LABEL_SIDE^2
+    /// samples through the same lens mapping as the image (without blur) give the mean planar
+    /// depth of the hits and the layout object most samples land on. Training labels only.
+    #[kernel]
+    pub unsafe fn patch_labels(buffers: Buffers, config: Config, args: ImageArgs, labels: LabelArgs) {
+        let index = thread::index_1d().get();
+        let columns = (args.width / PATCH) as usize;
+        let per = columns * (args.height / PATCH) as usize;
+        if index >= config.n as usize * per {
+            return;
+        }
+        let i = index / per;
+        let patch = index - i * per;
+        let (px, py) = ((patch % columns) as u32, (patch / columns) as u32);
+        let raw = unsafe { *args.lanes.add(4) };
+        let s = if raw != raw { 0.0 } else { clampf(raw, 0.0, 1.0) };
+        let l = unsafe { lens(args, i, s) };
+        let body = unsafe { *buffers.bodies.add(i) };
+        let (off, forward, up) = camera_basis(body.rotation);
+        let eye = add(xyz(body.position), off);
+        let right = cross(forward, up);
+        let plane = (args.width * args.height) as usize;
+        let step = PATCH / LABEL_SIDE;
+        let mut ids = [u32::MAX; (LABEL_SIDE * LABEL_SIDE) as usize];
+        let mut depth_sum = 0.0f32;
+        let mut hits = 0u32;
+        let mut sample = 0u32;
+        while sample < LABEL_SIDE * LABEL_SIDE {
+            let u = (px * PATCH + (sample % LABEL_SIDE) * step + step / 2) as f32 + 0.5;
+            let v = (py * PATCH + (sample / LABEL_SIDE) * step + step / 2) as f32 + 0.5;
+            let local = lens_source(l, args.width, args.height, u, v, row_time(l, args.height, v));
+            let source = i * plane + local;
+            let id = unsafe { *args.rendered.add(2 * args.pixels as usize + source) };
+            let depth = f32::from_bits(unsafe { *args.rendered.add(args.pixels as usize + source) });
+            if id != 0 && depth > 0.0 && depth <= CAMERA_FAR {
+                let su = (local % args.width as usize) as f32 + 0.5;
+                let sv = (local / args.width as usize) as f32 + 0.5;
+                let nx = (2.0 * su / args.width as f32 - 1.0) * config.tan_half_vfov * config.aspect;
+                let ny = (1.0 - 2.0 * sv / args.height as f32) * config.tan_half_vfov;
+                // Planar depth along `forward`: the unnormalized ray has unit forward component.
+                let hit = add(eye, scale(add(forward, add(scale(right, nx), scale(up, ny))), depth));
+                ids[sample as usize] = unsafe { object_at(labels, config, hit) };
+                depth_sum += depth;
+                hits += 1;
+            }
+            sample += 1;
+        }
+        let mut best = u32::MAX;
+        let mut best_count = 0u32;
+        let mut a = 0usize;
+        while a < ids.len() {
+            if ids[a] != u32::MAX {
+                let mut count = 0u32;
+                let mut b = 0usize;
+                while b < ids.len() {
+                    if ids[b] == ids[a] { count += 1; }
+                    b += 1;
+                }
+                if count > best_count {
+                    best = ids[a];
+                    best_count = count;
+                }
+            }
+            a += 1;
+        }
+        unsafe {
+            *labels.patch_depth.add(index) = if hits > 0 { depth_sum / hits as f32 } else { 0.0 };
+            *labels.patch_object.add(index) = if best_count >= LABEL_MIN_HITS { best as i32 } else { -1 };
         }
     }
 

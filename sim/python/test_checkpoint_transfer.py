@@ -8,28 +8,29 @@ import unittest
 
 import torch
 
-from sim_rl.cli import CHECKPOINT_FORMAT, load_checkpoint, native_provenance, validate_checkpoint
-from sim_rl.native import ABI_VERSION, TASK
+from sim_rl.cli import CHECKPOINT_FORMAT, TRANSFER_SOURCE, load_checkpoint, native_provenance, validate_checkpoint
+from sim_rl.native import ABI_VERSION, HORIZON, TASK
 
 
 def _fixture(directory: str):
     library = Path(directory) / "native.so"
     library.write_bytes(b"provenance fixture")
     env = SimpleNamespace(
-        action_dim=4, horizon=450, control_hz=30, control_mode="velocity", catalog_size=256,
+        action_dim=4, horizon=HORIZON, control_hz=30, control_mode="velocity", catalog_size=256,
         width=224, height=224, library=library,
-        task_contract={"task": TASK, "abi_version": ABI_VERSION,
+        task_contract={"task": TASK, "abi_version": ABI_VERSION, "horizon": HORIZON,
                        "dynamics": {"velocity_scales": [4.0, 2.0, 1.5]},
                        "sensors": {"proprio_width": 19}, "privileged": {"width": 29},
-                       "success": {"hold_steps": 90}, "reward": {"timeout": -10.0}})
+                       "success": {"hold_steps": 90}, "reward": {"timeout": -10.0},
+                       "camera_effects": {"vignette": 0.35}, "patch_labels": {"patch_px": 16}})
     features = SimpleNamespace(visual=True, spec="mean", dim=64, fingerprint="frozen-encoder", goal="global",
                                preprocessing={"engine": "tensorrt", "precision": "fp16"})
     recorded: dict[str, Any] = deepcopy(native_provenance(env, features))
-    del recorded["goal"]  # v2 checkpoints predate the goal-representation key
-    recorded.update(task="city-drone-goal-v2", abi_version=5)
-    recorded["native_task_contract"].update(
-        task="city-drone-goal-v2", abi_version=5,
-        success={"hold_steps": 15}, reward={"novelty": 0.05})
+    source_task, source_abi = TRANSFER_SOURCE
+    recorded.update(task=source_task, abi_version=source_abi, horizon=450)
+    contract = recorded["native_task_contract"]
+    contract.update(task=source_task, abi_version=source_abi, horizon=450, success={"hold_steps": 90, "timing": "deadline"})
+    del contract["camera_effects"], contract["patch_labels"]
     saved: dict[str, Any] = {"format": CHECKPOINT_FORMAT, "metadata": recorded, "model": {}}
     return env, features, saved
 

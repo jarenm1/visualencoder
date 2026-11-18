@@ -30,8 +30,8 @@ pub const PHYSICS_HZ: u32 = 240;
 pub const CONTROL_HZ: u32 = 30;
 /// Physics substeps per control step.
 pub const SUBSTEPS: u32 = PHYSICS_HZ / CONTROL_HZ;
-/// Control steps per episode (15 s at 30 Hz).
-pub const HORIZON: u32 = 450;
+/// Control steps per episode (40 s at 30 Hz): time to cross 60 m and search when the target is hidden.
+pub const HORIZON: u32 = 1200;
 /// Camera uptilt above the body x-axis, radians (15 deg).
 pub const CAMERA_UPTILT_RAD: f32 = core::f32::consts::PI / 12.0;
 /// Vertical field of view, radians (75 deg).
@@ -40,8 +40,8 @@ pub const CAMERA_VFOV_RAD: f32 = 5.0 * core::f32::consts::PI / 12.0;
 pub const CAMERA_OFFSET: [f32; 3] = [0.0, 0.05, -0.1];
 pub const CAMERA_NEAR: f32 = 0.05;
 pub const CAMERA_FAR: f32 = 120.0;
-/// Sustained standoff: remain within the target band, slow and facing it for the final
-/// `HOLD_STEPS` controls at the episode deadline. Earlier arrival never terminates training.
+/// Sustained standoff: success is the first `HOLD_STEPS` consecutive controls within the target band,
+/// slow and facing it; training episodes end there.
 pub const STANDOFF_MAX: f32 = 6.0;
 /// Progress reward stops below this box distance: closer brings no reward, only risk.
 pub const STANDOFF_NEAR: f32 = 3.0;
@@ -90,9 +90,8 @@ pub fn hold_outcome(previous_hold: u32, step: u32, holding: bool,
         if previous_hold < HOLD_STEPS { previous_hold + 1 } else { HOLD_STEPS }
     } else { 0 };
     let deadline = step >= HORIZON;
-    let success = hold >= HOLD_STEPS && !crash && !oob
-        && if free { previous_hold < HOLD_STEPS } else { deadline };
-    HoldOutcome { hold, success, done: crash || oob || (!free && deadline) }
+    let success = hold >= HOLD_STEPS && previous_hold < HOLD_STEPS && !crash && !oob;
+    HoldOutcome { hold, success, done: crash || oob || (!free && (success || deadline)) }
 }
 
 /// Four terms: distance progress, time, graded near-goal braking, and terminal outcome.
@@ -232,10 +231,10 @@ mod tests {
     use core::mem::{align_of, offset_of, size_of};
 
     #[test]
-    fn early_arrival_does_not_end_and_drift_away_fails_at_deadline() {
+    fn brief_arrival_does_not_end_and_drift_away_fails_at_deadline() {
         let mut hold = 0;
         for step in 1..HORIZON {
-            let out = hold_outcome(hold, step, step < 300, false, false, false);
+            let out = hold_outcome(hold, step, step % 60 < 30, false, false, false);
             assert!(!out.done && !out.success);
             hold = out.hold;
         }
@@ -246,13 +245,14 @@ mod tests {
     }
 
     #[test]
-    fn only_sustained_final_hold_succeeds_and_every_failure_costs_the_same() {
-        let held = hold_outcome(HOLD_STEPS - 1, HORIZON, true, false, false, false);
+    fn first_sustained_hold_succeeds_and_ends_and_every_failure_costs_the_same() {
+        let held = hold_outcome(HOLD_STEPS - 1, 200, true, false, false, false);
         assert!(held.done && held.success);
         let too_short = hold_outcome(HOLD_STEPS - 2, HORIZON, true, false, false, false);
         assert!(too_short.done && !too_short.success);
         for (crash, oob, step) in [(true, false, 100), (false, true, 100), (false, false, HORIZON)] {
-            let out = hold_outcome(HOLD_STEPS, step, false, crash, oob, false);
+            // A crash or leaving bounds fails even mid-hold; the deadline fails without one.
+            let out = hold_outcome(HOLD_STEPS - 1, step, crash || oob, crash, oob, false);
             assert!(out.done && !out.success);
             assert!((goal_reward(0.0, 0.0, false, false, true) + 10.01).abs() < 1e-5);
         }

@@ -101,6 +101,13 @@ def checkpoint(policy, metadata, steps):
             "model": policy.state_dict()}
 
 
+# The previous task, which explicit visual-policy evaluation may transfer from. v4 changed the
+# horizon (15 -> 40 s), ended episodes at the first sustained hold, and added camera effects and
+# label fields; flight dynamics, sensors and encoders are unchanged.
+TRANSFER_SOURCE = ("city-drone-goal-v3", 6)
+TRANSFER_CHANGED = {"task", "abi_version", "success", "reward", "horizon", "camera_effects", "patch_labels"}
+
+
 def load_checkpoint(path, *, for_task_transfer=False):
     saved = torch.load(path, map_location="cpu", weights_only=True)
     if saved.get("format") != CHECKPOINT_FORMAT:
@@ -108,8 +115,7 @@ def load_checkpoint(path, *, for_task_transfer=False):
                          f"cannot be used for {TASK} ABI {ABI_VERSION}")
     metadata = saved["metadata"]
     source = (metadata.get("task"), metadata.get("abi_version"))
-    if source != (TASK, ABI_VERSION) and not (
-            for_task_transfer and source == ("city-drone-goal-v2", 5)):
+    if source != (TASK, ABI_VERSION) and not (for_task_transfer and source == TRANSFER_SOURCE):
         raise ValueError(f"checkpoint targets an incompatible native ABI or task; retrain on sim_env ABI v{ABI_VERSION}")
     return saved
 
@@ -120,16 +126,15 @@ def validate_checkpoint(saved, env, features, *, for_task_transfer=False):
     transfer = (recorded.get("task"), recorded.get("abi_version")) != (TASK, ABI_VERSION)
     if transfer:
         if not (for_task_transfer and features.visual and
-                (recorded.get("task"), recorded.get("abi_version")) == ("city-drone-goal-v2", 5)):
-            raise ValueError("only explicit visual-policy evaluation may transfer a v2/ABI5 checkpoint")
+                (recorded.get("task"), recorded.get("abi_version")) == TRANSFER_SOURCE):
+            raise ValueError(f"only explicit visual-policy evaluation may transfer a {TRANSFER_SOURCE} checkpoint")
         # Visual actors never read privileged hold progress; controls, sensors and encoders must match.
-        changed = {"task", "abi_version", "success", "reward"}
-        source_contract = {k: v for k, v in recorded["native_task_contract"].items() if k not in changed}
-        target_contract = {k: v for k, v in expected["native_task_contract"].items() if k not in changed}
+        source_contract = {k: v for k, v in recorded["native_task_contract"].items() if k not in TRANSFER_CHANGED}
+        target_contract = {k: v for k, v in expected["native_task_contract"].items() if k not in TRANSFER_CHANGED}
         if source_contract != target_contract:
             raise ValueError("task-transfer checkpoint differs in dynamics, sensors or observation contract")
     for key in CHECKED_KEYS:
-        if transfer and key in {"task", "abi_version", "native_task_contract"}:
+        if transfer and key in {"task", "abi_version", "horizon", "native_task_contract"}:
             continue
         if recorded.get(key, UNRECORDED.get(key)) != expected[key]:
             raise ValueError(f"checkpoint {key} differs from the native/feature configuration: "
