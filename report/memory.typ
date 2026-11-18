@@ -6,7 +6,7 @@ over it.
 *Memory.* Each environment keeps a 128×128 map at 1.5 m around its start. The pose is dead-reckoned
 from the gyro and body-velocity sensors. Integrating the gyro about the gravity axis drifted 0.2 rad in
 10 s whenever the body tilted; integrating the heading rate of the levelled forward axis,
-ψ̇ = ω·u − f#sub[y](ω·f̂)/|h|, brings the median position error after 10 s to 0.06 m. Every patch ray is
+$dot(psi) = bold(omega) dot bold(u) - f_y (bold(omega) dot hat(bold(f))) \/ |bold(h)|$, brings the median position error after 10 s to 0.06 m. Every patch ray is
 cast to its predicted depth (@tab-perception): the hit cell takes the policy's own goal evidence and
 cells along the ray are marked looked-at, so evidence is replaced when the drone looks again. The actor
 reads a heading-aligned 32×32 crop (±48 m) through a small CNN plus the strongest candidate; an
