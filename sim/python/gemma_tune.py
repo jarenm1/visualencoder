@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -34,6 +35,7 @@ from gemma_goal import MATCH_IOU, ask, iou, load_gemma, object_phrase, parse_box
 
 MIN_PATCHES = 4                  # an object must cover this many 16 px patches to be asked for
 GRID_W, GRID_H = 20, 15
+LOSS_SCALE = 8.0                 # summed answer-token loss / LOSS_SCALE keeps the old gradient size
 
 
 def prompt(instruction):
@@ -148,8 +150,7 @@ def train(args):
     model.train()
     log = (args.out / f"{args.adapter}-log.jsonl").open("w")
     for step in range(args.steps):
-        # Absent examples at --absent-fraction: at 0.5 the first adapter learned to decline half of
-        # the visible targets.
+        # Absent examples at --absent-fraction (absent-heavy data taught refusals).
         row = rng.choice(absent if rng.random() < args.absent_fraction else visible)
         image = Image.open(args.out / "train" / row["image"]).convert("RGB")
         messages = [{"role": "user", "content": [{"type": "image", "image": image},
@@ -161,11 +162,14 @@ def train(args):
         inputs = {key: value.to("cuda") for key, value in context.items()}
         inputs["input_ids"] = torch.cat((inputs["input_ids"], target.to("cuda")), dim=1)
         inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
-        labels = inputs["input_ids"].clone()
-        labels[:, :context["input_ids"].shape[1]] = -100
+        # Summed, not averaged, over answer tokens: with the mean, the one token that decides box or
+        # "[]" carried 1/25 of a box answer's loss but 1/3 of an absent one's, and greedy decoding
+        # of those adapters answered "[]" to most visible targets despite a low training loss.
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss = model(**inputs, labels=labels).loss
-        (loss / args.accumulate).backward()
+            logits = model(**inputs, logits_to_keep=target.shape[1] + 1).logits[:, :-1].float()
+        total = F.cross_entropy(logits.flatten(0, 1), target.to("cuda").flatten(), reduction="sum")
+        loss = total.detach() / target.shape[1]   # per answer token, for the log only
+        (total / (LOSS_SCALE * args.accumulate)).backward()
         if (step + 1) % args.accumulate == 0:
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
