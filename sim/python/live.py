@@ -89,7 +89,11 @@ class Pilot:
         if args.gemma:
             from transformers import AutoProcessor
             from gemma_goal import load_gemma
-            self.gemma = (load_gemma(args.model, args.gemma_4bit), AutoProcessor.from_pretrained(args.model))
+            model = load_gemma(args.model, args.gemma_4bit)
+            if args.adapter is not None:   # grounding LoRA (gemma_tune.py); planning runs without it
+                from peft import PeftModel
+                model = PeftModel.from_pretrained(model, args.adapter).eval()
+            self.gemma = (model, AutoProcessor.from_pretrained(args.model))
         self.requests = queue.Queue()
         self.lock = threading.Lock()
         self.frame, self.goal_image, self.frame_id = b"", b"", 0
@@ -447,6 +451,7 @@ def main():
     parser.add_argument("--gemma", action="store_true", help="load Gemma 4 for typed instructions (~10 GB GPU)")
     parser.add_argument("--model", default="google/gemma-4-E4B-it")
     parser.add_argument("--gemma-4bit", action="store_true", help="4-bit NF4 Gemma language model (fits 8 GB)")
+    parser.add_argument("--adapter", type=Path, help="grounding LoRA for the agent's boxes (runs/gemma-tune/lora-sum)")
     args = parser.parse_args()
     pilot = Pilot(args)
     server = ThreadingHTTPServer((args.host, args.port), Handler)

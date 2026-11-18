@@ -142,10 +142,6 @@ def main():
     args = parser.parse_args()
     args.gemma, args.hz = True, 0.0
     pilot = Pilot(args)
-    if args.adapter is not None:
-        from peft import PeftModel
-        model, processor = pilot.gemma
-        pilot.gemma = (PeftModel.from_pretrained(model, args.adapter).eval(), processor)
     rows = []
     with pilot.env.execution():
         pilot.lanes[3] = 1.0   # no GPS: the policy gets no target offset, only the camera
