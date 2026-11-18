@@ -202,17 +202,19 @@ Without the ground prior `mean` reaches 0.214 / 0.70.
 
 **Explore command** (`--explore-fraction`): a share of training episodes gets the explore command instead of the goal; the actor and critic take a one-hot command, the goal input and the memory's goal evidence are zero, and the reward is newly observed surface tiles (native coverage counter) minus a step cost and the crash/leave penalty. Validation reports the explore command's mean observed tiles alongside goal success.
 
-**Agent** (`sim/python/agent.py`, live play with `--gemma` and a memory checkpoint): a typed instruction starts a loop in which Gemma sees the camera frame and a text summary of the memory (area looked at, confirmed cars with offsets, goal evidence) and answers `explore`, `go` (a box in the current frame, which becomes the goal crop) or `answer`. It replans every 5 simulated seconds or when a skill ends; simulated time waits while Gemma thinks. Switching goals keeps the map and the car tracks.
+**Agent** (`sim/python/agent.py`, live play with `--gemma` and a memory checkpoint): a typed instruction starts a loop in which Gemma sees the camera frame and a text summary of the memory (time left, area looked at, confirmed cars with offsets, goal evidence) and answers `explore`, `go` with an object label, or `answer`. A `go` label is boxed by a separate grounding call (the `gemma_goal.detect` prompt, so a grounding adapter can serve it while planning uses the base weights); the box crop becomes the goal. It replans every 5 simulated seconds or when a skill ends; at the time limit only an answer is accepted; simulated time waits while Gemma thinks. Re-confirming the current skill keeps the policy's recurrent state; switching goals keeps the map and the car tracks. The summary never contains simulator labels.
 
-**Gemma grounding post-train** (`sim/python/gemma_tune.py`): exploratory-flight frames with per-patch object labels give "Fly to the [nearest] <name>." → box examples and absent names → `[]`; QLoRA (rank 16, 4-bit NF4 base) on the language model's projections; `eval` compares base and tuned hit and false-box rates on 400 held-out examples. **Negative so far**: the adapter stops boxing absent objects but also declines half the visible ones, and the share of absent training examples is not the cause.
+**Gemma grounding post-train** (`sim/python/gemma_tune.py`): exploratory-flight frames with per-patch object labels give "Fly to the [nearest] <name>." → box examples and absent names → `[]`; QLoRA (rank 16, 4-bit NF4 base, 3000 examples) on the language model's projections; `eval` compares base and tuned hit and false-box rates on 400 held-out examples, and scores the agent's plain "the X" phrasing of "the nearest X" rows.
 
-| Model | Visible hit (IoU ≥ 0.3) | Visible boxed | Absent false box |
-|---|---|---|---|
-| base, 4-bit | 43.5% | 91% | 50.5% |
-| LoRA, 50% absent (`lora`) | 32.5% | 50% | 0% |
-| LoRA, 25% absent (`lora-a25`) | 28.5% | 50% | 0% |
+| Model | Visible hit (IoU ≥ 0.3) | Plain "the X" hit | Visible boxed | Absent false box |
+|---|---|---|---|---|
+| base, 4-bit | 43.5% | 44% | 91% | 50.5% |
+| LoRA, mean loss, 50% absent (`lora`) | 32.5% | – | 50% | 0% |
+| LoRA, mean loss, 25% absent (`lora-a25`) | 28.5% | – | 50% | 0% |
+| LoRA, mean loss, mixed phrasing (`lora-phrasing`) | 0% | 0% | 0% | 0% |
+| **LoRA, summed loss, mixed phrasing (`lora-sum`)** | **55%** | **55%** | 88.5% | **25%** |
 
-The agent keeps the base model; the patch matcher already vetoes boxes the policy cannot match.
+The mean-loss adapters learned to refuse. Averaged over answer tokens, the single token that decides box or `[]` weighed 1/25 of a box answer's loss but 1/3 of an absent answer's. Training loss looked low while greedy decoding answered `[]`. Summing the answer-token loss gives every example's decision the same weight. `lora-sum` is the first adapter that beats the base model on both hit rate and false boxes.
 
 ### Memory policy run (`runs/drone10-v4-memory-seed0`)
 
