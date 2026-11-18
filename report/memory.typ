@@ -14,6 +14,31 @@ auxiliary loss decodes the target's offset from the memory features. With labell
 is placed within 3 m of its box in every case; with predicted depth in about half, the remaining error
 being range rather than bearing.
 
+*Does memory help?* Two policies trained from scratch with identical settings (seed 0, 8–60 m starts,
+half the episodes without GPS, patience-stopped), differing only in the memory, plus the memory policy
+warm-started with the explore command (@tab-memory). Memory adds about four points on the held-out
+test with goal refresh and about five with a fixed goal reference, where nothing but memory can recover a
+lost target. All three policies overfit after about 2M steps: training success keeps rising while
+held-out collisions grow.
+
+#figure(
+  table(
+    columns: (auto, auto, auto, auto),
+    align: (left, center, center, center),
+    stroke: none, table.hline(),
+    [*Policy*], [*Refreshed, GPS*], [*Refreshed, no GPS*], [*Fixed goal, GPS / no GPS*],
+    table.hline(stroke: 0.5pt),
+    [No memory], [12.1%], [10.9%], [4.3% / 3.5%],
+    [Memory], [16.4%], [15.2%], [9.4% / 8.2%],
+    [Memory + explore command], [17.2%], [15.2%], [6.6% / 7.0%],
+    table.hline(),
+  ),
+  caption: [Held-out test success, 256 episodes per cell, 8–60 m starts (twice the range of earlier
+  sections), one seed; the 95% interval of a 15% rate is about ±4.5 points. Under the explore command
+  the third policy's validation coverage grew from 285 to 1,556 observed tiles per 40 s episode while its
+  explore-time collisions fell from 42% to 18%.],
+) <tab-memory>
+
 *Counting.* Patches the class head calls vehicle (within 35 m) are clustered per frame, associated to
 tracks with a range-dependent gate (3 m + 0.25 × the larger of the observation's and the track's range),
 merged when tracks converge and confirmed after three frames. On 128 held-out 15 s exploratory flights
