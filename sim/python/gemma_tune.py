@@ -128,7 +128,7 @@ def train(args):
     from peft import LoraConfig, get_peft_model
     from transformers import AutoProcessor
     processor = AutoProcessor.from_pretrained(args.model)
-    model = load_gemma(args.model)
+    model = load_gemma(args.model, args.quantize)
     model = get_peft_model(model, LoraConfig(r=args.rank, lora_alpha=2 * args.rank, lora_dropout=0.05,
                                              target_modules=r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"))
     model.print_trainable_parameters()
@@ -167,7 +167,7 @@ def train(args):
 def evaluate(args):
     from transformers import AutoProcessor
     processor = AutoProcessor.from_pretrained(args.model)
-    model = load_gemma(args.model)
+    model = load_gemma(args.model, args.quantize)
     rows = load(args.out / "test")[:args.eval_examples]
     results = {}
     for name in ("base", "lora"):
@@ -197,6 +197,7 @@ def main():
     parser.add_argument("stage", choices=("data", "train", "eval"))
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--model", default="google/gemma-4-E4B-it")
+    parser.add_argument("--quantize", action="store_true", help="4-bit NF4 base model (QLoRA when training)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-envs", type=int, default=32)
     parser.add_argument("--stride", type=int, default=20)

@@ -57,6 +57,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--model", default="google/gemma-4-E4B-it")
+    parser.add_argument("--quantize", action="store_true", help="4-bit NF4 Gemma language model")
     parser.add_argument("--frame", type=Path, help="RGB image for the Gemma answer (default: grey 320x240)")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
@@ -84,8 +85,8 @@ def main():
 
     from transformers import AutoProcessor
     processor = AutoProcessor.from_pretrained(args.model)
-    model = load_gemma(args.model)
-    ledger.add(f"{args.model} weights (bf16; per-layer embedding table in host memory)")
+    model = load_gemma(args.model, args.quantize)
+    ledger.add(f"{args.model} weights ({'4-bit NF4' if args.quantize else 'bf16'}; per-layer embedding table in host memory)")
     image = Image.open(args.frame).convert("RGB") if args.frame else Image.new("RGB", (320, 240), (128, 128, 128))
     _, _, latency = detect(model, processor, image, "Fly to the red car.")
     ledger.add("Gemma one grounding answer (activations, KV cache)", latency_s=round(latency, 3))

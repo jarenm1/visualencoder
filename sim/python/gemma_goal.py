@@ -106,22 +106,42 @@ def frames(args):
     print(f"wrote {args.num_envs} start frames (seed {seed}) to {args.out}")
 
 
-def load_gemma(model_id):
-    """bf16 Gemma 4 on the GPU except the per-layer embedding table (5.6 GB for E4B).
+def load_gemma(model_id, quantize=False):
+    """Gemma 4 on the GPU except the per-layer embedding table (5.6 GB for E4B).
 
     That table is only a per-token lookup, so it stays in host memory and its result is
     copied to the GPU; accelerate's offload instead re-uploads the whole table per call.
+    ``quantize`` stores the language model's linear layers as 4-bit NF4 (bitsandbytes, bf16
+    compute); the vision tower and embeddings stay bf16. Same model, a quarter of the weight memory.
     """
     from transformers import AutoModelForMultimodalLM
     model = AutoModelForMultimodalLM.from_pretrained(model_id, dtype=torch.bfloat16, device_map="cpu")
     language = model.model.language_model
     table = language._modules.pop("embed_tokens_per_layer", None)
+    if quantize:
+        quantize_linear(language)
     model.to("cuda")
     if table is not None:
         language._modules["embed_tokens_per_layer"] = table
         lookup = table.forward
         table.forward = lambda ids, *rest, **kw: lookup(ids.cpu(), *rest, **kw).to("cuda", non_blocking=True)
     return model.eval()
+
+
+def quantize_linear(module):
+    """Replace every nn.Linear under ``module`` with a bitsandbytes NF4 Linear4bit holding the same
+    weights; quantization happens when the module moves to the GPU."""
+    import bitsandbytes as bnb
+    for name, child in list(module.named_children()):
+        if isinstance(child, torch.nn.Linear):
+            layer = bnb.nn.Linear4bit(child.in_features, child.out_features, bias=child.bias is not None,
+                                      compute_dtype=torch.bfloat16, quant_type="nf4")
+            layer.weight = bnb.nn.Params4bit(child.weight.data, requires_grad=False, quant_type="nf4")
+            if child.bias is not None:
+                layer.bias = torch.nn.Parameter(child.bias.data, requires_grad=False)
+            setattr(module, name, layer)
+        else:
+            quantize_linear(child)
 
 
 def ask(model, processor, image, prompt, max_new_tokens=96):
@@ -168,7 +188,7 @@ def ground(args):
     hi = np.array([layout[i]["max"] for i in targets], dtype=float)
     centers, halves = (lo + hi) / 2, (hi - lo) / 2
     processor = AutoProcessor.from_pretrained(args.model)
-    model = load_gemma(args.model)
+    model = load_gemma(args.model, args.quantize)
     boxes = []
     for env in record["envs"]:
         image = Image.open(args.out / f"frame-{env['env']:03d}.png").convert("RGB")
@@ -218,7 +238,7 @@ def bench(args):
     chosen = np.concatenate((rng.choice(np.flatnonzero(visible), args.visible, replace=False),
                              rng.choice(np.flatnonzero(~visible), args.absent, replace=False)))
     processor = AutoProcessor.from_pretrained(args.model)
-    model = load_gemma(args.model)
+    model = load_gemma(args.model, args.quantize)
     rows = []
     for index in chosen:
         asset = layout[int(diagnostics[index, 27])]["asset"]
@@ -263,6 +283,7 @@ def main():
     parser.add_argument("stage", choices=("frames", "ground", "bench"))
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--model", default="google/gemma-4-E4B-it")
+    parser.add_argument("--quantize", action="store_true", help="4-bit NF4 Gemma language model")
     parser.add_argument("--num-envs", type=int, default=32)
     parser.add_argument("--seed", type=int, help="held-out reset seed (default: the test seed)")
     parser.add_argument("--appearance", type=float, default=1.0)
