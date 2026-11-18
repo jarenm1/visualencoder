@@ -32,6 +32,8 @@ class LiveDiagnosticsTest(unittest.TestCase):
         pilot.checkpoint = {'steps': 3006464, 'live_goal_refresh': False}
         pilot.gemma = None
         pilot.spatial, pilot.memory_image, pilot.memory_info = None, b"", None
+        pilot.command = torch.zeros(1, dtype=torch.long)
+        pilot.agent, pilot.agent_info, pilot.steps = None, None, 0
         return pilot
 
     def test_patch_agreement_uses_y_up_and_requires_comparable_ground_truth(self):

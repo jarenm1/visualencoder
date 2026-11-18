@@ -184,6 +184,11 @@ async function poll() {
       `fixed live goal (no automatic refresh) · ${checkpoint.path}`;
     $("checkpoint-detail").textContent += " · training success = first 3 s hold within 6 m, ≤1 m/s, facing" +
       (state.memory ? " · map: amber = goal evidence, blue = looked at (spatial memory)" : "");
+    const agent = state.agent;
+    $("goal-detail").textContent += agent
+      ? ` · Agent "${agent.instruction}": ${agent.answer ? `answer: ${agent.answer}` : agent.action ? agent.action.action : "thinking"}` +
+        ` (${agent.note}; ${agent.history.join(" → ")})`
+      : "";
     drawMap();
   } catch (_) { /* server restarting */ }
   setTimeout(poll, 100);

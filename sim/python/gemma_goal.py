@@ -124,25 +124,35 @@ def load_gemma(model_id):
     return model.eval()
 
 
-def detect(model, processor, image, instruction):
-    """Gemma's box for the instructed object -> (normalized [x0, y0, x1, y1] or None, raw answer, seconds)."""
-    prompt = (f"A drone receives the instruction: \"{instruction}\". Find the object it should fly to in this "
-              "drone camera image. Output a JSON list with that one object as {\"box_2d\": [ymin, xmin, ymax, xmax] "
-              "normalized to 0-1000, \"label\": name}. Output [] if it is not visible.")
+def ask(model, processor, image, prompt, max_new_tokens=96):
+    """One greedy Gemma answer about an image -> (text, seconds)."""
     content = [{"type": "image", "image": image}, {"type": "text", "text": prompt}]
     inputs = processor.apply_chat_template([{"role": "user", "content": content}], tokenize=True, return_dict=True,
                                            return_tensors="pt", add_generation_prompt=True).to("cuda")
     start = time.monotonic()
     with torch.no_grad():
-        output = model.generate(**inputs, max_new_tokens=96, do_sample=False)
+        output = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
     latency = time.monotonic() - start
-    text = processor.decode(output[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True).strip()
+    return processor.decode(output[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True).strip(), latency
+
+
+def parse_box(text):
+    """First [ymin, xmin, ymax, xmax] (0-1000) in ``text`` -> normalized [x0, y0, x1, y1], or None."""
     match = re.search(r"\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]", text)
     if not match:
-        return None, text, latency
+        return None
     y0, x0, y1, x1 = (min(max(int(v) / 1000, 0.0), 1.0) for v in match.groups())
     box = [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)]
-    return (box if box[2] - box[0] > 0.01 and box[3] - box[1] > 0.01 else None), text, latency
+    return box if box[2] - box[0] > 0.01 and box[3] - box[1] > 0.01 else None
+
+
+def detect(model, processor, image, instruction):
+    """Gemma's box for the instructed object -> (normalized [x0, y0, x1, y1] or None, raw answer, seconds)."""
+    prompt = (f"A drone receives the instruction: \"{instruction}\". Find the object it should fly to in this "
+              "drone camera image. Output a JSON list with that one object as {\"box_2d\": [ymin, xmin, ymax, xmax] "
+              "normalized to 0-1000, \"label\": name}. Output [] if it is not visible.")
+    text, latency = ask(model, processor, image, prompt)
+    return parse_box(text), text, latency
 
 
 def ground(args):

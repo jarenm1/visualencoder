@@ -10,12 +10,15 @@ from torch.profiler import record_function
 from .curriculum import MODES as CURRICULUM_MODES, Curriculum
 from .features import RefreshedGoals
 from .memory import CANDIDATE_WIDTH, CHANNELS, EGO, SpatialMemory, observe as observe_memory
-from .model import saliency_loss, squashed_entropy, squashed_log_prob
+from .model import EXPLORE_COMMAND, GOAL_COMMAND, saliency_loss, squashed_entropy, squashed_log_prob
 from .native import HOVER_ACTIONS, PRIVILEGED_WIDTH, PROPRIO_WIDTH
 
 # finish_rollout layout: rollout totals, PPO losses, bucket totals, used/next weights, EMAs.
-ROLLOUT_WIDTH, LOSS_WIDTH, BUCKET_WIDTH = 5, 9, 12
+ROLLOUT_WIDTH, LOSS_WIDTH, BUCKET_WIDTH = 7, 9, 12
 RESULT_WIDTH = ROLLOUT_WIDTH + LOSS_WIDTH + BUCKET_WIDTH + 3 + 3 + 3
+# Explore-command reward: newly observed surface tiles (native coverage, 128x128 city grid), a step
+# cost, and the same failure penalty as goal episodes. No timeout penalty: exploring has no deadline.
+EXPLORE_TILE_REWARD, EXPLORE_STEP_COST, EXPLORE_FAILURE = 0.02, 0.01, 10.0
 LOSS_NAMES = ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_fraction", "grad_norm",
               "aux_saliency_loss", "aux_patch_accuracy", "aux_memory_loss")
 
@@ -49,6 +52,7 @@ class Config:
     no_gps_fraction: float = 0.0
     appearance: float = 1.0
     goal_refresh_steps: int = 0
+    explore_fraction: float = 0.0
 
     def validate(self):
         if min(self.total_steps, self.rollout_steps, self.sequence_length,
@@ -68,6 +72,8 @@ class Config:
             raise ValueError("appearance must be in [0, 1]")
         if self.goal_refresh_steps < 0:
             raise ValueError("goal_refresh_steps must be non-negative")
+        if not 0.0 <= self.explore_fraction < 1.0:
+            raise ValueError("explore_fraction must be in [0, 1)")
 
 
 def terminal_gae(rewards, values, done, gamma, lam, out=None):
@@ -97,6 +103,8 @@ class Trainer:
             raise ValueError("visual policy requires a visual encoder")
         if policy.mode != "visual" and features.visual:
             raise ValueError("non-visual policy must not own a visual encoder")
+        if (config.explore_fraction > 0) != (policy.commands > 1):
+            raise ValueError("explore episodes need a command-conditioned policy, and only they")
         self.env, self.features, self.policy, self.config = env, features, policy, config
         self.hover = torch.tensor(HOVER_ACTIONS[env.control_mode], device=env.device)
         self.optimizer = torch.optim.Adam(policy.parameters(), lr=config.learning_rate, fused=True, capturable=True)
@@ -114,6 +122,10 @@ class Trainer:
         self.success, self.collision, self.out_of_bounds, self.ended = (allocate(t, n) for _ in range(4))
         self.values, self.advantages, self.returns = allocate(t + 1, n), allocate(t, n), allocate(t, n)
         self.completed_returns = allocate(t, n)
+        self.commands = torch.zeros((t, n), dtype=torch.long, device=env.device)
+        self.command = torch.zeros(n, dtype=torch.long, device=env.device)
+        self.explore_tiles = allocate(t, n)
+        self.tiles = torch.zeros(n, device=env.device)
         self.applied = allocate(n, env.action_dim)
         self.bucket_ids = torch.arange(3, device=env.device, dtype=torch.float32)
         self.memory = torch.zeros((n, h), device=env.device)
@@ -142,16 +154,36 @@ class Trainer:
         if self.features.visual:
             self.current_cls, self.current_tokens = self.features.observe(self.env)
 
-    def _inputs(self, cls, tokens, goal, proprio, privileged, memory=None):
+    def _inputs(self, cls, tokens, goal, proprio, privileged, memory=None, command=None):
         """Use the exact goal and memory seen at collection, including any in-episode refresh."""
-        return self.policy.actor_inputs_and_features(cls, tokens, goal, proprio, privileged, memory)
+        return self.policy.actor_inputs_and_features(cls, tokens, goal, proprio, privileged, memory, command)
 
     def _memory(self, goal):
-        """Spatial-memory tick for the current observation (None without spatial memory)."""
+        """Spatial-memory tick for the current observation (None without spatial memory). Explore
+        episodes have no goal, so their frames add looked-at cells but no goal evidence."""
         if self.spatial is None:
             return None
         return observe_memory(self.policy, self.spatial, self.current_cls, self.current_tokens, goal,
-                              self.env.proprio, self.next_start)
+                              self.env.proprio, self.next_start, (self.command == GOAL_COMMAND).float())
+
+    def _sample_commands(self):
+        """New episodes explore with probability explore_fraction (GPU draw, no host decision)."""
+        if self.config.explore_fraction > 0:
+            fresh = (torch.rand(self.env.n, device=self.env.device) < self.config.explore_fraction).long()
+            self.command.copy_(torch.where(self.next_start > 0.5, fresh, self.command))
+
+    def _explore_reward(self, explore):
+        """Explore episodes: EXPLORE_TILE_REWARD per newly observed surface tile (native coverage
+        counter, terminal value on the done step), EXPLORE_STEP_COST per step, EXPLORE_FAILURE on a
+        crash or leaving the area; no goal terms. Updates the per-env tile baseline."""
+        diagnostics = self.env.episode_diagnostics
+        done = self.env.done > 0.5
+        gain = torch.where(done, diagnostics[:, 1], diagnostics[:, 0]) - self.tiles
+        failed = (self.env.collision > 0.5) | (self.env.out_of_bounds > 0.5)
+        reward = EXPLORE_TILE_REWARD * gain - EXPLORE_STEP_COST - EXPLORE_FAILURE * failed.float()
+        self.explore_tiles_now = torch.where(done & explore, diagnostics[:, 1], torch.zeros_like(gain))
+        self.tiles.copy_(diagnostics[:, 0])
+        return reward
 
     @torch.no_grad()
     def warmup(self, seed, iterations=3):
@@ -160,7 +192,7 @@ class Trainer:
         for _ in range(iterations):
             goal = self.goal_source.step(self.next_start) if self.features.visual else None
             inputs, _ = self._inputs(self.current_cls, self.current_tokens, goal,
-                                     self.env.proprio, self.env.privileged, self._memory(goal))
+                                     self.env.proprio, self.env.privileged, self._memory(goal), self.command)
             self.policy.step(inputs, self.memory, self.next_start)
             self.env.step(hover)
             self._observe()
@@ -172,6 +204,8 @@ class Trainer:
         self.memory.zero_()
         self.next_start.fill_(1)
         self.episode_return.zero_()
+        self.command.zero_()
+        self.tiles.copy_(self.env.episode_diagnostics[:, 0])
         self.env.stream.synchronize()  # Explicit initialization boundary, not collection.
 
     @torch.no_grad()
@@ -182,12 +216,17 @@ class Trainer:
         log_std = self.policy.log_std
         with gpu_range("sim.collect"):
             for t in range(length):
+                self._sample_commands()
+                self.commands[t].copy_(self.command)
+                explore = self.command == EXPLORE_COMMAND
                 self.proprio[t].copy_(self.env.proprio)
                 self.privileged[t].copy_(self.env.privileged)
                 self.starts[t].copy_(self.next_start)
                 self.hidden[t].copy_(self.memory)
                 if self.features.visual:
-                    self.rollout_goals[t].copy_(self.goal_source.step(self.next_start))
+                    # Explore episodes carry no goal: the goal input is zero.
+                    goal = self.goal_source.step(self.next_start) * (~explore).unsqueeze(-1)
+                    self.rollout_goals[t].copy_(goal)
                     self.cls[t].copy_(self.current_cls)
                     self.tokens[t].copy_(self.current_tokens)
                 memory = self._memory(self.rollout_goals[t].float() if self.features.visual else None)
@@ -197,31 +236,37 @@ class Trainer:
                 inputs, _ = self._inputs(self.cls[t] if self.features.visual else None,
                                          self.tokens[t] if self.features.visual else None,
                                          self.rollout_goals[t].float() if self.features.visual else None,
-                                         self.proprio[t], self.privileged[t], memory)
+                                         self.proprio[t], self.privileged[t], memory, self.command)
                 mean, hidden = self.policy.step(inputs, self.memory, self.next_start)
                 raw = mean + log_std.exp() * torch.randn_like(mean)
                 self.actions[t].copy_(raw)
                 self.logprobs[t].copy_(squashed_log_prob(mean, log_std, raw))
-                self.values[t].copy_(self.policy.value(self.privileged[t], self.proprio[t]))
+                self.values[t].copy_(self.policy.value(self.privileged[t], self.proprio[t], self.command))
                 self.memory.copy_(hidden)
                 # The simulator receives the squashed command; rollouts keep the pre-squash
                 # sample, whose log-probability includes the tanh Jacobian.
                 torch.tanh(raw, out=self.applied)
                 self.env.step(self.applied)
-                self.rewards[t].copy_(self.env.reward)
+                if self.config.explore_fraction > 0:
+                    reward = torch.where(explore, self._explore_reward(explore), self.env.reward)
+                    self.explore_tiles[t].copy_(self.explore_tiles_now)
+                else:
+                    reward = self.env.reward
+                self.rewards[t].copy_(reward)
                 self.done[t].copy_(self.env.done)
-                self.success[t].copy_(self.env.success)
+                # Goal success and the visibility-bucket curriculum describe goal episodes only.
+                self.success[t].copy_(self.env.success * (~explore))
                 self.collision[t].copy_(self.env.collision)
                 self.out_of_bounds[t].copy_(self.env.out_of_bounds)
-                self.ended[t].copy_(self.env.ended_bucket)
-                self.episode_return.add_(self.env.reward)
+                self.ended[t].copy_(torch.where(explore, torch.full_like(self.env.ended_bucket, -1), self.env.ended_bucket))
+                self.episode_return.add_(reward)
                 self.completed_returns[t].copy_(self.episode_return * self.env.done)
                 self.episode_return.mul_(1 - self.env.done)
                 self.next_start.copy_(self.env.done)
                 # Native returns the reset observation on completion; the next
                 # tick sees it with a reset GRU while completion flags remain old.
                 self._observe()
-            self.values[length].copy_(self.policy.value(self.env.privileged, self.env.proprio))
+            self.values[length].copy_(self.policy.value(self.env.privileged, self.env.proprio, self.command))
         self.steps += length * self.env.n
         return length
 
@@ -247,6 +292,8 @@ class Trainer:
                     proprio = self.proprio[times, env_ids]
                     privileged = self.privileged[times, env_ids]
                     length_b, batch = times.shape
+                    command = self.commands[times, env_ids]
+                    goal_rows = command.flatten(0, 1) == GOAL_COMMAND
                     if self.features.visual:
                         memory = ((self.memory_ego[times, env_ids].flatten(0, 1),
                                    self.memory_candidate[times, env_ids].flatten(0, 1))
@@ -254,15 +301,16 @@ class Trainer:
                         inputs, attended = self._inputs(self.cls[times, env_ids].flatten(0, 1),
                                                         self.tokens[times, env_ids].flatten(0, 1),
                                                         self.rollout_goals[times, env_ids].flatten(0, 1).float(),
-                                                        proprio.flatten(0, 1), privileged.flatten(0, 1), memory)
+                                                        proprio.flatten(0, 1), privileged.flatten(0, 1), memory,
+                                                        command.flatten(0, 1))
                     else:
                         inputs, attended = self._inputs(None, None, None, proprio.flatten(0, 1),
-                                                        privileged.flatten(0, 1))
+                                                        privileged.flatten(0, 1), None, command.flatten(0, 1))
                     means = self.policy.sequence(inputs.view(length_b, batch, -1),
                                                  self.hidden[first, env_ids], self.starts[times, env_ids])
                     logprobs = squashed_log_prob(means, self.policy.log_std, self.actions[times, env_ids])
                     entropy = squashed_entropy(means, self.policy.log_std)
-                    values = self.policy.value(privileged, proprio)
+                    values = self.policy.value(privileged, proprio, command)
                     logratio = logprobs - self.logprobs[times, env_ids]
                     ratio = logratio.exp()
                     adv = self.advantages[times, env_ids]
@@ -274,11 +322,11 @@ class Trainer:
                     if attended is not None:
                         aux_saliency, aux_accuracy = saliency_loss(
                             attended, privileged.flatten(0, 1), self.policy.attention.grid_h,
-                            self.policy.attention.grid_w)
+                            self.policy.attention.grid_w, goal_rows)
                     else:
                         aux_saliency = aux_accuracy = torch.zeros((), device=self.env.device)
-                    aux_memory = (self.policy.memory_loss(inputs, privileged.flatten(0, 1)) if self.spatial is not None
-                                  else torch.zeros((), device=self.env.device))
+                    aux_memory = (self.policy.memory_loss(inputs, privileged.flatten(0, 1), goal_rows.float())
+                                  if self.spatial is not None else torch.zeros((), device=self.env.device))
                     loss = (policy_loss + cfg.value_coefficient * value_loss - cfg.entropy * entropy
                             + cfg.aux_coefficient * (aux_saliency + aux_memory))
                     self.optimizer.zero_grad(set_to_none=True)
@@ -308,17 +356,20 @@ class Trainer:
     def finish_rollout(self, length, losses):
         """GPU-only end-of-rollout bookkeeping: curriculum update for the next rollout and metrics.
 
-        Returns float32 [RESULT_WIDTH] (35): rollout totals (5), PPO losses (9, see LOSS_NAMES),
-        bucket totals (12, row-major [4,3]), weights used this rollout (3), weights for the
-        next rollout (3), success EMAs (3).
+        Returns float32 [RESULT_WIDTH] (37): rollout totals (7: mean reward, completed episodes,
+        goal successes, collisions, completed returns, completed explore episodes, their terminal
+        observed tiles), PPO losses (9, see LOSS_NAMES), bucket totals (12, row-major [4,3]),
+        weights used this rollout (3), weights for the next rollout (3), success EMAs (3).
         """
         totals = self.bucket_totals(length)
         used = self.curriculum.weights.clone()
         self.curriculum.observe(totals[0], totals[1])
         self.curriculum.advance()
         self.curriculum.write(self.env)
+        explored = self.done[:length] * (self.commands[:length] == EXPLORE_COMMAND).float()
         rollout = torch.stack((self.rewards[:length].mean(), self.done[:length].sum(),
                                self.success[:length].sum(), self.collision[:length].sum(),
-                               self.completed_returns[:length].sum()))
+                               self.completed_returns[:length].sum(), explored.sum(),
+                               self.explore_tiles[:length].sum()))
         return torch.cat((rollout, losses, totals.flatten(), used,
                           self.curriculum.weights, self.curriculum.ema))

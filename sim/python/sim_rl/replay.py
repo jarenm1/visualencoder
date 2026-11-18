@@ -16,7 +16,7 @@ from .cli import (DEFAULT_LIBRARY, ROOT, TEST_SEED, TEST_STYLE, TRAIN_STYLE, VAL
 from .curriculum import UNIFORM_WEIGHTS
 from .features import RefreshedGoals, checkpoint_features, crop_goals, square_goal_box
 from .memory import CHANNELS, EGO, EGO_RADIUS, SpatialMemory, observe as observe_memory
-from .model import deterministic_action, saliency_targets
+from .model import GOAL_COMMAND, deterministic_action, saliency_targets
 from .native import DEFAULT_CITY, PRIVILEGED_WIDTH, CudaEnv
 
 # Diagnostics indices (ABI v6, width 28) recorded per frame, pre-action: pose, target centre and
@@ -165,6 +165,7 @@ def capture(args, saved, features, seed, style, no_gps_fraction, appearance, gro
             finished = torch.zeros(n, dtype=torch.bool, device=device)
             hidden = torch.zeros((n, policy.hidden_size), device=device)
             basis = None
+            goal_command = torch.full((n,), GOAL_COMMAND, dtype=torch.long, device=device)
             for t in range(horizon):
                 chunk[t % CHUNK].copy_((env.obs.clamp(0, 1) * 255).round().to(torch.uint8).permute(0, 2, 3, 1))
                 states[t, :, :len(STATE_INDEX)].copy_(env.diagnostics.index_select(1, index))
@@ -184,7 +185,7 @@ def capture(args, saved, features, seed, style, no_gps_fraction, appearance, gro
                 if memory is not None:
                     memory_maps[t].copy_((memory[0].clamp(0, 1) * 255).round().to(torch.uint8))
                 inputs, logits = policy.actor_inputs_and_features(cls, patch_tokens, goal, env.proprio,
-                                                                  env.privileged, memory)
+                                                                  env.privileged, memory, goal_command)
                 if saliency is not None:
                     saliency[t].copy_(logits.softmax(-1))
                 mean, hidden = policy.step(inputs, hidden, starts)

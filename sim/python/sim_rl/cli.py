@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 
 from .curriculum import MODES as CURRICULUM_MODES
-from .evaluation import evaluate, heuristics_for
+from .evaluation import evaluate, evaluate_explore, heuristics_for
 from .features import ARMS, GOALS, PRECISIONS, FrozenFeatures, checkpoint_features
 from .model import ActorCritic
 from .native import ABI_VERSION, CONTROL_MODES, DEFAULT_CITY, HOVER_ACTIONS, TASK, CudaEnv
@@ -66,13 +66,15 @@ def mode_of(features):
     return "visual" if features.visual else features.spec
 
 
-def build_policy(env, features, saved=None, memory_heads=None):
+def build_policy(env, features, saved=None, memory_heads=None, commands=1):
     """Visual arms attend over the frozen patch grid; the grid is height//16 x width//16.
-    ``saved`` loads a checkpoint (its recorded spatial memory included); ``memory_heads`` starts a
-    new spatial-memory policy from frozen perception heads trained on this exact encoder."""
+    ``saved`` loads a checkpoint (its recorded spatial memory and commands included); ``memory_heads``
+    starts a new spatial-memory policy from frozen perception heads trained on this exact encoder;
+    ``commands`` > 1 makes a new policy command-conditioned (goal, explore)."""
     memory = memory_heads is not None or bool(saved and saved["metadata"].get("memory"))
+    commands = saved["metadata"].get("commands", 1) if saved is not None else commands
     policy = ActorCritic(mode_of(features), features.dim, features.goal_dim, env.height // 16, env.width // 16,
-                         env.action_dim, features.goal, memory).to(env.device)
+                         env.action_dim, features.goal, memory, commands).to(env.device)
     if memory_heads is not None:
         policy.perception.load_state_dict(load_heads(memory_heads, features, env.device).state_dict())
     if saved is not None:
@@ -108,7 +110,12 @@ def training_settings(args):
             "aux_coefficient": args.aux_coefficient, "appearance": args.appearance,
             "goal_refresh_steps": args.goal_refresh_steps,
             "goal_box_source": "simulator" if args.goal_refresh_steps else None,
-            "start_distance": args.start_distance, "memory": memory}
+            "start_distance": args.start_distance, "memory": memory,
+            "explore_fraction": args.explore_fraction, "commands": commands_of(args)}
+
+
+def commands_of(args):
+    return 2 if args.explore_fraction > 0 else 1
 
 
 def checkpoint(policy, metadata, steps):
@@ -164,7 +171,7 @@ def make_config(args):
                   value_coefficient=args.value_coefficient, max_grad_norm=args.max_grad_norm,
                   curriculum=args.curriculum, aux_coefficient=args.aux_coefficient,
                   no_gps_fraction=args.no_gps_fraction, appearance=args.appearance,
-                  goal_refresh_steps=args.goal_refresh_steps)
+                  goal_refresh_steps=args.goal_refresh_steps, explore_fraction=args.explore_fraction)
 
 
 def open_env(args, n, seed, style):
@@ -233,6 +240,8 @@ def training_record(steps, elapsed, values):
         "reward_mean": values[0], "completed_episodes": completed,
         "success": values[2], "collision": values[3],
         "episode_return": values[4] / completed if completed else None,
+        "explore_completed": values[5],
+        "explore_tiles_mean": values[6] / values[5] if values[5] else None,
         **dict(zip(LOSS_NAMES, values[LOSS_AT:BUCKET_AT])),
         "bucket_completed": values[BUCKET_AT:BUCKET_AT + 3],
         "bucket_success": values[BUCKET_AT + 3:BUCKET_AT + 6],
@@ -257,7 +266,7 @@ def train_command(args, started):
     with open_env(args, args.num_envs, args.seed, TRAIN_STYLE) as env, \
             open_env(args, args.eval_envs, VALIDATION_SEED, VALIDATION_STYLE) as validation_env:
         with env.execution():
-            policy = build_policy(env, features, memory_heads=args.memory_heads)
+            policy = build_policy(env, features, memory_heads=args.memory_heads, commands=commands_of(args))
             trainer = Trainer(env, features, policy, config)
             trainer.warmup(args.seed)
             metadata = provenance(env, features, training_settings(args))
@@ -267,6 +276,8 @@ def train_command(args, started):
                 policy.eval()
                 result = gps_modes(validation_env, features, policy, VALIDATION_SEED, heuristics=False,
                                    goal_refresh_steps=config.goal_refresh_steps)
+                if policy.commands > 1:
+                    result["explore"] = evaluate_explore(validation_env, features, policy, VALIDATION_SEED)
                 policy.train()
             result["selection_success"] = selection_success(result, config)
             return result
@@ -413,6 +424,11 @@ def confusion_probe_command(args, started):
     confusion_probe(args)
 
 
+def count_eval_command(args, started):
+    from .counting import count_eval_command as run
+    run(args, started)
+
+
 def perception_command(args, started):
     from .perception import perception_command as run
     run(args, started)
@@ -464,7 +480,7 @@ def benchmark_command(args, started):
         config = make_config(args)
         with open_env(args, n, args.seed, TRAIN_STYLE) as env:
             with env.execution():
-                policy = build_policy(env, features, memory_heads=args.memory_heads)
+                policy = build_policy(env, features, memory_heads=args.memory_heads, commands=commands_of(args))
                 trainer = Trainer(env, features, policy, config)
                 trainer.warmup(args.seed)
                 hover = torch.tensor(HOVER_ACTIONS[env.control_mode], device=env.device).expand(n, -1).contiguous()
@@ -486,7 +502,7 @@ def profile_command(args, started):
     config = make_config(args)
     with open_env(args, args.num_envs, args.seed, TRAIN_STYLE) as env:
         with env.execution():
-            policy = build_policy(env, features, memory_heads=args.memory_heads)
+            policy = build_policy(env, features, memory_heads=args.memory_heads, commands=commands_of(args))
             trainer = Trainer(env, features, policy, config)
             trainer.warmup(args.seed)
             result = capture(trainer, args.out, args.iterations)
@@ -500,7 +516,7 @@ def memory_check_command(args, started):
     allocated = []
     with open_env(args, args.num_envs, args.seed, TRAIN_STYLE) as env:
         with env.execution():
-            policy = build_policy(env, features, memory_heads=args.memory_heads)
+            policy = build_policy(env, features, memory_heads=args.memory_heads, commands=commands_of(args))
             trainer = Trainer(env, features, policy, config)
             trainer.warmup(args.seed)
             for _ in range(args.repeats):
@@ -547,6 +563,9 @@ def add_learner(parser):
     add_precision(parser)
     parser.add_argument("--memory-heads", type=Path,
                         help="perception heads (train.py perception) for this encoder: enables the spatial memory")
+    parser.add_argument("--explore-fraction", type=float, default=DEFAULTS.explore_fraction,
+                        help="fraction of training episodes given the explore command (coverage reward) "
+                             "instead of the goal; > 0 makes the policy command-conditioned")
     parser.add_argument("--curriculum", choices=CURRICULUM_MODES, default="adaptive")
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--no-gps-fraction", type=float, default=DEFAULTS.no_gps_fraction,
@@ -669,6 +688,19 @@ def parser():
     perception.add_argument("--learning-rate", type=float, default=2e-3)
     perception.add_argument("--out", type=Path, required=True)
     perception.set_defaults(func=perception_command)
+
+    counting = commands.add_parser("count-eval", help="count cars seen on exploratory flights (perception + memory)")
+    add_native(counting)
+    add_precision(counting)
+    counting.add_argument("--encoder", default="mean")
+    counting.add_argument("--heads", type=Path, required=True, help="perception heads for --encoder")
+    counting.add_argument("--num-envs", type=int, default=64)
+    counting.add_argument("--rounds", type=int, default=4, help="flights per environment (fresh resets)")
+    counting.add_argument("--steps", type=int, default=600, help="control steps per flight (30 per second)")
+    counting.add_argument("--start-distance", type=float, nargs=2, default=[8.0, 60.0], metavar=("MIN", "MAX"))
+    counting.add_argument("--appearance", type=float, default=1.0)
+    counting.add_argument("--out", type=Path, required=True)
+    counting.set_defaults(func=count_eval_command)
 
     cohorts = commands.add_parser("eval-cohorts", help="paired fixed-goal hidden and far-target evaluations")
     add_native(cohorts)

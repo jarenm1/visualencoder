@@ -6,7 +6,7 @@ import torch
 from .curriculum import BUCKETS, UNIFORM_WEIGHTS
 from .features import RefreshedGoals
 from .memory import SpatialMemory, observe as observe_memory
-from .model import deterministic_action
+from .model import EXPLORE_COMMAND, GOAL_COMMAND, deterministic_action
 from .native import HOVER_ACTIONS
 from .ppo import gpu_range
 from .stats import wilson
@@ -100,6 +100,7 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
     spatial = (SpatialMemory(n, env.height // 16, env.width // 16, env.metadata["camera"], device)
                if policy is not None and policy.spatial else None)
     hover = torch.tensor(HOVER_ACTIONS[env.control_mode], device=device).expand(n, -1)
+    goal_command = torch.full((n,), GOAL_COMMAND, dtype=torch.long, device=device)
     generator = torch.Generator(device=device).manual_seed(seed)
     if policy is not None:
         policy.eval()
@@ -112,7 +113,8 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
                 goal = goal_source.step(starts) if goal_source is not None else None
                 memory = (observe_memory(policy, spatial, cls, tokens, goal, env.proprio, starts)
                           if spatial is not None else None)
-                inputs, _ = policy.actor_inputs_and_features(cls, tokens, goal, env.proprio, env.privileged, memory)
+                inputs, _ = policy.actor_inputs_and_features(cls, tokens, goal, env.proprio, env.privileged, memory,
+                                                             goal_command)
                 mean, hidden = policy.step(inputs, hidden, starts)
                 actions.copy_(deterministic_action(mean))
             elif heuristic == "hover":
@@ -183,6 +185,43 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
     result["classes"] = {name: {"episodes": round(count), "success": hits / count if count else None}
                          for name, count, hits in zip(env.target_classes, *class_table.cpu().tolist())}
     return result
+
+
+@torch.no_grad()
+def evaluate_explore(env, features, policy, seed=0, appearance=1.0, no_gps=1.0):
+    """Deterministic policy under the explore command (no goal) for one reset of the horizon: surface
+    tiles observed by each environment's first episode (native coverage), and how it ended."""
+    n, device = env.n, env.device
+    env.write_curriculum(torch.tensor(UNIFORM_WEIGHTS + (no_gps, appearance), device=device, dtype=torch.float32))
+    env.reset(seed)
+    spatial = (SpatialMemory(n, env.height // 16, env.width // 16, env.metadata["camera"], device)
+               if policy.spatial else None)
+    command = torch.full((n,), EXPLORE_COMMAND, dtype=torch.long, device=device)
+    goal = torch.zeros((n, features.goal_dim), device=device) if features.visual else None
+    no_goal = torch.zeros(n, device=device)
+    starts, active = torch.ones(n, device=device), torch.ones(n, device=device)
+    hidden = torch.zeros((n, policy.hidden_size), device=device)
+    tiles, crashed, left, steps = (torch.zeros(n, device=device) for _ in range(4))
+    policy.eval()
+    with gpu_range("sim.evaluate_explore"):
+        for _ in range(env.horizon):
+            cls, tokens = features.observe(env) if features.visual else (None, None)
+            memory = (observe_memory(policy, spatial, cls, tokens, goal, env.proprio, starts, no_goal)
+                      if spatial is not None else None)
+            inputs, _ = policy.actor_inputs_and_features(cls, tokens, goal, env.proprio, env.privileged, memory, command)
+            mean, hidden = policy.step(inputs, hidden, starts)
+            env.step(deterministic_action(mean).contiguous())
+            finished = active * env.done
+            steps.add_(active)
+            tiles.add_(finished * env.episode_diagnostics[:, 1])
+            crashed.add_(finished * env.collision)
+            left.add_(finished * env.out_of_bounds * (1 - env.collision))
+            active.mul_(1 - env.done)
+            starts.copy_(env.done)
+    env.stream.synchronize()  # Explicit evaluation end-batch boundary.
+    return {"episodes": n, "mean_observed_tiles": float(tiles.mean()), "collision": float(crashed.mean()),
+            "out_of_bounds": float(left.mean()), "mean_steps": float(steps.mean()), "no_gps_fraction": no_gps,
+            "appearance": appearance}
 
 
 def _aggregate(cells, buckets, landed):

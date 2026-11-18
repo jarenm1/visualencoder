@@ -31,20 +31,24 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "sim/python"), str(ROOT / "src")]
 
-from gemma_goal import MATCH_IOU, iou, project_boxes, start_camera  # noqa: E402
+from agent import Agent, summarize  # noqa: E402
+from gemma_goal import MATCH_IOU, detect, iou, project_boxes, start_camera  # noqa: E402
 from sim_rl.cli import (DEFAULT_LIBRARY, TEST_STYLE, build_policy, load_checkpoint,  # noqa: E402
                         validate_checkpoint)
 from sim_rl.curriculum import UNIFORM_WEIGHTS  # noqa: E402
 from sim_rl.features import checkpoint_features, crop_goals, square_goal_box  # noqa: E402
 from sim_rl.memory import CELL, GRID, SpatialMemory, observe as observe_memory  # noqa: E402
-from sim_rl.model import deterministic_action  # noqa: E402
+from sim_rl.model import EXPLORE_COMMAND, GOAL_COMMAND, deterministic_action  # noqa: E402
 from sim_rl.native import CudaEnv  # noqa: E402
+from sim_rl.perception import CLASSES  # noqa: E402
+from sim_rl.tracks import CLASS_THRESHOLD, ObjectTracks  # noqa: E402
 
 PAGE = ROOT / "sim/live"
 PAGES = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
          "/style.css": ("style.css", "text/css; charset=utf-8")}
 TARGET_CLASSES = ("building", "vehicle", "vegetation", "prop")
 MEMORY_IMAGE_EVERY = 6           # control ticks between spatial-memory map images (5 Hz at 30 Hz)
+VEHICLE = CLASSES.index("vehicle")
 
 
 def jpeg(image):
@@ -100,9 +104,12 @@ class Pilot:
             self.policy.eval()
             self.hidden = torch.zeros((1, self.policy.hidden_size), device=self.device)
             self.starts = torch.ones(1, device=self.device)
+            self.command = torch.full((1,), GOAL_COMMAND, dtype=torch.long, device=self.device)
             self.spatial = (SpatialMemory(1, self.env.height // 16, self.env.width // 16, self.env.metadata["camera"],
                                           self.device) if self.policy.spatial else None)
+            self.tracks = ObjectTracks(1, self.device) if self.spatial is not None else None
             self.memory_image, self.memory_info = b"", None
+            self.agent, self.agent_info, self.steps = None, None, 0
             self.lanes = torch.tensor(UNIFORM_WEIGHTS + (0.0, args.appearance), device=self.device)
             self.env.write_curriculum(self.lanes)
             self.env.set_free_flight(True)
@@ -111,6 +118,9 @@ class Pilot:
     # --- episode and goal management (simulator thread only) -------------------------------
     def new_episode(self, seed):
         self.env.reset(seed)
+        self.starts.fill_(1)   # fresh recurrent state, memory map and car tracks
+        self.agent = None
+        self.command.fill_(GOAL_COMMAND)
         self.catalog_goal()
 
     def catalog_goal(self):
@@ -120,8 +130,12 @@ class Pilot:
         self.set_goal(crop, "catalog goal")
 
     def set_goal(self, crop, source, box=None, match_iou=None):
+        """A new goal resets the recurrent state and the old goal's map evidence; what the drone has
+        looked at and the car tracks stay."""
         self.goal = self.features.goal_embedding(crop)
-        self.starts.fill_(1)
+        self.hidden.zero_()
+        if self.spatial is not None:
+            self.spatial.map[:, 0].zero_()
         self.goal_revision += 1
         self.goal_started = time.monotonic()
         d = self.env.diagnostics[0].cpu().numpy()
@@ -152,15 +166,51 @@ class Pilot:
         self.set_goal(crop, f"{source}: {self.objects['asset'][best]}", box=box, match_iou=round(float(overlap[best]), 3))
 
     def instruct(self, text):
+        """With a spatial-memory policy, the instruction starts the Gemma agent (agent.py), which plans
+        over the memory; otherwise Gemma boxes the instructed object in the current frame once."""
         if self.gemma is None:
             raise RuntimeError("start live.py with --gemma to use text instructions")
-        from gemma_goal import detect
+        if self.spatial is not None:
+            self.agent = Agent(text, self.gemma, self.policy.commands > 1)
+            return
         model, processor = self.gemma
-        frame = (self.env.obs[0].clamp(0, 1) * 255).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy()
-        box, answer, latency = detect(model, processor, Image.fromarray(frame), text)
+        box, answer, latency = detect(model, processor, Image.fromarray(self.camera_frame()), text)
         if box is None:
             raise RuntimeError(f"Gemma does not see \"{text}\" in this view ({latency:.1f} s)")
         self.box_goal(box, f"\"{text}\" ({latency:.1f} s)")
+
+    def camera_frame(self):
+        return (self.env.obs[0].clamp(0, 1) * 255).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy()
+
+    def explore(self):
+        """Explore command: no goal; the memory keeps what was seen."""
+        self.command.fill_(EXPLORE_COMMAND)
+        self.goal = torch.zeros_like(self.goal)
+        self.hidden.zero_()
+        with self.lock:
+            self.goal_info = {**self.goal_info, "source": "explore", "revision": self.goal_revision}
+
+    def think(self, skill_ended):
+        """Agent planning step (simulated time waits while Gemma answers)."""
+        agent = self.agent
+        skill = "explore" if int(self.command[0]) == EXPLORE_COMMAND else self.goal_info.get("source", "goal")
+        summary = summarize(self.spatial, self.tracks, agent.elapsed(self.steps), skill)
+        action, text, latency = agent.plan(self.steps, Image.fromarray(self.camera_frame()), summary)
+        note = f"{latency:.1f} s"
+        if action is None:
+            note += f", unparsed: {text[:120]}"
+        elif action["action"] == "explore":
+            self.explore()
+        elif action["action"] == "go":
+            try:
+                self.command.fill_(GOAL_COMMAND)
+                self.box_goal(action["box"], f"agent: {action['label']}")
+            except RuntimeError as error:
+                note += f", {error}"
+        with self.lock:
+            self.agent_info = {"instruction": agent.instruction, "action": action, "note": note,
+                               "answer": agent.answer, "summary": summary,
+                               "history": [h["action"] for h in agent.history][-8:]}
 
     def handle(self, request):
         kind, payload = request
@@ -189,7 +239,7 @@ class Pilot:
         else:
             memory = self.remember(cls, tokens) if self.spatial is not None else None
             inputs, logits = self.policy.actor_inputs_and_features(cls, tokens, self.goal, self.env.proprio,
-                                                                   self.env.privileged, memory)
+                                                                   self.env.privileged, memory, self.command)
         probs = logits.softmax(-1)[0]
         frame = jpeg(self.env.obs[0])
         privileged = self.env.privileged[0].cpu().numpy()
@@ -202,6 +252,7 @@ class Pilot:
         mean, self.hidden = self.policy.step(inputs, self.hidden, self.starts)
         action = deterministic_action(mean).contiguous()
         self.env.step(action)
+        self.steps += 1
         self.starts.copy_(self.env.done)
         outcome = None
         if bool(self.env.success[0] > 0.5):
@@ -211,7 +262,11 @@ class Pilot:
         self.publish(frame, privileged, diagnostics, peak, in_view, outcome, action[0].tolist())
         if bool(self.env.done[0] > 0.5):
             # Publish the pre-action frame with its own goal before adopting the reset episode.
+            self.agent = None
+            self.command.fill_(GOAL_COMMAND)
             self.catalog_goal()
+        elif self.agent is not None and self.agent.due(self.steps, outcome == "success"):
+            self.think(outcome == "success")
 
     def remember(self, cls, tokens):
         """Spatial-memory tick; the map image for the viewer is refreshed every MEMORY_IMAGE_EVERY ticks.
@@ -223,7 +278,12 @@ class Pilot:
             self.memory_info = {"origin": [float(d[0]), float(d[2])],
                                 "forward": (forward / max(np.linalg.norm(forward), 1e-6)).round(5).tolist(),
                                 "cell_m": CELL, "grid": GRID, "revision": 0}
-        memory = observe_memory(self.policy, self.spatial, cls, tokens, self.goal, self.env.proprio, self.starts)
+        memory = observe_memory(self.policy, self.spatial, cls, tokens, self.goal, self.env.proprio, self.starts,
+                                (self.command == GOAL_COMMAND).float())
+        self.tracks.reset(self.starts)
+        ranges = (self.spatial.points - self.spatial.position[:, None]).norm(dim=-1)
+        cars = (self.spatial.classes[..., VEHICLE] >= CLASS_THRESHOLD) & (self.spatial.depth > 0)
+        self.tracks.update(self.spatial.points, ranges, cars)
         if self.frame_id % MEMORY_IMAGE_EVERY == 0:
             evidence, seen = self.spatial.map[0].clamp(0, 1).cpu().numpy()
             rgba = np.zeros((GRID, GRID, 4), dtype=np.uint8)
@@ -267,7 +327,7 @@ class Pilot:
                 "action": None if action is None else [round(a, 2) for a in action],
                 "goal": {**self.goal_info, "age_s": round(time.monotonic() - self.goal_started, 1)},
                 "checkpoint": self.checkpoint, "last_outcome": self.last_outcome,
-                "gemma": self.gemma is not None, "memory": self.memory_info,
+                "gemma": self.gemma is not None, "memory": self.memory_info, "agent": self.agent_info,
             }
 
     def run(self):

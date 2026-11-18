@@ -70,6 +70,7 @@ class SpatialMemory:
         along = (offset * forward[:, None]).sum(-1, keepdim=True)
         across = (offset * right[:, None]).sum(-1, keepdim=True)
         reach = along * heading[:, None] + across * side[:, None]               # [n, P, 2]
+        self.points = self.position[:, None] + reach                            # this frame's patch hits
         points = self.position[:, None, None] + self.fractions[None, None, :, None] * reach[:, :, None]
         values = torch.where(self.fractions == 1.0, evidence[..., None], torch.zeros_like(evidence[..., None]))
         cells = (points / CELL).floor().long() + GRID // 2                      # [n, P, S, 2]
@@ -101,14 +102,24 @@ class SpatialMemory:
         present = (value >= CANDIDATE_FLOOR).float()
         return torch.cat((rows / EGO_RADIUS, value[:, None]), -1) * present[:, None]
 
+    def relative(self, env, point):
+        """(forward, right) metres from environment ``env``'s drone to a memory-frame ``point`` [2]."""
+        offset = point - self.position[env]
+        c, s = float(self.yaw[env].cos()), float(self.yaw[env].sin())
+        return float(offset[0] * c + offset[1] * s), float(offset[0] * s - offset[1] * c)
+
 
 @torch.no_grad()
-def observe(policy, memory, cls, tokens, goal, proprio, starts):
+def observe(policy, memory, cls, tokens, goal, proprio, starts, goal_mask=None):
     """One memory tick before the actor acts: reset finished episodes, project this frame, and
-    return the actor's memory inputs (ego crop, candidate)."""
+    return the actor's memory inputs (ego crop, candidate). ``goal_mask`` [n] zeroes the goal
+    evidence of environments without a goal (explore commands)."""
     memory.reset(starts)
     _, logits = policy.attention(goal, cls, tokens)
     evidence = torch.sigmoid(logits[:, :-1] - logits[:, -1:])
-    depth, _ = policy.perception.predict(tokens, ground_prior(proprio, memory.rays))
+    if goal_mask is not None:
+        evidence = evidence * goal_mask[:, None]
+    depth, memory.classes = policy.perception.predict(tokens, ground_prior(proprio, memory.rays))
     memory.update(proprio, depth, evidence)
+    memory.depth = depth
     return memory.ego(), memory.candidate()

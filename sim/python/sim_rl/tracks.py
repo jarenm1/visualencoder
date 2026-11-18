@@ -100,3 +100,8 @@ class ObjectTracks:
         """[n] confirmed tracks per environment."""
         slots = torch.arange(CAPACITY, device=self.device)[None] < self.used[:, None]
         return ((self.hits >= CONFIRM_HITS) & slots).sum(-1)
+
+    def confirmed(self, env):
+        """Memory-frame positions [2] of environment ``env``'s confirmed tracks."""
+        used = int(self.used[env])
+        return [self.position[env, k] for k in range(used) if float(self.hits[env, k]) >= CONFIRM_HITS]
