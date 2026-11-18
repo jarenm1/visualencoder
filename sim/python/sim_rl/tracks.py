@@ -5,8 +5,10 @@ Each frame, patches the perception head calls a given class (P >= ``CLASS_THRESH
 depth, dead-reckoned pose), then merged: patches of one object in one frame join within
 ``FRAME_MERGE_M`` (clusters of fewer than ``MIN_PATCHES`` are dropped); each frame cluster then
 updates the nearest track within its association gate or starts a new one. Monocular range error
-grows with distance, so the gate is
-``GATE_M + GATE_PER_M * range`` and observations update a track with weight 1 / range. After each
+grows with distance, so the gate is ``GATE_M + GATE_PER_M * range`` with the larger of the
+observation's range and the track's effective range (harmonic mean of its observations' ranges, so
+a car first placed from far away still accepts a precise near sighting), and observations update a
+track with weight 1 / range. After each
 frame, tracks closer than ``GATE_M`` merge. A track counts once seen in ``CONFIRM_HITS`` frames, so a
 single misclassified patch does not count. Counting is a query on these tracks (``count``), not a
 flight behaviour.
@@ -62,8 +64,9 @@ class ObjectTracks:
         used, weight = int(self.used[env]), 1.0 / max(reach, 1.0)
         if used:
             distance = (self.position[env, :used] - centre).norm(dim=-1)
+            spread = torch.clamp(self.hits[env, :used] / self.weight[env, :used].clamp_min(1e-6), min=reach)
             best = int(distance.argmin())
-            if float(distance[best]) <= GATE_M + GATE_PER_M * reach:
+            if float(distance[best]) <= GATE_M + GATE_PER_M * float(spread[best]):
                 total = self.weight[env, best] + weight
                 self.position[env, best] = (self.position[env, best] * self.weight[env, best] + centre * weight) / total
                 self.weight[env, best] = total
