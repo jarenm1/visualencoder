@@ -427,7 +427,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--checkpoint", type=Path, default=ROOT / "runs/drone9-mean-patch-seed0/best.pt")
+    parser.add_argument("--checkpoint", type=Path, default=ROOT / "runs/drone11-v4-memory-explore-seed0/best.pt")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8790)
     parser.add_argument("--hz", type=float, default=30.0, help="control rate of the live loop (30 = real time)")

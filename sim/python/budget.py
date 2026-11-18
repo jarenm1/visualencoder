@@ -4,8 +4,8 @@ Loads each component in order on one GPU and records the device memory this proc
 per-process usage, so TensorRT engines count and other GPU users do not) plus the PyTorch peak
 while it runs one control step or one Gemma answer. The goal is that the whole stack fits in 8 GB.
 
-    nix develop path:sim --command .venv/bin/python sim/python/budget.py \
-        --checkpoint runs/drone9-mean-patch-seed0/best.pt --out reports/budget.json
+    nix develop path:sim --command .venv/bin/python sim/python/budget.py --quantize \
+        --checkpoint runs/drone11-v4-memory-explore-seed0/best.pt --out reports/budget-4bit.json
 """
 from __future__ import annotations
 
