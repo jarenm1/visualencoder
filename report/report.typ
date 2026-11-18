@@ -23,6 +23,8 @@
   bootstrap intervals expose uncertainty, with only seven validation videos. A separate Vulkan/NVIDIA Rust CUDA
   pipeline trains frozen-encoder recurrent policies within an hour, but an actual-city pilot remains below
   80% success; neither convergence nor an encoder-ranking advantage is established. INT8 preserves measured probe scores, but embedded-device latency is unmeasured.
+  For goal-object search, how the goal is matched against frame patches matters more than the encoder: patch-level
+  matching lifts every frozen encoder and closes the apparent student-over-teacher advantage.
 ]
 
 = Introduction
@@ -36,6 +38,7 @@ needed to get there. Our contributions:
 + Paired-target distillation compared against pretrained encoders and standard distillation.
 + Unlabelled-real adaptation evaluated with car AP and whole-video uncertainty, not AUROC alone.
 + A GPU-owned control pipeline with timed PPO, blind/privileged controls and a separate INT8 probe check.
++ A mined-confusion goal-matching benchmark comparing single-vector and patch-level goal matching across encoders.
 
 = Methodology
 
@@ -193,6 +196,10 @@ same geometry for GPU collision. Its paired-student policy succeeds on 84/128 he
 3.00M transitions in 50.05 minutes, versus 0/128 for each blind heuristic. It does not meet the 80% target.
 Matched learned proprioception-only control scores 0/128, while privileged waypoint state reaches 127/128.
 This separate pilot uses goal-facing, altitude-stabilized kinematic control, not rotor flight; details are in the supplement.
+
+#include "goal-matching.typ"
+
+#include "onboard.typ"
 
 = Conclusion
 In the original fixed-city benchmark, paired-view targets improve every measured novel-appearance readout.
