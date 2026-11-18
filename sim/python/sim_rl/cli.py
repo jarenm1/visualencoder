@@ -198,16 +198,18 @@ def make_config(args):
 
 
 def open_env(args, n, seed, style):
-    """The training split simulates ``--city`` plus any ``--train-cities`` (a CityPool). With train
-    cities, validation also uses the per-city catalogue so the goal tables fit beside the pool
-    (the final test keeps the full catalogue)."""
+    """The training split simulates ``--city`` plus any ``--train-cities`` (a CityPool). Validation
+    uses ``--validation-catalog-size`` (or, with train cities, the per-city catalogue) so its goal
+    table fits beside training; the final test keeps the full catalogue."""
     start = getattr(args, "start_distance", None)
     start = tuple(start) if start else None
     cities = getattr(args, "train_cities", None)
     if style == TRAIN_STYLE and cities:
         return CityPool(args.library, n, seed, args.width, args.height, style, args.control,
                         (args.city, *cities), start_distance=start, catalog_size=args.city_catalog_size)
-    catalog = args.city_catalog_size if style == VALIDATION_STYLE and cities else None
+    catalog = None
+    if style == VALIDATION_STYLE:
+        catalog = getattr(args, "validation_catalog_size", None) or (args.city_catalog_size if cities else None)
     return CudaEnv(args.library, n, seed, args.width, args.height, style, args.control, args.city,
                    start_distance=start, catalog_size=catalog)
 
@@ -718,6 +720,8 @@ def add_learner(parser):
     parser.add_argument("--city-catalog-size", type=int, default=16384,
                         help="episode catalogue per city with --train-cities (each city's goal table is "
                              "catalogue x goal_dim bf16; 65536 is 2.3 GiB)")
+    parser.add_argument("--validation-catalog-size", type=int,
+                        help="validation episode catalogue (default: the native 65536; a 16384 one saves 1.7 GiB)")
     parser.add_argument("--curriculum", choices=CURRICULUM_MODES, default="adaptive")
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--no-gps-fraction", type=float, default=DEFAULTS.no_gps_fraction,
