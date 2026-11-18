@@ -133,12 +133,15 @@ def train(args):
                                              target_modules=r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"))
     model.print_trainable_parameters()
     rows = load(args.out / "train")
+    visible, absent = [row for row in rows if row["box"]], [row for row in rows if not row["box"]]
     rng = random.Random(args.seed)
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.learning_rate)
     model.train()
-    log = (args.out / "train-log.jsonl").open("w")
+    log = (args.out / f"{args.adapter}-log.jsonl").open("w")
     for step in range(args.steps):
-        row = rng.choice(rows)
+        # Absent examples at --absent-fraction: at 0.5 the first adapter learned to decline half of
+        # the visible targets.
+        row = rng.choice(absent if rng.random() < args.absent_fraction else visible)
         image = Image.open(args.out / "train" / row["image"]).convert("RGB")
         messages = [{"role": "user", "content": [{"type": "image", "image": image},
                                                  {"type": "text", "text": prompt(row["instruction"])}]}]
@@ -161,7 +164,7 @@ def train(args):
             log.write(json.dumps({"step": step, "loss": float(loss)}) + "\n")
             log.flush()
             print(json.dumps({"step": step, "loss": round(float(loss), 4)}), flush=True)
-    model.save_pretrained(args.out / "lora")
+    model.save_pretrained(args.out / args.adapter)
 
 
 def evaluate(args):
@@ -170,10 +173,10 @@ def evaluate(args):
     model = load_gemma(args.model, args.quantize)
     rows = load(args.out / "test")[:args.eval_examples]
     results = {}
-    for name in ("base", "lora"):
-        if name == "lora":
+    for name in ("base", args.adapter):
+        if name != "base":
             from peft import PeftModel
-            model = PeftModel.from_pretrained(model, args.out / "lora").eval()
+            model = PeftModel.from_pretrained(model, args.out / name).eval()
         hits = boxed = false_box = visible = absent = 0
         for row in rows:
             image = Image.open(args.out / "test" / row["image"]).convert("RGB")
@@ -189,7 +192,7 @@ def evaluate(args):
         results[name] = {"visible": visible, "visible_hit": hits / max(visible, 1), "visible_boxed": boxed / max(visible, 1),
                          "absent": absent, "absent_false_box": false_box / max(absent, 1)}
         print(json.dumps({name: results[name]}), flush=True)
-    (args.out / "eval.json").write_text(json.dumps(results, indent=2) + "\n")
+    (args.out / f"eval-{args.adapter}.json").write_text(json.dumps(results, indent=2) + "\n")
 
 
 def main():
@@ -198,6 +201,8 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--model", default="google/gemma-4-E4B-it")
     parser.add_argument("--quantize", action="store_true", help="4-bit NF4 base model (QLoRA when training)")
+    parser.add_argument("--adapter", default="lora", help="adapter directory name under --out")
+    parser.add_argument("--absent-fraction", type=float, default=0.25, help="share of 'not visible' training examples")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-envs", type=int, default=32)
     parser.add_argument("--stride", type=int, default=20)

@@ -25,7 +25,8 @@ sys.path[:0] = [str(ROOT / "sim/python"), str(ROOT / "src")]
 from gemma_goal import detect, load_gemma  # noqa: E402
 from sim_rl.cli import load_checkpoint  # noqa: E402
 from sim_rl.features import checkpoint_features  # noqa: E402
-from sim_rl.model import ActorCritic  # noqa: E402
+from sim_rl.memory import SpatialMemory, observe as observe_memory  # noqa: E402
+from sim_rl.model import GOAL_COMMAND, ActorCritic  # noqa: E402
 from sim_rl.native import PRIVILEGED_WIDTH, PROPRIO_WIDTH  # noqa: E402
 
 GIB = 1024 ** 3
@@ -74,14 +75,22 @@ def main():
     goal = features.goal_embedding(frame)
     ledger.add(f"encoder {meta['encoder']} ({meta['preprocessing'].split('/')[2]})")
 
-    policy = ActorCritic("visual", features.dim, features.goal_dim, meta["height"] // 16, meta["width"] // 16,
-                         meta["action_dim"], features.goal).to(device).eval()
+    grid_h, grid_w = meta["height"] // 16, meta["width"] // 16
+    policy = ActorCritic("visual", features.dim, features.goal_dim, grid_h, grid_w, meta["action_dim"], features.goal,
+                         bool(meta.get("memory")), meta.get("commands", 1)).to(device).eval()
     policy.load_state_dict(saved["model"])
-    hidden = torch.zeros(1, policy.hidden_size, device=device)
-    inputs, _ = policy.actor_inputs_and_features(cls, tokens, goal, torch.zeros(1, PROPRIO_WIDTH, device=device),
-                                                 torch.zeros(1, PRIVILEGED_WIDTH, device=device))
-    policy.step(inputs, hidden, torch.ones(1, device=device))
-    ledger.add(f"policy ({sum(p.numel() for p in policy.parameters()) / 1e6:.2f}M parameters, goal {features.goal})")
+    proprio = torch.zeros(1, PROPRIO_WIDTH, device=device)
+    proprio[:, 1] = -1.0   # level gravity
+    starts, command = torch.ones(1, device=device), torch.full((1,), GOAL_COMMAND, device=device)
+    memory = None
+    if policy.spatial:
+        spatial = SpatialMemory(1, grid_h, grid_w, meta["native_task_contract"]["camera"], device)
+        memory = observe_memory(policy, spatial, cls, tokens, goal, proprio, starts)
+    inputs, _ = policy.actor_inputs_and_features(cls, tokens, goal, proprio, torch.zeros(1, PRIVILEGED_WIDTH, device=device),
+                                                 memory, command)
+    policy.step(inputs, torch.zeros(1, policy.hidden_size, device=device), starts)
+    ledger.add(f"policy ({sum(p.numel() for p in policy.parameters()) / 1e6:.2f}M parameters, goal {features.goal}"
+               + (", spatial memory and perception heads" if policy.spatial else "") + ")")
 
     from transformers import AutoProcessor
     processor = AutoProcessor.from_pretrained(args.model)
