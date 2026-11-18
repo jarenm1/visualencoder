@@ -196,8 +196,11 @@ def open_env(args, n, seed, style):
 
 
 def open_env_checkpoint(args, metadata, seed, style):
+    """Evaluation env for a checkpoint: its image size and control mode, and its training start
+    distances unless ``--start-distance`` overrides them."""
+    start = getattr(args, "start_distance", None) or metadata.get("start_distance")
     return CudaEnv(args.library, args.eval_envs, seed, metadata["width"], metadata["height"], style,
-                   metadata["control_mode"], args.city)
+                   metadata["control_mode"], args.city, start_distance=tuple(start) if start else None)
 
 
 def check_episodes(result):
@@ -660,6 +663,8 @@ def parser():
     evaluation.add_argument("--checkpoint", type=Path, required=True)
     evaluation.add_argument("--split", choices=("validation", "test"), default="test")
     evaluation.add_argument("--eval-envs", type=int, default=384)
+    evaluation.add_argument("--start-distance", type=float, nargs=2, metavar=("MIN", "MAX"),
+                            help="start distance range (default: the checkpoint's training range)")
     evaluation.add_argument("--out", type=Path)
     evaluation.set_defaults(func=eval_command)
 
