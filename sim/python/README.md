@@ -220,6 +220,18 @@ Fresh seed-0 visual policy with spatial memory, patch goal, TensorRT FP16 `mean`
 
 Held-out test of `best.pt` (256 episodes per mode, 8–60 m): **16.4% with GPS, 15.2% without**. After 2M, training success kept rising (52% EMA on visible starts) while validation fell and collisions rose: the policy overfits the training districts' obstacles. The no-memory ablation with identical settings is `runs/drone10-v4-nomem-seed0`.
 
+### Memory + explore run and the no-memory ablation
+
+`runs/drone11-v4-memory-explore-seed0`: `drone10`'s settings plus `--explore-fraction 0.3`, warm-started with `--init-from runs/drone10-v4-memory-seed0/best.pt`. Stopped by patience at 8.0M steps (127 min). `runs/drone10-v4-nomem-seed0`: `drone10`'s settings without `--memory-heads`; stopped at 5.0M (63 min), `best.pt` = 2M.
+
+| Run | Test GPS | Test no GPS | Fixed-goal GPS / no GPS |
+|---|---|---|---|
+| `drone10` memory | 16.4% | 15.2% | 9.4% / 8.2% |
+| `drone11` memory + explore | 17.2% | 15.2% | 6.6% / 7.0% |
+| `drone10-nomem` | 12.1% | 10.9% | 4.3% / 3.5% |
+
+Memory adds about 4 points on the refreshed test and about 5 on fixed goal (single seed, 256 episodes per cell; the 95% interval of a 15% rate is about ±4.5 points). The explore command keeps goal success while its own validation coverage grew from 285 to 1,556 observed tiles per episode (1M→8M) and explore-command collisions fell from 42% to 18%. Patience selects on goal success only, so it stopped `drone11` while coverage was still improving.
+
 ## Patch-goal run (ABI v6)
 
 `runs/drone9-mean-patch-seed0`: `drone8`'s exact settings (fresh seed 0, TensorRT FP16 `mean`, 128 envs, oracle refresh every 30 steps, 2M steps, sustained-hold task, unchanged reward) with one change: `--goal patch`, the patch-matching saliency head. 2,007,040 steps in 1409 s. Validation GPS success at 0.5M / 1M / 1.5M / 2M: 4.3% / 5.5% / 14.5% / 12.5%; `best.pt` = 1.5M.
