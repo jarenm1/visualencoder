@@ -206,6 +206,20 @@ Without the ground prior `mean` reaches 0.214 / 0.70.
 
 **Gemma grounding post-train** (`sim/python/gemma_tune.py`): exploratory-flight frames with per-patch object labels give "Fly to the [nearest] <name>." → box examples and absent names → `[]`; LoRA on the language model's projections; `eval` compares base and tuned hit and false-box rates on held-out districts.
 
+### Memory policy run (`runs/drone10-v4-memory-seed0`)
+
+Fresh seed-0 visual policy with spatial memory, patch goal, TensorRT FP16 `mean`, 128 envs, oracle refresh every 30 steps, 8–60 m starts, half the episodes without GPS, adaptive curriculum. Stopped by `--patience 3` at 5.0M steps (76 min including evaluation); `best.pt` = 2.0M.
+
+| Steps | Validation GPS | Validation no GPS | Collision (GPS) |
+|---|---|---|---|
+| 1M | 3.5% | 2.3% | 27% |
+| 2M | 11.7% | 9.4% | 45% |
+| 3M | 5.9% | 6.3% | 57% |
+| 4M | 6.6% | 5.9% | 61% |
+| 5M | 8.6% | 9.8% | 46% |
+
+Held-out test of `best.pt` (256 episodes per mode, 8–60 m): **16.4% with GPS, 15.2% without**. After 2M, training success kept rising (52% EMA on visible starts) while validation fell and collisions rose: the policy overfits the training districts' obstacles. The no-memory ablation with identical settings is `runs/drone10-v4-nomem-seed0`.
+
 ## Patch-goal run (ABI v6)
 
 `runs/drone9-mean-patch-seed0`: `drone8`'s exact settings (fresh seed 0, TensorRT FP16 `mean`, 128 envs, oracle refresh every 30 steps, 2M steps, sustained-hold task, unchanged reward) with one change: `--goal patch`, the patch-matching saliency head. 2,007,040 steps in 1409 s. Validation GPS success at 0.5M / 1M / 1.5M / 2M: 4.3% / 5.5% / 14.5% / 12.5%; `best.pt` = 1.5M.
