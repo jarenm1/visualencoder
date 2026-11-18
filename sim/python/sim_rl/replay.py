@@ -122,8 +122,9 @@ def capture(args, saved, features, seed, style, no_gps_fraction, appearance, gro
     """
     metadata = saved["metadata"]
     n = args.num_envs
+    start = metadata.get("start_distance")   # the checkpoint's training start range
     with CudaEnv(args.library, n, seed, metadata["width"], metadata["height"], style,
-                 metadata["control_mode"], args.city) as env:
+                 metadata["control_mode"], args.city, start_distance=tuple(start) if start else None) as env:
         with env.execution():
             validate_checkpoint(saved, env, features)
             policy = build_policy(env, features, saved)
