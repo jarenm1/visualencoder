@@ -207,6 +207,8 @@ This separate pilot uses goal-facing, altitude-stabilized kinematic control, not
 
 #include "agent.typ"
 
+#include "posttrain.typ"
+
 = Conclusion
 In the original fixed-city benchmark, paired-view targets improve every measured novel-appearance readout.
 Extra training layouts within the shared assets add little at the same budget and do not improve real transfer
