@@ -173,28 +173,42 @@ class RefreshedGoals:
     Reset rows immediately on autoreset, including two consecutive episodes of the same object.
     ``step`` is called once per observation; the fixed batch schedule never reads GPU state.
     Deployment must supply boxes from perception, not these privileged simulator bounds.
+
+    With ``category`` (category.CategoryReferences), a ``category_fraction`` of new episodes start
+    from another same-type object's goal row; ``instance`` marks the episodes whose goal shows the
+    actual target (from the start, or since a refresh).
     """
 
-    def __init__(self, env, features, table, interval):
+    def __init__(self, env, features, table, interval, category=None, category_fraction=0.0):
         self.env, self.features, self.table, self.interval = env, features, table, interval
+        self.category, self.category_fraction = category, category_fraction
         self.goal = table[env.catalog_index.long()].clone()
+        self.instance = torch.ones(env.n, dtype=torch.bool, device=env.device)
         self.ticks = 0
         self.updates = torch.zeros(env.n, device=env.device, dtype=torch.long)
 
     @torch.no_grad()
     def step(self, starts):
-        initial = self.table[self.env.catalog_index.long()]
-        self.goal.copy_(torch.where(starts[:, None] > 0.5, initial, self.goal))
+        index = self.env.catalog_index.long()
+        fresh = starts > 0.5
+        if self.category is not None:
+            by_type = torch.rand(self.env.n, device=self.env.device) < self.category_fraction
+            alternate = self.category.alternate(index)
+            # A type with a single object has no other reference: the goal is the instance.
+            self.instance.copy_(torch.where(fresh, ~by_type | (alternate == index), self.instance))
+            index = torch.where(self.instance, index, alternate)
+        self.goal.copy_(torch.where(fresh[:, None], self.table[index], self.goal))
         if self.interval and self.ticks and self.ticks % self.interval == 0:
             p = self.env.privileged
             x0, y0, x1, y1 = p[:, 25:29].unbind(-1)
             boxes = torch.stack(((x0 + 1) / 2, (1 - y1) / 2,
                                  (x1 + 1) / 2, (1 - y0) / 2), -1)
             span = (boxes[:, 2] - boxes[:, 0]).maximum(boxes[:, 3] - boxes[:, 1])
-            valid = (p[:, 14] > 0.5) & (span >= 0.08) & (span * 1.3 <= 0.8) & (starts < 0.5)
+            valid = (p[:, 14] > 0.5) & (span >= 0.08) & (span * 1.3 <= 0.8) & ~fresh
             crops = crop_goals(self.env.obs, square_goal_box(boxes))
             refreshed = self.features.goal_embedding(crops).to(self.goal.dtype)
             self.goal.copy_(torch.where(valid[:, None], refreshed, self.goal))
+            self.instance.logical_or_(valid)
             self.updates.add_(valid)
         self.ticks += 1
         return self.goal.float()

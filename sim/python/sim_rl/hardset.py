@@ -12,6 +12,7 @@ sets the hint mix:
   coarse_hint   all entries                              coarse hint (10-40 m radius)
   wrong_hint    all entries                              wrong hint (30-80 m off, claims 1-5 m)
   look_alike    a same-class object within LOOK_ALIKE_M   no hint
+  category      all entries, goal starts as another same-type object's reference   no hint
 
     train.py eval-hard --checkpoint runs/drone13-v5-seed0/best.pt --verifier runs/verifier/test.pt --out ...
 """
@@ -22,6 +23,7 @@ import json
 import numpy as np
 import torch
 
+from .category import CategoryReferences
 from .evaluation import evaluate
 
 FAR_M = 40.0
@@ -37,6 +39,7 @@ COHORTS = {
     "coarse_hint": ("all", {"no_gps": 0.0, "coarse": 1.0}),
     "wrong_hint": ("all", {"no_gps": 0.0, "wrong": 1.0}),
     "look_alike": ("look_alike", {"no_gps": 1.0}),
+    "category": ("all", {"no_gps": 1.0, "category": True}),
 }
 
 
@@ -76,9 +79,12 @@ def cohort_entries(labels, layout, count, seed):
 def evaluate_hard(env, features, policy, labels, seed, goal_refresh_steps=0):
     layout = json.loads((env.city_path / "layout.json").read_text())["objects"]
     chosen, sizes = cohort_entries(labels, layout, env.n, seed)
+    references = CategoryReferences(labels["meta"][:, 0].numpy().astype(np.int64), layout, env.device)
     results = {"cohort_sizes": sizes}
     for name, (_, hints) in COHORTS.items():
         entries = torch.as_tensor(chosen[name], device=env.device)
+        hints = dict(hints)
+        category = references if hints.pop("category", False) else None
         results[name] = evaluate(env, features, policy=policy, seed=seed, goal_refresh_steps=goal_refresh_steps,
-                                 entries=entries, **hints)
+                                 entries=entries, category=category, **hints)
     return results

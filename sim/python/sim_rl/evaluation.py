@@ -52,13 +52,16 @@ def gps_pursuit(proprio, action_scales):
 
 @torch.no_grad()
 def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, appearance=1.0,
-             goal_refresh_steps=0, bucket_weights=UNIFORM_WEIGHTS, coarse=0.0, wrong=0.0, entries=None):
+             goal_refresh_steps=0, bucket_weights=UNIFORM_WEIGHTS, coarse=0.0, wrong=0.0, entries=None,
+             category=None):
     """Deterministic policy (tanh of the mean) or blind heuristic over one reset of the native finite horizon.
 
     Curriculum is uniform over visibility buckets with p_no_gps = ``no_gps`` (episodes without a
     target hint), hinted episodes coarse / wrong with probabilities ``coarse`` / ``wrong`` (precise
     otherwise), and the given appearance strength. ``entries`` (int32 [n] catalog indices, -1 to
-    sample) fixes each environment's first episode (the hard set). Outcomes are exclusive
+    sample) fixes each environment's first episode (the hard set); ``category``
+    (category.CategoryReferences) starts every goal from another same-type object's reference until
+    the refresh sees the actual target. Outcomes are exclusive
     (success > collision > out_of_bounds > timeout) and recorded only for each environment's first
     completed episode.
     """
@@ -76,7 +79,8 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
     if entries is not None:
         env.next_catalog.copy_(entries)
     env.reset(seed)
-    goal_source = RefreshedGoals(env, features, goals, goal_refresh_steps) if goals is not None else None
+    goal_source = (RefreshedGoals(env, features, goals, goal_refresh_steps, category, float(category is not None))
+                   if goals is not None else None)
     start_landed = env.diagnostics[:, 19].clamp(0, 1).clone()
     start_class = env.diagnostics[:, 14].clone()
     initial_coverage = env.episode_diagnostics[:, 0].clone()

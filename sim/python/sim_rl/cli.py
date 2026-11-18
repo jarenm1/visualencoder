@@ -123,6 +123,7 @@ def training_settings(args):
                 "catalog_size_per_city": args.city_catalog_size},
             "explore_fraction": args.explore_fraction, "commands": commands_of(args),
             "mask_confusion": args.mask_confusion,
+            "category_goal_fraction": args.category_goal_fraction,
             "replay": None if not args.replay_fraction else {"fraction": args.replay_fraction,
                                                              "verifier": str(args.verifier),
                                                              "verifier_sha256": sha256(args.verifier)},
@@ -192,7 +193,8 @@ def make_config(args):
                   no_gps_fraction=args.no_gps_fraction, appearance=args.appearance,
                   coarse_hint_fraction=args.coarse_hint_fraction, wrong_hint_fraction=args.wrong_hint_fraction,
                   goal_refresh_steps=args.goal_refresh_steps, explore_fraction=args.explore_fraction,
-                  mask_confusion=args.mask_confusion, replay_fraction=args.replay_fraction)
+                  mask_confusion=args.mask_confusion, replay_fraction=args.replay_fraction,
+                  category_goal_fraction=args.category_goal_fraction)
 
 
 def open_env(args, n, seed, style):
@@ -702,6 +704,9 @@ def add_learner(parser):
                              "pilot fails most (levels.py), among those --verifier marks solvable")
     parser.add_argument("--verifier", type=Path,
                         help="train.py verify output for this training catalogue (seed, start distance, size)")
+    parser.add_argument("--category-goal-fraction", type=float, default=DEFAULTS.category_goal_fraction,
+                        help="share of goal episodes that start from another same-type object's reference "
+                             "(category goal) until the refresh sees the actual target (category.py)")
     parser.add_argument("--explore-fraction", type=float, default=DEFAULTS.explore_fraction,
                         help="fraction of training episodes given the explore command (coverage reward) "
                              "instead of the goal; > 0 makes the policy command-conditioned")

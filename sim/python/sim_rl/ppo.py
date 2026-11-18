@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import torch
 from torch.profiler import record_function
 
+from .category import category_references
 from .curriculum import MODES as CURRICULUM_MODES, Curriculum
 from .features import RefreshedGoals
 from .levels import HardEpisodes
@@ -67,6 +68,7 @@ class Config:
     explore_fraction: float = 0.0
     mask_confusion: bool = False
     replay_fraction: float = 0.0
+    category_goal_fraction: float = 0.0
 
     def validate(self):
         if min(self.total_steps, self.rollout_steps, self.sequence_length,
@@ -92,6 +94,8 @@ class Config:
             raise ValueError("mask_confusion must be a bool")
         if not 0.0 <= self.replay_fraction <= 1.0:
             raise ValueError("replay_fraction must be in [0, 1]")
+        if not 0.0 <= self.category_goal_fraction <= 1.0:
+            raise ValueError("category_goal_fraction must be in [0, 1]")
 
 
 def terminal_gae(rewards, values, done, gamma, lam, out=None):
@@ -155,7 +159,9 @@ class Trainer:
         if features.visual:
             patches = env.height // 16 * (env.width // 16)
             self.goals = features.catalog_goals(env, config.appearance)
-            self.goal_source = RefreshedGoals(env, features, self.goals, config.goal_refresh_steps)
+            category = category_references(env) if config.category_goal_fraction > 0 else None
+            self.goal_source = RefreshedGoals(env, features, self.goals, config.goal_refresh_steps, category,
+                                              config.category_goal_fraction)
             self.rollout_goals = torch.empty((t, n, features.goal_dim), device=env.device, dtype=torch.bfloat16)
             self.cls = allocate(t, n, features.dim)
             self.tokens = torch.empty((t, n, patches, features.dim), device=env.device, dtype=torch.bfloat16)
@@ -196,7 +202,8 @@ class Trainer:
         peak = objects.gather(1, probs[:, :-1].argmax(-1, keepdim=True)).squeeze(1)
         target = self.env.diagnostics[:, 27].long()
         same_class = self.object_class[peak.clamp_min(0)] == self.env.diagnostics[:, 14].long()
-        confused = claimed & (peak >= 0) & (peak != target) & same_class
+        # A type-level reference makes any same-type object a fair approach; only instance goals count.
+        confused = claimed & (peak >= 0) & (peak != target) & same_class & self.goal_source.instance
         self.claimed[t].copy_(claimed.float())
         self.confused[t].copy_(confused.float())
         self.loss_weights[t].copy_(1.0 - confused.float() if self.config.mask_confusion else torch.ones_like(self.confused[t]))
