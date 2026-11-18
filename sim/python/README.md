@@ -276,6 +276,38 @@ The first pass found **17% of test episodes started inside hollow suburban house
 
 The catalog builder now rejects starts that are enclosed: rays up and in 8 horizontal directions all hit within 25 m. After the fix, 99.7% of test episodes (`runs/verifier/test.pt`) and 99.3% of training episodes (`runs/verifier/train-s0.pt`) are solvable; the rest are labelled per entry.
 
+### Post-training on hard episodes (`--replay-fraction`, `sim_rl/levels.py`)
+
+Online failure mining in the style of lab post-training:
+- every completed goal episode credits one attempt, and its success, to its catalog entry (GPU counters);
+- each rollout, `--replay-fraction` of the environments get their next episode from the solvable entries (`--verifier`, which must match this catalog's city, seed, start range and size);
+- entries are drawn in proportion to their failure rate plus a floor, with never-tried entries counting as failures;
+- the draw goes through the native `next_catalog` override; the other environments keep the curriculum, so the pilot does not forget.
+
+Runs save `hard-episodes.pt` (attempts, successes, solvable).
+
+### Held-out hard set (`train.py eval-hard`, `sim_rl/hardset.py`)
+
+Fixed samples of 256 verified-solvable test episodes per cohort (`--verifier runs/verifier/test.pt`), forced through the catalog override:
+
+| Cohort | Entries | Hint |
+|---|---|---|
+| standard | all, visibility buckets in thirds (88% of test entries are hidden) | none / precise |
+| hidden | hidden starts | none |
+| far | start ≥ 40 m from the target | none |
+| hidden + far | both | none |
+| coarse hint | all, buckets in thirds | coarse |
+| wrong hint | all, buckets in thirds | wrong |
+| look-alike | a same-class object within 15 m | none |
+| category | all, buckets in thirds; goal starts as another same-type object's reference | none |
+
+### Category goals (`--category-goal-fraction`, `sim_rl/category.py`, `references.py`)
+
+The commander can name an object the drone has never seen. Success is still only the actual instance.
+- **Training:** a share of goal episodes start from the goal row of another catalog entry showing a different object of the same type (layout asset). The goal refresh swaps in the true target's crop once it is visible. Look-alike masking applies only after that swap, since approaching any same-type object is right while the goal is a type reference.
+- **Deployment:** `references.py` builds `runs/reference-library`, one plain-render goal crop per type: 28 types such as truck, van, police, sports sedan, large tree, building.
+- **Agent:** when Gemma names an object it cannot box, the agent sets that type's reference as the goal (`live.py --references`), so the pilot searches by type. Gemma's box of the instance later replaces the reference.
+
 ### Multi-city training
 
 After 2M steps every single-city run kept improving on its training districts while held-out success fell and collisions rose: the policy memorizes one layout. `--train-cities DIR...` trains on `--city` plus more cities built by `scene/build_city.py` (`blender -b --python scene/build_city.py -- --assets assets/kenney --out assets/geometry/train-103 --seed 103 --family train`, about 45 s each; `heldout-*` builds are never trained on). `sim_rl/cities.py` `CityPool` runs one native environment per city (n/K drones each, own CUDA stream) and gathers their fields into the trainer's [n, ...] buffers with device copies; catalogue indices are offset per city so the concatenated goal tables index as before. Each city gets a smaller episode catalogue (`--city-catalog-size`, default 16384; a 65536-entry goal table is 2.3 GiB). Each extra city costs about 0.3 GiB of device memory besides its table. Validation and the final test stay on `--city`'s held-out districts; `eval --city assets/geometry/heldout-10001` tests an unseen city.
