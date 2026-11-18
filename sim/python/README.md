@@ -246,6 +246,17 @@ After 2M steps every single-city run kept improving on its training districts wh
 
 City identity (`city_fingerprint`, landable geometry, catalogue size) is no longer part of the checkpoint contract; checkpoints record their training cities under `cities`. The TensorRT encoder now orders each call after the previous one: sharing its execution context across two streams at once (per-city goal tables) corrupted about 9% of goal embeddings with NaN.
 
+### Task benchmark (`sim/python/benchmark.py`)
+
+The whole onboard stack on three instructions, 20 held-out free flights each, no GPS and no goal image (the instruction is all the drone is told), Gemma 4-bit: `count` ("How many cars are in this area? ..."), `find` ("Fly to the <name>." naming the episode's target; success = the native reach-and-hold of that object), `explore` (area the memory marked looked-at after 40 s). Policy `drone11`.
+
+| Grounding | count exact / ±1 / MAE | count crashed | find success | find crashed | explore m² | explore crashed |
+|---|---|---|---|---|---|---|
+| base | 5% / 5% / 4.2 | 10% | 10% | 55% | 23,774 | 20% |
+| LoRA `lora` | 5% / 5% / 4.2 | 10% | 0% | 10% | 26,385 | 10% |
+
+These count numbers scored against every car seen at any range over a 120 s flight (mean 6.9) while the tracker only counts within 35 m; the benchmark now scores within that range and reports both. Gemma answers with the memory's count (it relays the summary faithfully), so count error is perception and memory recall. `find` fails in two ways. With base grounding Gemma boxes the wrong object (a building for "truck") and the drone often crashes into it. With the LoRA it declines almost every box, so the drone never commits to a target. Crashes are the policy's: they also end 10–20% of explore flights.
+
 ## Patch-goal run (ABI v6)
 
 `runs/drone9-mean-patch-seed0`: `drone8`'s exact settings (fresh seed 0, TensorRT FP16 `mean`, 128 envs, oracle refresh every 30 steps, 2M steps, sustained-hold task, unchanged reward) with one change: `--goal patch`, the patch-matching saliency head. 2,007,040 steps in 1409 s. Validation GPS success at 0.5M / 1M / 1.5M / 2M: 4.3% / 5.5% / 14.5% / 12.5%; `best.pt` = 1.5M.
