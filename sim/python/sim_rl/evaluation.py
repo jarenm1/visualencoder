@@ -52,13 +52,15 @@ def gps_pursuit(proprio, action_scales):
 
 @torch.no_grad()
 def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, appearance=1.0,
-             goal_refresh_steps=0, bucket_weights=UNIFORM_WEIGHTS, coarse=0.0, wrong=0.0):
+             goal_refresh_steps=0, bucket_weights=UNIFORM_WEIGHTS, coarse=0.0, wrong=0.0, entries=None):
     """Deterministic policy (tanh of the mean) or blind heuristic over one reset of the native finite horizon.
 
     Curriculum is uniform over visibility buckets with p_no_gps = ``no_gps`` (episodes without a
     target hint), hinted episodes coarse / wrong with probabilities ``coarse`` / ``wrong`` (precise
-    otherwise), and the given appearance strength. Outcomes are exclusive (success > collision >
-    out_of_bounds > timeout) and recorded only for each environment's first completed episode.
+    otherwise), and the given appearance strength. ``entries`` (int32 [n] catalog indices, -1 to
+    sample) fixes each environment's first episode (the hard set). Outcomes are exclusive
+    (success > collision > out_of_bounds > timeout) and recorded only for each environment's first
+    completed episode.
     """
     if (policy is None) == (heuristic is None):
         raise ValueError("provide exactly one trained policy or blind heuristic")
@@ -71,6 +73,8 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
         raise ValueError("bucket_weights must contain three nonnegative weights with positive sum")
     env.write_curriculum(fixed_lanes(device, tuple(bucket_weights), no_gps, appearance, coarse, wrong))
     goals = features.catalog_goals(env, appearance) if policy is not None and features.visual else None
+    if entries is not None:
+        env.next_catalog.copy_(entries)
     env.reset(seed)
     goal_source = RefreshedGoals(env, features, goals, goal_refresh_steps) if goals is not None else None
     start_landed = env.diagnostics[:, 19].clamp(0, 1).clone()

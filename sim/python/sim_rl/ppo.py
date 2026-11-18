@@ -17,6 +17,7 @@ from torch.profiler import record_function
 
 from .curriculum import MODES as CURRICULUM_MODES, Curriculum
 from .features import RefreshedGoals
+from .levels import HardEpisodes
 from .memory import CHANNELS, EGO, SpatialMemory, observe as observe_memory
 from .model import EXPLORE_COMMAND, GOAL_COMMAND, saliency_loss, squashed_entropy, squashed_log_prob
 from .native import HOVER_ACTIONS, PRIVILEGED_WIDTH, PROPRIO_WIDTH
@@ -65,6 +66,7 @@ class Config:
     goal_refresh_steps: int = 0
     explore_fraction: float = 0.0
     mask_confusion: bool = False
+    replay_fraction: float = 0.0
 
     def validate(self):
         if min(self.total_steps, self.rollout_steps, self.sequence_length,
@@ -88,6 +90,8 @@ class Config:
             raise ValueError("explore_fraction must be in [0, 1)")
         if not isinstance(self.mask_confusion, bool):
             raise ValueError("mask_confusion must be a bool")
+        if not 0.0 <= self.replay_fraction <= 1.0:
+            raise ValueError("replay_fraction must be in [0, 1]")
 
 
 def terminal_gae(rewards, values, done, gamma, lam, out=None):
@@ -109,7 +113,9 @@ def terminal_gae(rewards, values, done, gamma, lam, out=None):
 class Trainer:
     """Rollout storage is preallocated; collection and update never read values back to the host."""
 
-    def __init__(self, env, features, policy, config):
+    def __init__(self, env, features, policy, config, solvable=None):
+        """``solvable`` (bool [catalog], verifier.py) enables hard-episode replay when
+        ``config.replay_fraction`` > 0 (levels.py)."""
         config.validate()
         if policy.action_dim != env.action_dim:
             raise ValueError("policy action dimension differs from native city-drone task")
@@ -173,6 +179,9 @@ class Trainer:
         self.current_cls = self.current_tokens = None
         self._sequence_offsets = torch.arange(config.sequence_length, device=env.device).unsqueeze(1)
         self._observe()
+        if config.replay_fraction > 0 and solvable is None:
+            raise ValueError("hard-episode replay needs the verifier's solvable labels")
+        self.levels = HardEpisodes(env, solvable, config.replay_fraction) if config.replay_fraction > 0 else None
 
     def _observe(self):
         if self.features.visual:
@@ -236,6 +245,8 @@ class Trainer:
             self.env.step(hover)
             self._observe()
         self.env.reset(seed)
+        if self.levels is not None:
+            self.levels.episode.copy_(self.env.catalog_index.long())
         if self.features.visual:
             self.goal_source.ticks = 0
             self.goal_source.updates.zero_()
@@ -253,6 +264,8 @@ class Trainer:
         if length < 1 or length > self.config.rollout_steps or length % self.config.sequence_length:
             raise ValueError("rollout must fit preallocation and contain complete recurrent sequences")
         log_std = self.policy.log_std
+        if self.levels is not None:
+            self.levels.propose()
         with gpu_range("sim.collect"):
             for t in range(length):
                 self._sample_commands()
@@ -288,6 +301,8 @@ class Trainer:
                 # sample, whose log-probability includes the tanh Jacobian.
                 torch.tanh(raw, out=self.applied)
                 self.env.step(self.applied)
+                if self.levels is not None:
+                    self.levels.observe(self.env.done, self.env.success, ~explore)
                 if self.config.explore_fraction > 0:
                     reward = torch.where(explore, self._explore_reward(explore), self.env.reward)
                     self.explore_tiles[t].copy_(self.explore_tiles_now)

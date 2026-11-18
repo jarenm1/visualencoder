@@ -123,6 +123,9 @@ def training_settings(args):
                 "catalog_size_per_city": args.city_catalog_size},
             "explore_fraction": args.explore_fraction, "commands": commands_of(args),
             "mask_confusion": args.mask_confusion,
+            "replay": None if not args.replay_fraction else {"fraction": args.replay_fraction,
+                                                             "verifier": str(args.verifier),
+                                                             "verifier_sha256": sha256(args.verifier)},
             "init_from": None if args.init_from is None else {"path": str(args.init_from),
                                                                "sha256": sha256(args.init_from)}}
 
@@ -189,7 +192,7 @@ def make_config(args):
                   no_gps_fraction=args.no_gps_fraction, appearance=args.appearance,
                   coarse_hint_fraction=args.coarse_hint_fraction, wrong_hint_fraction=args.wrong_hint_fraction,
                   goal_refresh_steps=args.goal_refresh_steps, explore_fraction=args.explore_fraction,
-                  mask_confusion=args.mask_confusion)
+                  mask_confusion=args.mask_confusion, replay_fraction=args.replay_fraction)
 
 
 def open_env(args, n, seed, style):
@@ -302,6 +305,22 @@ def warm_start(policy, state):
             raise ValueError(f"cannot warm-start {name}: {tuple(value.shape)} -> {tuple(target.shape)}")
 
 
+def solvable_labels(args, env):
+    """The verifier's solvable mask for this training catalogue (None without hard-episode replay);
+    refuses labels computed for another city, seed, start range or catalogue size."""
+    if not args.replay_fraction:
+        return None
+    if args.verifier is None:
+        raise SystemExit("--replay-fraction needs --verifier (train.py verify --split train --seed <seed>)")
+    labels = torch.load(args.verifier, map_location="cpu", weights_only=False)
+    expected = {"city_fingerprint": env.metadata["city_fingerprint"], "seed": args.seed, "style": TRAIN_STYLE,
+                "start_distance": tuple(args.start_distance), "catalog_size": env.catalog_size}
+    found = {key: tuple(labels[key]) if key == "start_distance" else labels[key] for key in expected}
+    if found != expected:
+        raise SystemExit(f"{args.verifier} labels another catalogue: {found} != {expected}")
+    return labels["solvable"].bool()
+
+
 def train_command(args, started):
     seed_all(args.seed)
     config = make_config(args)
@@ -320,7 +339,7 @@ def train_command(args, started):
                                   depth_view=args.depth_view)
             if args.init_from is not None:
                 warm_start(policy, load_checkpoint(args.init_from)["model"])
-            trainer = Trainer(env, features, policy, config)
+            trainer = Trainer(env, features, policy, config, solvable_labels(args, env))
             trainer.warmup(args.seed)
             metadata = provenance(env, features, training_settings(args))
 
@@ -369,6 +388,8 @@ def train_command(args, started):
         curves.close()
         # Look-alike confusion steps per catalog entry (failure mining input).
         torch.save(trainer.confusion_by_catalog.cpu(), run / "confusion-by-catalog.pt")
+        if trainer.levels is not None:
+            torch.save(trainer.levels.state(), run / "hard-episodes.pt")
         final = validate()
         validations.append({"steps": trainer.steps, "result": final, "final": True})
         if final["selection_success"] > best_success:
@@ -457,6 +478,31 @@ def eval_command(args, started):
     payload = {"checkpoint": str(args.checkpoint), "checkpoint_sha256": sha256(args.checkpoint),
                "split": args.split, "control_mode": metadata["control_mode"], **results}
     emit(payload, args.out)
+
+
+def eval_hard_command(args, started):
+    """Held-out hard set (hardset.py) on verified-solvable test episodes."""
+    from .hardset import evaluate_hard  # noqa: PLC0415
+    saved = load_checkpoint(args.checkpoint)
+    metadata = saved["metadata"]
+    features = checkpoint_features(metadata, torch.device("cuda:0"))
+    labels = torch.load(args.verifier, map_location="cpu", weights_only=False)
+    with open_env_checkpoint(args, metadata, TEST_SEED, TEST_STYLE) as env, env.execution():
+        expected = {"city_fingerprint": env.metadata["city_fingerprint"], "seed": TEST_SEED, "style": TEST_STYLE,
+                    "catalog_size": env.catalog_size}
+        if {key: labels[key] for key in expected} != expected or tuple(labels["start_distance"]) != \
+                tuple(metadata.get("start_distance") or ()):
+            raise SystemExit(f"{args.verifier} labels another test catalogue than this checkpoint's")
+        validate_checkpoint(saved, env, features)
+        policy = build_policy(env, features, saved)
+        policy.eval()
+        refresh = metadata.get("goal_refresh_steps", 0) if args.goal_refresh_steps is None else args.goal_refresh_steps
+        results = evaluate_hard(env, features, policy, labels, TEST_SEED, refresh)
+    summary = {name: {key: result[key] for key in ("success", "collision", "out_of_bounds", "timeout")}
+               for name, result in results.items() if name != "cohort_sizes"}
+    print(json.dumps(summary), flush=True)
+    emit({"checkpoint": str(args.checkpoint), "checkpoint_sha256": sha256(args.checkpoint), "goal_refresh_steps": refresh,
+          "seconds": round(time.monotonic() - started, 1), "summary": summary, **results}, args.out)
 
 
 def cohorts_command(args, started):
@@ -651,6 +697,11 @@ def add_learner(parser):
     parser.add_argument("--mask-confusion", action="store_true",
                         help="give goal steps whose saliency peak is a same-class look-alike zero weight in "
                              "the policy and value losses (an encoder error, not a flight error)")
+    parser.add_argument("--replay-fraction", type=float, default=DEFAULTS.replay_fraction,
+                        help="share of environments whose next episode is replayed from the catalog entries the "
+                             "pilot fails most (levels.py), among those --verifier marks solvable")
+    parser.add_argument("--verifier", type=Path,
+                        help="train.py verify output for this training catalogue (seed, start distance, size)")
     parser.add_argument("--explore-fraction", type=float, default=DEFAULTS.explore_fraction,
                         help="fraction of training episodes given the explore command (coverage reward) "
                              "instead of the goal; > 0 makes the policy command-conditioned")
@@ -721,6 +772,15 @@ def parser():
                             help="start distance range (default: the checkpoint's training range)")
     evaluation.add_argument("--out", type=Path)
     evaluation.set_defaults(func=eval_command)
+
+    hard = commands.add_parser("eval-hard", help="held-out hard set on verified-solvable test episodes")
+    add_native(hard)
+    hard.add_argument("--checkpoint", type=Path, required=True)
+    hard.add_argument("--verifier", type=Path, required=True, help="train.py verify --split test output")
+    hard.add_argument("--eval-envs", type=int, default=256, help="episodes per cohort")
+    hard.add_argument("--goal-refresh-steps", type=int, help="default: the checkpoint's")
+    hard.add_argument("--out", type=Path, required=True)
+    hard.set_defaults(func=eval_hard_command)
 
     mine = commands.add_parser("mine", help="mine perception failures of a frozen visual policy")
     add_native(mine)
