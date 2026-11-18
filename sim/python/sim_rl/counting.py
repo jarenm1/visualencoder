@@ -15,7 +15,7 @@ import json
 
 import torch
 
-from .curriculum import UNIFORM_WEIGHTS
+from .curriculum import fixed_lanes
 from .memory import SpatialMemory
 from .native import PATCH, CudaEnv
 from .perception import CLASSES, OU_BIAS, OU_SIGMA, OU_THETA, ground_prior, load_heads, object_classes
@@ -30,7 +30,7 @@ def count_flights(env, features, heads, steps, seed, appearance):
     """(estimated counts [n], true counts [n]) after one exploratory flight per environment."""
     n, device = env.n, env.device
     lookup = object_classes(env)
-    env.write_curriculum(torch.tensor(UNIFORM_WEIGHTS + (0.0, appearance), device=device, dtype=torch.float32))
+    env.write_curriculum(fixed_lanes(device, appearance=appearance))
     env.reset(seed)
     memory = SpatialMemory(n, env.height // PATCH, env.width // PATCH, env.metadata["camera"], device)
     tracks = ObjectTracks(n, device)

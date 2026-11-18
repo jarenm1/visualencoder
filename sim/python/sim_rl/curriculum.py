@@ -1,8 +1,9 @@
 """Visibility-bucket curriculum: GPU-resident lanes written into native field 11.
 
-Lanes are [w_visible, w_partial, w_hidden, p_no_gps, appearance]. The bucket weights adapt
-(adaptive mode); p_no_gps is a fixed training-time probability of GPS-denied episodes and
-appearance the fixed randomized-appearance strength (0 = plain render).
+Lanes are [w_visible, w_partial, w_hidden, p_no_gps, appearance, p_coarse, p_wrong]. The bucket
+weights adapt (adaptive mode); the rest are fixed: p_no_gps is the probability of an episode
+without a target hint, appearance the randomized-appearance strength (0 = plain render), and
+p_coarse / p_wrong the share of hinted episodes whose hint is coarse or wrong (precise otherwise).
 """
 from __future__ import annotations
 
@@ -16,6 +17,11 @@ PROMOTE, DEMOTE = 0.70, 0.25
 STEP_UP, STEP_BACK = 0.05, 0.025
 EMA_ALPHA = 0.05
 MODES = ("adaptive", "uniform")
+
+
+def fixed_lanes(device, weights=UNIFORM_WEIGHTS, no_gps=0.0, appearance=1.0, coarse=0.0, wrong=0.0):
+    """Lanes for evaluation and data collection: fixed bucket weights and hint mix."""
+    return torch.tensor((*weights, no_gps, appearance, coarse, wrong), device=device, dtype=torch.float32)
 
 
 def update_weights(weights, ema, floors):
@@ -47,23 +53,27 @@ def update_weights(weights, ema, floors):
 class Curriculum:
     """Tracks per-bucket success EMAs and weights; ``uniform`` keeps weights fixed."""
 
-    def __init__(self, mode, device, no_gps_fraction, appearance=1.0):
+    def __init__(self, mode, device, no_gps_fraction, appearance=1.0, coarse_hint_fraction=0.0,
+                 wrong_hint_fraction=0.0):
         if mode not in MODES:
             raise ValueError(f"curriculum must be one of {MODES}")
-        if not 0.0 <= no_gps_fraction <= 1.0:
-            raise ValueError("no_gps_fraction must be in [0, 1]")
-        if not 0.0 <= appearance <= 1.0:
-            raise ValueError("appearance must be in [0, 1]")
+        for name, value in (("no_gps_fraction", no_gps_fraction), ("appearance", appearance),
+                            ("coarse_hint_fraction", coarse_hint_fraction), ("wrong_hint_fraction", wrong_hint_fraction)):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1]")
+        if coarse_hint_fraction + wrong_hint_fraction > 1.0:
+            raise ValueError("coarse and wrong hint fractions must sum to at most 1")
         self.mode = mode
         start = START_WEIGHTS if mode == "adaptive" else UNIFORM_WEIGHTS
         self.weights = torch.tensor(start, device=device, dtype=torch.float32)
         self.floors = torch.tensor(FLOORS, device=device, dtype=torch.float32)
-        self.fixed = torch.tensor([no_gps_fraction, appearance], device=device, dtype=torch.float32)
+        self.fixed = torch.tensor([no_gps_fraction, appearance, coarse_hint_fraction, wrong_hint_fraction],
+                                  device=device, dtype=torch.float32)
         self.ema = torch.zeros(3, device=device, dtype=torch.float32)
         self.seen = torch.zeros(3, device=device, dtype=torch.bool)
 
     def lanes(self):
-        """float32[5] device tensor: bucket weights, p_no_gps, appearance (device cat, no host transfer)."""
+        """float32[7] device tensor: bucket weights then the fixed lanes (device cat, no host transfer)."""
         return torch.cat((self.weights, self.fixed))
 
     def observe(self, counts, successes):

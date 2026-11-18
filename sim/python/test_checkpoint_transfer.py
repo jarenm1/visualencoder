@@ -20,17 +20,18 @@ def _fixture(directory: str):
         width=224, height=224, library=library, city_fingerprints=("city-fixture",),
         task_contract={"task": TASK, "abi_version": ABI_VERSION, "horizon": HORIZON,
                        "dynamics": {"velocity_scales": [4.0, 2.0, 1.5]},
-                       "sensors": {"proprio_width": 19}, "privileged": {"width": 29},
-                       "success": {"hold_steps": 90}, "reward": {"timeout": -10.0},
-                       "camera_effects": {"vignette": 0.35}, "patch_labels": {"patch_px": 16}})
+                       "sensors": {"proprio_width": 20}, "privileged": {"width": 29},
+                       "success": {"hold_steps": 90}, "reward": {"terms": "search, reach, hold"},
+                       "hints": {"modes": ["none", "precise", "coarse", "wrong"]}})
     features = SimpleNamespace(visual=True, spec="mean", dim=64, fingerprint="frozen-encoder", goal="global",
                                preprocessing={"engine": "tensorrt", "precision": "fp16"})
     recorded: dict[str, Any] = deepcopy(native_provenance(env, features))
     source_task, source_abi = TRANSFER_SOURCE
-    recorded.update(task=source_task, abi_version=source_abi, horizon=450)
+    recorded.update(task=source_task, abi_version=source_abi)
     contract = recorded["native_task_contract"]
-    contract.update(task=source_task, abi_version=source_abi, horizon=450, success={"hold_steps": 90, "timing": "deadline"})
-    del contract["camera_effects"], contract["patch_labels"]
+    contract.update(task=source_task, abi_version=source_abi, reward={"terms": "progress, braking"},
+                    gps={"radius_m": [3.0, 15.0]})
+    del contract["hints"]
     saved: dict[str, Any] = {"format": CHECKPOINT_FORMAT, "metadata": recorded, "model": {}}
     return env, features, saved
 
@@ -76,7 +77,7 @@ class TaskTransferTests(unittest.TestCase):
                                                              landable={"triangles": 7})
             saved["metadata"]["cities"] = ["training-city"]
             validate_checkpoint(saved, env, features)
-            saved["metadata"]["native_task_contract"]["sensors"] = {"proprio_width": 20}
+            saved["metadata"]["native_task_contract"]["sensors"] = {"proprio_width": 19}
             with self.assertRaisesRegex(ValueError, "native_task_contract differs"):
                 validate_checkpoint(saved, env, features)
 

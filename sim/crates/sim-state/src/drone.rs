@@ -94,11 +94,27 @@ pub fn hold_outcome(previous_hold: u32, step: u32, holding: bool,
     HoldOutcome { hold, success, done: crash || oob || (!free && (success || deadline)) }
 }
 
-/// Four terms: distance progress, time, graded near-goal braking, and terminal outcome.
+/// Reward per newly observed surface tile while searching (target not yet seen, no precise hint).
+pub const SEARCH_TILE_REWARD: f32 = 0.02;
+/// One-time bonus for first entering the standoff band while facing the target.
+pub const REACH_BONUS: f32 = 3.0;
+/// Per-step reward while holding (in the band, facing, at most `HOLD_SPEED`).
+pub const HOLD_REWARD: f32 = 0.1;
+pub const STEP_COST: f32 = 0.01;
+/// Terminal success bonus and failure (crash, leaving the area, deadline) penalty.
+pub const OUTCOME_REWARD: f32 = 10.0;
+
+/// Search, reach, hold. Until the target has been seen (`guided` false, unless a precise hint
+/// locates it), the policy cannot observe where it is, so box-distance progress would be noise to
+/// it and newly observed surface tiles are rewarded instead; once guided, distance progress. A
+/// one-time bonus on reaching the band (`reached`), a per-step bonus while `holding`, a step cost
+/// and the terminal outcome.
 #[inline(always)]
-pub fn goal_reward(progress: f32, speed: f32, near: bool, success: bool, failed: bool) -> f32 {
-    let braking = if near && speed < 3.0 { 0.1 * (1.0 - speed / 3.0) } else { 0.0 };
-    progress - 0.01 + braking + if success { 10.0 } else if failed { -10.0 } else { 0.0 }
+pub fn goal_reward(progress: f32, new_tiles: u32, guided: bool, reached: bool, holding: bool, success: bool,
+    failed: bool) -> f32 {
+    let search = if guided { progress } else { SEARCH_TILE_REWARD * new_tiles as f32 };
+    search - STEP_COST + if reached { REACH_BONUS } else { 0.0 } + if holding { HOLD_REWARD } else { 0.0 }
+        + if success { OUTCOME_REWARD } else if failed { -OUTCOME_REWARD } else { 0.0 }
 }
 
 /// One candidate episode. Written by host catalog construction; read by the native reset
@@ -241,7 +257,7 @@ mod tests {
         let out = hold_outcome(hold, HORIZON, false, false, false, false);
         assert!(out.done && !out.success);
         assert_eq!(out.hold, 0);
-        assert!((goal_reward(0.0, 0.0, false, out.success, out.done && !out.success) + 10.01).abs() < 1e-5);
+        assert!((goal_reward(0.0, 0, true, false, false, out.success, out.done && !out.success) + 10.01).abs() < 1e-5);
     }
 
     #[test]
@@ -254,9 +270,20 @@ mod tests {
             // A crash or leaving bounds fails even mid-hold; the deadline fails without one.
             let out = hold_outcome(HOLD_STEPS - 1, step, crash || oob, crash, oob, false);
             assert!(out.done && !out.success);
-            assert!((goal_reward(0.0, 0.0, false, false, true) + 10.01).abs() < 1e-5);
+            assert!((goal_reward(0.0, 0, true, false, false, false, true) + 10.01).abs() < 1e-5);
         }
-        assert!(goal_reward(0.0, 0.0, true, false, false) > goal_reward(0.0, 2.5, true, false, false));
+    }
+
+    #[test]
+    fn search_reach_and_hold_terms() {
+        // Before the target is seen, distance progress is ignored and new surface pays.
+        assert!((goal_reward(5.0, 0, false, false, false, false, false) + STEP_COST).abs() < 1e-6);
+        assert!((goal_reward(5.0, 10, false, false, false, false, false) - (10.0 * SEARCH_TILE_REWARD - STEP_COST)).abs() < 1e-6);
+        // Once guided, progress pays and new surface does not.
+        assert!((goal_reward(0.5, 10, true, false, false, false, false) - (0.5 - STEP_COST)).abs() < 1e-6);
+        let base = goal_reward(0.0, 0, true, false, false, false, false);
+        assert!((goal_reward(0.0, 0, true, true, false, false, false) - base - REACH_BONUS).abs() < 1e-6);
+        assert!((goal_reward(0.0, 0, true, false, true, false, false) - base - HOLD_REWARD).abs() < 1e-6);
     }
 
     #[test]

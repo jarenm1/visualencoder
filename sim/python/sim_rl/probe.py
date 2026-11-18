@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .curriculum import BUCKETS, UNIFORM_WEIGHTS
+from .curriculum import BUCKETS, fixed_lanes
 from .model import NDC_LANES, VISIBLE_LANE, TargetSaliency, saliency_loss, saliency_targets
 from .native import DIAGNOSTICS_WIDTH, PRIVILEGED_WIDTH
 from .stats import auroc, average_precision
@@ -63,7 +63,7 @@ def collect_frames(env, count, seed, generator_seed, appearance):
     privileged = torch.empty((total, PRIVILEGED_WIDTH), device=device)
     diagnostics = torch.empty((total, DIAGNOSTICS_WIDTH), device=device)
     catalog = torch.empty(total, dtype=torch.long, device=device)
-    lanes = torch.tensor(UNIFORM_WEIGHTS + (0.0, appearance), device=device, dtype=torch.float32)
+    lanes = fixed_lanes(device, appearance=appearance)
     env.write_curriculum(lanes)
     for step in range(steps):
         env.reset(seed + generator_seed * 1_000_003 + step)

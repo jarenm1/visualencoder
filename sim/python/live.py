@@ -35,7 +35,7 @@ from agent import Agent, summarize  # noqa: E402
 from gemma_goal import MATCH_IOU, detect, iou, project_boxes, start_camera  # noqa: E402
 from sim_rl.cli import (DEFAULT_LIBRARY, TEST_STYLE, build_policy, load_checkpoint,  # noqa: E402
                         validate_checkpoint)
-from sim_rl.curriculum import UNIFORM_WEIGHTS  # noqa: E402
+from sim_rl.curriculum import fixed_lanes  # noqa: E402
 from sim_rl.features import checkpoint_features, crop_goals, square_goal_box  # noqa: E402
 from sim_rl.memory import CELL, GRID, SpatialMemory, observe as observe_memory  # noqa: E402
 from sim_rl.model import EXPLORE_COMMAND, GOAL_COMMAND, deterministic_action  # noqa: E402
@@ -114,7 +114,7 @@ class Pilot:
             self.tracks = ObjectTracks(1, self.device) if self.spatial is not None else None
             self.memory_image, self.memory_info = b"", None
             self.agent, self.agent_info, self.steps = None, None, 0
-            self.lanes = torch.tensor(UNIFORM_WEIGHTS + (0.0, args.appearance), device=self.device)
+            self.lanes = fixed_lanes(self.device, appearance=args.appearance)
             self.env.write_curriculum(self.lanes)
             self.env.set_free_flight(True)
             self.new_episode(int.from_bytes(os.urandom(7), "little"))

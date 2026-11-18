@@ -1,6 +1,14 @@
-"""GPU-resident recurrent PPO (continuous Gaussian actions) with finite-horizon terminal GAE."""
+"""GPU-resident recurrent PPO (continuous Gaussian actions) with finite-horizon terminal GAE.
+
+Look-alike confusion: a goal step where the policy believes the target is in view but its peak
+patch is another object of the target's class is an encoder/matcher error, not a flight error.
+Those steps are counted (telemetry, per catalog entry for failure mining) and, with
+``mask_confusion``, get zero weight in the policy and value losses; the supervised saliency loss
+on the true target box still trains the matcher to tell them apart.
+"""
 from __future__ import annotations
 
+import json
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -14,8 +22,9 @@ from .model import EXPLORE_COMMAND, GOAL_COMMAND, saliency_loss, squashed_entrop
 from .native import HOVER_ACTIONS, PRIVILEGED_WIDTH, PROPRIO_WIDTH
 
 # finish_rollout layout: rollout totals, PPO losses, bucket totals, used/next weights, EMAs.
-ROLLOUT_WIDTH, LOSS_WIDTH, BUCKET_WIDTH = 7, 9, 12
+ROLLOUT_WIDTH, LOSS_WIDTH, BUCKET_WIDTH = 9, 9, 12
 RESULT_WIDTH = ROLLOUT_WIDTH + LOSS_WIDTH + BUCKET_WIDTH + 3 + 3 + 3
+CONFUSION_IN_VIEW = 0.5          # saliency P(target in view) above which the peak patch is a claim
 # Explore-command reward: newly observed surface tiles (native coverage, 128x128 city grid), a step
 # cost, and the same failure penalty as goal episodes. No timeout penalty: exploring has no deadline.
 EXPLORE_TILE_REWARD, EXPLORE_STEP_COST, EXPLORE_FAILURE = 0.02, 0.01, 10.0
@@ -50,9 +59,12 @@ class Config:
     curriculum: str = "adaptive"
     aux_coefficient: float = 0.5
     no_gps_fraction: float = 0.0
+    coarse_hint_fraction: float = 0.0
+    wrong_hint_fraction: float = 0.0
     appearance: float = 1.0
     goal_refresh_steps: int = 0
     explore_fraction: float = 0.0
+    mask_confusion: bool = False
 
     def validate(self):
         if min(self.total_steps, self.rollout_steps, self.sequence_length,
@@ -74,6 +86,8 @@ class Config:
             raise ValueError("goal_refresh_steps must be non-negative")
         if not 0.0 <= self.explore_fraction < 1.0:
             raise ValueError("explore_fraction must be in [0, 1)")
+        if not isinstance(self.mask_confusion, bool):
+            raise ValueError("mask_confusion must be a bool")
 
 
 def terminal_gae(rewards, values, done, gamma, lam, out=None):
@@ -109,7 +123,8 @@ class Trainer:
         self.hover = torch.tensor(HOVER_ACTIONS[env.control_mode], device=env.device)
         self.optimizer = torch.optim.Adam(policy.parameters(), lr=config.learning_rate, fused=True, capturable=True)
         self.steps = 0
-        self.curriculum = Curriculum(config.curriculum, env.device, config.no_gps_fraction, config.appearance)
+        self.curriculum = Curriculum(config.curriculum, env.device, config.no_gps_fraction, config.appearance,
+                                     config.coarse_hint_fraction, config.wrong_hint_fraction)
         self.curriculum.write(env)
         t, n, h = config.rollout_steps, env.n, policy.hidden_size
         allocate = lambda *shape: torch.empty(shape, device=env.device)
@@ -140,6 +155,15 @@ class Trainer:
             self.tokens = torch.empty((t, n, patches, features.dim), device=env.device, dtype=torch.bfloat16)
         else:
             self.goals = self.cls = self.tokens = None
+        # Look-alike confusion telemetry (visual arms): per step, and per catalog entry.
+        self.loss_weights = torch.ones((t, n), device=env.device)
+        self.confused = torch.zeros((t, n), device=env.device)
+        self.claimed = torch.zeros((t, n), device=env.device)
+        self.confusion_by_catalog = torch.zeros(env.catalog_size, device=env.device)
+        if features.visual:
+            layout = json.loads((env.city_path / "layout.json").read_text())["objects"]
+            self.object_class = torch.tensor([env.layout_classes.index(o["class"]) for o in layout],
+                                             device=env.device, dtype=torch.long)
         if policy.spatial:
             self.spatial = SpatialMemory(n, env.height // 16, env.width // 16, env.metadata["camera"], env.device)
             self.memory_ego = torch.empty((t, n, CHANNELS, EGO, EGO), device=env.device, dtype=torch.bfloat16)
@@ -153,6 +177,21 @@ class Trainer:
     def _observe(self):
         if self.features.visual:
             self.current_cls, self.current_tokens = self.features.observe(self.env)
+
+    def _confusion(self, t, logits, explore):
+        """Mark goal steps whose saliency peak claims a same-class look-alike of the target
+        (label: native per-patch object); see the module docstring."""
+        probs = logits.softmax(-1)
+        claimed = (probs[:, -1] < 1 - CONFUSION_IN_VIEW) & ~explore
+        objects = self.env.patch_object.long()
+        peak = objects.gather(1, probs[:, :-1].argmax(-1, keepdim=True)).squeeze(1)
+        target = self.env.diagnostics[:, 27].long()
+        same_class = self.object_class[peak.clamp_min(0)] == self.env.diagnostics[:, 14].long()
+        confused = claimed & (peak >= 0) & (peak != target) & same_class
+        self.claimed[t].copy_(claimed.float())
+        self.confused[t].copy_(confused.float())
+        self.loss_weights[t].copy_(1.0 - confused.float() if self.config.mask_confusion else torch.ones_like(self.confused[t]))
+        self.confusion_by_catalog.index_add_(0, self.env.catalog_index.long(), confused.float())
 
     def _inputs(self, cls, tokens, goal, proprio, privileged, memory=None, command=None):
         """Use the exact goal and memory seen at collection, including any in-episode refresh."""
@@ -233,10 +272,12 @@ class Trainer:
                 if memory is not None:
                     self.memory_ego[t].copy_(memory[0])
                     self.memory_vector[t].copy_(memory[1])
-                inputs, _ = self._inputs(self.cls[t] if self.features.visual else None,
-                                         self.tokens[t] if self.features.visual else None,
-                                         self.rollout_goals[t].float() if self.features.visual else None,
-                                         self.proprio[t], self.privileged[t], memory, self.command)
+                inputs, logits = self._inputs(self.cls[t] if self.features.visual else None,
+                                              self.tokens[t] if self.features.visual else None,
+                                              self.rollout_goals[t].float() if self.features.visual else None,
+                                              self.proprio[t], self.privileged[t], memory, self.command)
+                if logits is not None:
+                    self._confusion(t, logits, explore)
                 mean, hidden = self.policy.step(inputs, self.memory, self.next_start)
                 raw = mean + log_std.exp() * torch.randn_like(mean)
                 self.actions[t].copy_(raw)
@@ -314,11 +355,16 @@ class Trainer:
                     logratio = logprobs - self.logprobs[times, env_ids]
                     ratio = logratio.exp()
                     adv = self.advantages[times, env_ids]
-                    policy_loss = torch.maximum(-adv * ratio, -adv * ratio.clamp(1 - cfg.clip, 1 + cfg.clip)).mean()
+                    # Confusion-masked steps (mask_confusion) carry zero weight; otherwise all ones.
+                    weight = self.loss_weights[times, env_ids]
+                    norm = weight.sum().clamp_min(1.0)
+                    policy_loss = (torch.maximum(-adv * ratio, -adv * ratio.clamp(1 - cfg.clip, 1 + cfg.clip))
+                                   * weight).sum() / norm
                     old_value = self.values[times, env_ids]
                     clipped_value = old_value + (values - old_value).clamp(-cfg.clip, cfg.clip)
                     target = self.returns[times, env_ids]
-                    value_loss = 0.5 * torch.maximum((values - target).square(), (clipped_value - target).square()).mean()
+                    value_loss = 0.5 * (torch.maximum((values - target).square(), (clipped_value - target).square())
+                                        * weight).sum() / norm
                     if attended is not None:
                         aux_saliency, aux_accuracy = saliency_loss(
                             attended, privileged.flatten(0, 1), self.policy.attention.grid_h,
@@ -356,10 +402,11 @@ class Trainer:
     def finish_rollout(self, length, losses):
         """GPU-only end-of-rollout bookkeeping: curriculum update for the next rollout and metrics.
 
-        Returns float32 [RESULT_WIDTH] (37): rollout totals (7: mean reward, completed episodes,
+        Returns float32 [RESULT_WIDTH] (39): rollout totals (9: mean reward, completed episodes,
         goal successes, collisions, completed returns, completed explore episodes, their terminal
-        observed tiles), PPO losses (9, see LOSS_NAMES), bucket totals (12, row-major [4,3]),
-        weights used this rollout (3), weights for the next rollout (3), success EMAs (3).
+        observed tiles, goal steps claiming the target in view, of those confused with a look-alike),
+        PPO losses (9, see LOSS_NAMES), bucket totals (12, row-major [4,3]), weights used this
+        rollout (3), weights for the next rollout (3), success EMAs (3).
         """
         totals = self.bucket_totals(length)
         used = self.curriculum.weights.clone()
@@ -370,6 +417,7 @@ class Trainer:
         rollout = torch.stack((self.rewards[:length].mean(), self.done[:length].sum(),
                                self.success[:length].sum(), self.collision[:length].sum(),
                                self.completed_returns[:length].sum(), explored.sum(),
-                               self.explore_tiles[:length].sum()))
+                               self.explore_tiles[:length].sum(), self.claimed[:length].sum(),
+                               self.confused[:length].sum()))
         return torch.cat((rollout, losses, totals.flatten(), used,
                           self.curriculum.weights, self.curriculum.ema))

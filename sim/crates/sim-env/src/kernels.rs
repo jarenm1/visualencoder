@@ -49,8 +49,8 @@ pub(crate) struct EnvState {
     pub target_half: [f32; 4],
     /// Clamped action applied on the last step.
     pub action: [f32; 4],
-    /// Per-episode GPS offset: noisy target = target + gps_offset.
-    pub gps_offset: [f32; 4],
+    /// Per-episode hint error: hinted target = target + hint_offset.
+    pub hint_offset: [f32; 4],
     /// Yaw-only setpoint quaternion (xyzw, rotation about world +y), velocity mode only.
     pub yaw_setpoint: [f32; 4],
     /// Box distance at the start.
@@ -71,9 +71,16 @@ pub(crate) struct EnvState {
     pub hold: u32,
     /// EVENT_* bits set by the control kernel.
     pub event: u32,
-    /// Per-episode GPS availability, sampled at reset (0 or 1).
-    pub gps_available: u32,
+    /// Per-episode hint mode (task::HINT_*) and claimed radius (metres), sampled at reset.
+    pub hint: u32,
+    pub hint_radius: f32,
     pub observed_tiles: u32,
+    /// observed_tiles already rewarded (search reward pays only new tiles).
+    pub rewarded_tiles: u32,
+    /// The target's anchor has been in view this episode (search -> approach).
+    pub seen: u32,
+    /// The reach bonus has been paid this episode.
+    pub reached: u32,
 }
 
 #[repr(C)]
@@ -100,7 +107,8 @@ pub(crate) struct Buffers {
     pub episodes: *mut u64,
     /// Current catalog index per env (the goal-table row).
     pub catalog_index: *mut i32,
-    pub gps_available: *mut f32,
+    /// Hint mode of each episode that ended this step (-1 otherwise).
+    pub ended_hint: *mut f32,
     /// Goal crop rectangles written by `goal_view` (n x [x0, y0, x1, y1]).
     pub crops: *mut f32,
     /// Appearance key per camera slot: the catalog index whose appearance it renders.
@@ -161,12 +169,13 @@ pub(crate) mod device {
     use super::{Buffers, Config, EnvState, ImageArgs, LabelArgs};
     use crate::task::{
         APPEARANCE_SALT, CAMERA_FLOATS, COS_LANDING_TILT, CONTROL_RATES, DIAGNOSTIC_DIM, DISTRICT_MARGIN,
-        EVENT_CRASH, EVENT_OOB, GPS_MAX_RADIUS, GPS_MIN_RADIUS, GPS_SCALE, GPS_VERTICAL, HEIGHT_SCALE,
-        LABEL_CELL, LABEL_MARGIN, LABEL_MIN_HITS, LABEL_SIDE, LANE_BUCKET, LANE_CATALOG, LANE_GPS_ANGLE,
-        LANE_GPS_AVAILABLE, LANE_GPS_RADIUS, LANE_GPS_VERTICAL, LANE_GYRO, LANE_HEIGHT, LANE_VELOCITY,
-        LENS_BLUR_TAPS, LENS_DISTORTION, LENS_EXPOSURE, LENS_READOUT, LENS_VIGNETTE, NOISE_GYRO, NOISE_HEIGHT,
-        NOISE_VELOCITY, PATCH, PRIVILEGED_DIM, RATE_SCALE, SENSOR_DIM, SETTLE_RATE, VELOCITY_SCALE, mix,
-        stream, unit,
+        EVENT_CRASH, EVENT_OOB, HEIGHT_SCALE, HINT_COARSE, HINT_COARSE_RADIUS, HINT_NONE, HINT_PRECISE,
+        HINT_PRECISE_RADIUS, HINT_VERTICAL, HINT_WRONG, HINT_WRONG_ERROR, LABEL_CELL, LABEL_MARGIN,
+        LABEL_MIN_HITS, LABEL_SIDE, LANE_BUCKET, LANE_CATALOG, LANE_GYRO, LANE_HEIGHT, LANE_HINT_ANGLE,
+        LANE_HINT_AVAILABLE, LANE_HINT_ERROR, LANE_HINT_MODE, LANE_HINT_RADIUS, LANE_HINT_VERTICAL,
+        LANE_VELOCITY, LENS_BLUR_TAPS, LENS_DISTORTION, LENS_EXPOSURE, LENS_READOUT, LENS_VIGNETTE,
+        NOISE_GYRO, NOISE_HEIGHT, NOISE_VELOCITY, PATCH, POSITION_SCALE, PRIVILEGED_DIM, RATE_SCALE,
+        SENSOR_DIM, SETTLE_RATE, VELOCITY_SCALE, mix, stream, unit,
     };
     use cuda_device::{float, kernel, thread};
     use sim_state::BodyState;
@@ -234,6 +243,13 @@ pub(crate) mod device {
     #[inline(always)]
     fn clampf(x: f32, lo: f32, hi: f32) -> f32 {
         if x < lo { lo } else if x > hi { hi } else { x }
+    }
+
+    /// Curriculum lane `k` as a probability in [0, 1] (NaN reads as 0).
+    #[inline(always)]
+    unsafe fn probability(buffers: Buffers, k: usize) -> f32 {
+        let raw = unsafe { *buffers.weights.add(k) };
+        if raw != raw { 0.0 } else { clampf(raw, 0.0, 1.0) }
     }
 
     #[inline(always)]
@@ -400,8 +416,7 @@ pub(crate) mod device {
             w = [1.0; 3];
             sum = 3.0;
         }
-        let p_raw = unsafe { *buffers.weights.add(3) };
-        let p_no_gps = if p_raw != p_raw { 0.0 } else { clampf(p_raw, 0.0, 1.0) };
+        let p_no_hint = unsafe { probability(buffers, 3) };
         let pick = unit(base, LANE_BUCKET) * sum;
         let bucket = if pick < w[0] { 0usize } else if pick < w[0] + w[1] { 1usize } else { 2usize };
         let count = config.bucket_count[bucket];
@@ -421,14 +436,27 @@ pub(crate) mod device {
         let half = xyz(spec.target_half);
         let start_landed = spec.meta[2];
 
-        // GPS: episode-level availability (no-GPS probability p) and a fixed-metre error radius.
-        let gps_available = unit(base, LANE_GPS_AVAILABLE) >= p_no_gps;
-        let radius = GPS_MIN_RADIUS + (GPS_MAX_RADIUS - GPS_MIN_RADIUS) * unit(base, LANE_GPS_RADIUS);
-        let angle = core::f32::consts::TAU * unit(base, LANE_GPS_ANGLE);
-        let gps = [
-            radius * float::cos_approx_f32(angle),
-            (2.0 * unit(base, LANE_GPS_VERTICAL) - 1.0) * GPS_VERTICAL,
-            radius * float::sin_approx_f32(angle),
+        // Hint: none with probability p_no_hint; otherwise coarse / wrong with lanes 5 / 6 of the
+        // hinted episodes and precise for the rest. Precise and coarse errors are uniform in the
+        // claimed disc; a wrong hint is 30-80 m off while claiming a precise radius.
+        let hinted = unit(base, LANE_HINT_AVAILABLE) >= p_no_hint;
+        let mode_pick = unit(base, LANE_HINT_MODE);
+        let p_coarse = unsafe { probability(buffers, 5) };
+        let p_wrong = unsafe { probability(buffers, 6) };
+        let hint = if !hinted { HINT_NONE } else if mode_pick < p_coarse { HINT_COARSE }
+            else if mode_pick < p_coarse + p_wrong { HINT_WRONG } else { HINT_PRECISE };
+        let range = if hint == HINT_COARSE { HINT_COARSE_RADIUS } else { HINT_PRECISE_RADIUS };
+        let claimed = range[0] + (range[1] - range[0]) * unit(base, LANE_HINT_RADIUS);
+        let error = if hint == HINT_WRONG {
+            HINT_WRONG_ERROR[0] + (HINT_WRONG_ERROR[1] - HINT_WRONG_ERROR[0]) * unit(base, LANE_HINT_ERROR)
+        } else {
+            claimed * float::sqrt_rn_f32(unit(base, LANE_HINT_ERROR))
+        };
+        let angle = core::f32::consts::TAU * unit(base, LANE_HINT_ANGLE);
+        let offset = [
+            error * float::cos_approx_f32(angle),
+            (2.0 * unit(base, LANE_HINT_VERTICAL) - 1.0) * HINT_VERTICAL,
+            error * float::sin_approx_f32(angle),
         ];
 
         let thrust = if start_landed != 0 { 0.0 } else { MASS * GRAVITY };
@@ -437,7 +465,7 @@ pub(crate) mod device {
             target: pack(target),
             target_half: pack(half),
             action: [0.0; 4],
-            gps_offset: pack(gps),
+            hint_offset: pack(offset),
             yaw_setpoint: heading_quat(rot),
             initial_distance: spec.stats[1],
             previous_distance: maxf(box_distance(position, target, half), STANDOFF_NEAR),
@@ -452,8 +480,12 @@ pub(crate) mod device {
             landed: start_landed,
             hold: 0,
             event: 0,
-            gps_available: gps_available as u32,
+            hint,
+            hint_radius: claimed,
             observed_tiles: 0,
+            rewarded_tiles: 0,
+            seen: 0,
+            reached: 0,
         };
         let body = BodyState {
             position: pack(position),
@@ -553,18 +585,19 @@ pub(crate) mod device {
             put(s, 9, (height_above + gauss(base, LANE_HEIGHT) * NOISE_HEIGHT) / HEIGHT_SCALE);
             put4(s, 10, st.action);
         }
-        let rel = sub(add(target, xyz(st.gps_offset)), p);
+        let rel = sub(add(target, xyz(st.hint_offset)), p);
         let fwd_w = rotate(q, [0.0, 0.0, -1.0]);
         let fwd_h = [fwd_w[0], 0.0, fwd_w[2]];
         let forward = if length(fwd_h) > 1.0e-6 { normalize(fwd_h) } else { [0.0, 0.0, -1.0] };
         let right = [-forward[2], 0.0, forward[0]];
         unsafe {
-            let gps_on = st.gps_available != 0;
-            let hint = [dot(rel, right) / GPS_SCALE, rel[1] / GPS_SCALE, -dot(rel, forward) / GPS_SCALE];
-            put3(s, 14, if gps_on { hint } else { [0.0; 3] });
+            let hinted = st.hint != HINT_NONE;
+            let hint = [dot(rel, right) / POSITION_SCALE, rel[1] / POSITION_SCALE, -dot(rel, forward) / POSITION_SCALE];
+            put3(s, 14, if hinted { hint } else { [0.0; 3] });
             let remaining = if st.step >= HORIZON { 0.0 } else { (HORIZON - st.step) as f32 / HORIZON as f32 };
             put(s, 17, remaining);
-            put(s, 18, if gps_on { 1.0 } else { 0.0 });
+            put(s, 18, if hinted { 1.0 } else { 0.0 });
+            put(s, 19, if hinted { st.hint_radius / POSITION_SCALE } else { 0.0 });
         }
 
         // Privileged (critic-only) state.
@@ -575,8 +608,8 @@ pub(crate) mod device {
         let rel_body = rotate_inverse(q, rel_true);
         let pv = unsafe { buffers.privileged.add(i * PRIVILEGED_DIM) };
         unsafe {
-            put3(pv, 0, scale(rel_body, 1.0 / GPS_SCALE));
-            put(pv, 3, box_distance(p, target, half) / GPS_SCALE);
+            put3(pv, 0, scale(rel_body, 1.0 / POSITION_SCALE));
+            put(pv, 3, box_distance(p, target, half) / POSITION_SCALE);
             put3(pv, 4, scale(v, 1.0 / VELOCITY_SCALE));
             put3(pv, 7, scale(w_b, 1.0 / RATE_SCALE));
             put4(pv, 10, q);
@@ -587,7 +620,7 @@ pub(crate) mod device {
             put(pv, 18, ndc[0]);
             put(pv, 19, ndc[1]);
             put(pv, 20, if in_frustum { 1.0 } else { 0.0 });
-            put3(pv, 21, scale(half, 1.0 / GPS_SCALE));
+            put3(pv, 21, scale(half, 1.0 / POSITION_SCALE));
             put(pv, 24, st.hold as f32 / HOLD_STEPS as f32);
             let screen = if seen { box_screen(config, eye, cam_forward, cam_up, target, half) } else { [0.0; 4] };
             put4(pv, 25, screen);
@@ -610,7 +643,7 @@ pub(crate) mod device {
             put(dg, 20, st.initial_distance);
             put(dg, 21, st.visible_start);
             put(dg, 22, (st.episode & 0xFF_FFFF) as f32);
-            put(dg, 23, if st.gps_available != 0 { 1.0 } else { 0.0 });
+            put(dg, 23, st.hint as f32);
             put3(dg, 24, half);
             put(dg, 27, st.object as f32);
             *buffers.catalog_index.add(i) = st.catalog as i32;
@@ -838,8 +871,8 @@ pub(crate) mod device {
         }
     }
 
-    // The policy must approach, brake and hold. Success is the first sustained three-second hold
-    // and ends the episode; the 40 s deadline otherwise fails it. No action override.
+    // Search, reach, hold (sim_state::drone::goal_reward). Success is the first sustained
+    // three-second hold and ends the episode; the 40 s deadline otherwise fails it. No action override.
     #[inline(always)]
     unsafe fn finish_env(buffers: Buffers, config: Config, i: usize) {
         let mut st = unsafe { *buffers.states.add(i) };
@@ -867,8 +900,21 @@ pub(crate) mod device {
             st.step = 0;
         }
 
+        // Search until the target is first in view (or a precise hint locates it), then approach;
+        // the reach bonus is paid once, on first entering the facing band.
+        if facing {
+            st.seen = 1;
+        }
+        let guided = st.seen != 0 || st.hint == HINT_PRECISE;
+        let reached = near && st.reached == 0;
+        if reached {
+            st.reached = 1;
+        }
+        let new_tiles = st.observed_tiles - st.rewarded_tiles;
+        st.rewarded_tiles = st.observed_tiles;
         let effective = maxf(d, STANDOFF_NEAR);
-        let reward = goal_reward(st.previous_distance - effective, speed, near, success, done && !success);
+        let reward = goal_reward(st.previous_distance - effective, new_tiles, guided, reached, holding, success,
+            done && !success);
 
         unsafe {
             *buffers.episode_diagnostics.add(i * 3 + 1) = if done { st.observed_tiles as f32 } else { -1.0 };
@@ -879,7 +925,7 @@ pub(crate) mod device {
             *buffers.collision.add(i) = if crash { 1.0 } else { 0.0 };
             *buffers.oob.add(i) = if oob { 1.0 } else { 0.0 };
             *buffers.bucket.add(i) = if done { st.bucket as f32 } else { -1.0 };
-            *buffers.gps_available.add(i) = if done { st.gps_available as f32 } else { -1.0 };
+            *buffers.ended_hint.add(i) = if done { st.hint as f32 } else { -1.0 };
         }
         st.previous_distance = effective;
         unsafe { *buffers.states.add(i) = st };
@@ -1224,6 +1270,9 @@ pub(crate) mod device {
         // A new target is a new task from here: the episode clock restarts.
         st.step = 0;
         st.observed_tiles = 0;
+        st.rewarded_tiles = 0;
+        st.seen = 0;
+        st.reached = 0;
         let mut word = 0usize;
         while word < 512 {
             unsafe { *buffers.coverage_seen.add(i * 512 + word) = 0; }
@@ -1239,7 +1288,8 @@ pub(crate) mod device {
         }
     }
 
-    /// Actual-camera surface coverage, measured only for diagnosis. Never used in reward.
+    /// Actual-camera surface coverage: the goal reward's search term before the first sighting,
+    /// the explore command's reward, and diagnostics.
     #[kernel]
     pub unsafe fn coverage(buffers: Buffers, config: Config, args: ImageArgs) {
         let i = thread::index_1d().get();
@@ -1303,7 +1353,7 @@ pub(crate) mod device {
             *buffers.collision.add(i) = 0.0;
             *buffers.oob.add(i) = 0.0;
             *buffers.bucket.add(i) = -1.0;
-            *buffers.gps_available.add(i) = -1.0;
+            *buffers.ended_hint.add(i) = -1.0;
             *buffers.episode_diagnostics.add(i * 3) = 0.0;
             *buffers.episode_diagnostics.add(i * 3 + 1) = -1.0;
             *buffers.episode_diagnostics.add(i * 3 + 2) = -1.0;

@@ -113,6 +113,7 @@ def training_settings(args):
         "pose": "dead reckoning from noisy gyro and body velocity", "depth": "frozen monocular patch heads",
         "depth_view": args.depth_view}
     return {"curriculum": args.curriculum, "no_gps_fraction": args.no_gps_fraction,
+            "coarse_hint_fraction": args.coarse_hint_fraction, "wrong_hint_fraction": args.wrong_hint_fraction,
             "aux_coefficient": args.aux_coefficient, "appearance": args.appearance,
             "goal_refresh_steps": args.goal_refresh_steps,
             "goal_box_source": "simulator" if args.goal_refresh_steps else None,
@@ -121,6 +122,7 @@ def training_settings(args):
                 "paths": [str(path) for path in (args.city, *args.train_cities)],
                 "catalog_size_per_city": args.city_catalog_size},
             "explore_fraction": args.explore_fraction, "commands": commands_of(args),
+            "mask_confusion": args.mask_confusion,
             "init_from": None if args.init_from is None else {"path": str(args.init_from),
                                                                "sha256": sha256(args.init_from)}}
 
@@ -134,11 +136,11 @@ def checkpoint(policy, metadata, steps):
             "model": policy.state_dict()}
 
 
-# The previous task, which explicit visual-policy evaluation may transfer from. v4 changed the
-# horizon (15 -> 40 s), ended episodes at the first sustained hold, and added camera effects and
-# label fields; flight dynamics, sensors and encoders are unchanged.
-TRANSFER_SOURCE = ("city-drone-goal-v3", 6)
-TRANSFER_CHANGED = {"task", "abi_version", "success", "reward", "horizon", "camera_effects", "patch_labels"}
+# The previous task, which explicit visual-policy evaluation may transfer from. v5 changed the
+# reward (search, reach and hold terms) and replaced the GPS lane with hint modes, which also adds a
+# sensor lane; so a v4 policy, whose sensors differ, is still rejected by the contract check.
+TRANSFER_SOURCE = ("city-drone-goal-v4", 7)
+TRANSFER_CHANGED = {"task", "abi_version", "reward", "gps", "hints"}
 
 
 def load_checkpoint(path, *, for_task_transfer=False):
@@ -185,7 +187,9 @@ def make_config(args):
                   value_coefficient=args.value_coefficient, max_grad_norm=args.max_grad_norm,
                   curriculum=args.curriculum, aux_coefficient=args.aux_coefficient,
                   no_gps_fraction=args.no_gps_fraction, appearance=args.appearance,
-                  goal_refresh_steps=args.goal_refresh_steps, explore_fraction=args.explore_fraction)
+                  coarse_hint_fraction=args.coarse_hint_fraction, wrong_hint_fraction=args.wrong_hint_fraction,
+                  goal_refresh_steps=args.goal_refresh_steps, explore_fraction=args.explore_fraction,
+                  mask_confusion=args.mask_confusion)
 
 
 def open_env(args, n, seed, style):
@@ -268,6 +272,8 @@ def training_record(steps, elapsed, values):
         "episode_return": values[4] / completed if completed else None,
         "explore_completed": values[5],
         "explore_tiles_mean": values[6] / values[5] if values[5] else None,
+        "claimed_in_view_steps": values[7], "confused_steps": values[8],
+        "confusion_rate": values[8] / values[7] if values[7] else None,
         **dict(zip(LOSS_NAMES, values[LOSS_AT:BUCKET_AT])),
         "bucket_completed": values[BUCKET_AT:BUCKET_AT + 3],
         "bucket_success": values[BUCKET_AT + 3:BUCKET_AT + 6],
@@ -361,6 +367,8 @@ def train_command(args, started):
                                       "validations_without_improvement": stale}), flush=True)
                     break
         curves.close()
+        # Look-alike confusion steps per catalog entry (failure mining input).
+        torch.save(trainer.confusion_by_catalog.cpu(), run / "confusion-by-catalog.pt")
         final = validate()
         validations.append({"steps": trainer.steps, "result": final, "final": True})
         if final["selection_success"] > best_success:
@@ -616,6 +624,9 @@ def add_learner(parser):
     parser.add_argument("--depth-view", action="store_true",
                         help="with --memory-heads: the actor also reads the heads' nearest predicted depth "
                              "over a 3x5 image grid (obstacle view)")
+    parser.add_argument("--mask-confusion", action="store_true",
+                        help="give goal steps whose saliency peak is a same-class look-alike zero weight in "
+                             "the policy and value losses (an encoder error, not a flight error)")
     parser.add_argument("--explore-fraction", type=float, default=DEFAULTS.explore_fraction,
                         help="fraction of training episodes given the explore command (coverage reward) "
                              "instead of the goal; > 0 makes the policy command-conditioned")
@@ -630,7 +641,11 @@ def add_learner(parser):
     parser.add_argument("--curriculum", choices=CURRICULUM_MODES, default="adaptive")
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--no-gps-fraction", type=float, default=DEFAULTS.no_gps_fraction,
-                        help="probability that a training episode runs without GPS")
+                        help="probability that a training episode has no target hint (GPS denied)")
+    parser.add_argument("--coarse-hint-fraction", type=float, default=DEFAULTS.coarse_hint_fraction,
+                        help="share of hinted episodes whose hint is coarse (10-40 m radius)")
+    parser.add_argument("--wrong-hint-fraction", type=float, default=DEFAULTS.wrong_hint_fraction,
+                        help="share of hinted episodes whose hint is 30-80 m off while claiming 1-5 m")
     parser.add_argument("--aux-coefficient", type=float, default=DEFAULTS.aux_coefficient,
                         help="weight of the visibility + localization auxiliary loss (visual arms)")
     parser.add_argument("--appearance", type=float, default=DEFAULTS.appearance,

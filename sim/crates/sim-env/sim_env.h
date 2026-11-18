@@ -40,16 +40,18 @@ enum sim_env_field {
     SIM_ENV_FIELD_CATALOG_INDEX = 9,
     /* float32 [n, 3, H, W]: goal reference views written by sim_env_render_goals(). */
     SIM_ENV_FIELD_GOAL_VIEWS = 10,
-    /* float32 [5]: [w_visible, w_partial, w_hidden, p_no_gps, appearance] bucket sampling
-     * weights, per-episode GPS-outage probability and appearance randomization strength
-     * in [0, 1]; writable by the caller. */
+    /* float32 [7]: [w_visible, w_partial, w_hidden, p_no_hint, appearance, p_coarse, p_wrong]:
+     * bucket sampling weights, per-episode no-hint probability, appearance randomization strength,
+     * and among hinted episodes the coarse and wrong hint probabilities (the rest are precise);
+     * writable by the caller. */
     SIM_ENV_FIELD_CURRICULUM = 11,
     /* float32 [n]: bucket of the episode ended on this transition (-1 if not done). */
     SIM_ENV_FIELD_BUCKET = 12,
     /* float32 [n]: 1 if the drone left the district or ceiling, else 0. */
     SIM_ENV_FIELD_OOB = 13,
-    /* float32 [n]: 1 if GPS was available for the episode ended on this transition, else 0; -1 if not done. */
-    SIM_ENV_FIELD_GPS_AVAILABLE = 14,
+    /* float32 [n]: hint mode (0 none, 1 precise, 2 coarse, 3 wrong) of the episode ended on this
+     * transition; -1 if not done. */
+    SIM_ENV_FIELD_ENDED_HINT = 14,
     /* float32 [n, 4]: normalized goal crops [x0, y0, x1, y1] written by sim_env_render_goals(). */
     SIM_ENV_FIELD_GOAL_CROPS = 15,
     /* float32 [n, 3]: current/terminal unique tiles, terminal consecutive hold steps; diagnostic only. */

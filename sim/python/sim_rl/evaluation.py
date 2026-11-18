@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import torch
 
-from .curriculum import BUCKETS, UNIFORM_WEIGHTS
+from .curriculum import BUCKETS, UNIFORM_WEIGHTS, fixed_lanes
 from .features import RefreshedGoals
 from .memory import SpatialMemory, observe as observe_memory
 from .model import EXPLORE_COMMAND, GOAL_COMMAND, deterministic_action
@@ -15,7 +15,7 @@ GPS_SPEED_GAIN = 0.5             # 1/s, proportional horizontal and vertical gai
 GPS_MAX_HORIZONTAL = 4.0         # m/s
 GPS_MAX_VERTICAL = 2.0           # m/s
 GPS_MAX_YAW_RATE = 1.5           # rad/s
-# proprio lanes 14..16 hold the GPS hint (right, up, -forward) in metres / 32; lane 18 is gps_available.
+# proprio lanes 14..16 hold the target hint (right, up, -forward) in metres / 32; lane 18 is hint available.
 GPS_HINT_SCALE = 32.0
 GPS_LANE = 18
 FIELDS = ("completed", "success", "collision", "out_of_bounds", "timeout", "success_steps",
@@ -52,12 +52,13 @@ def gps_pursuit(proprio, action_scales):
 
 @torch.no_grad()
 def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, appearance=1.0,
-             goal_refresh_steps=0, bucket_weights=UNIFORM_WEIGHTS):
+             goal_refresh_steps=0, bucket_weights=UNIFORM_WEIGHTS, coarse=0.0, wrong=0.0):
     """Deterministic policy (tanh of the mean) or blind heuristic over one reset of the native finite horizon.
 
-    Curriculum is uniform over visibility buckets with p_no_gps = ``no_gps`` and the given
-    appearance strength. Outcomes are exclusive (success > collision > out_of_bounds > timeout)
-    and recorded only for each environment's first completed episode.
+    Curriculum is uniform over visibility buckets with p_no_gps = ``no_gps`` (episodes without a
+    target hint), hinted episodes coarse / wrong with probabilities ``coarse`` / ``wrong`` (precise
+    otherwise), and the given appearance strength. Outcomes are exclusive (success > collision >
+    out_of_bounds > timeout) and recorded only for each environment's first completed episode.
     """
     if (policy is None) == (heuristic is None):
         raise ValueError("provide exactly one trained policy or blind heuristic")
@@ -68,8 +69,7 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
     n, device = env.n, env.device
     if len(bucket_weights) != 3 or min(bucket_weights) < 0 or sum(bucket_weights) <= 0:
         raise ValueError("bucket_weights must contain three nonnegative weights with positive sum")
-    lanes = torch.tensor(tuple(bucket_weights) + (no_gps, appearance), device=device, dtype=torch.float32)
-    env.write_curriculum(lanes)
+    env.write_curriculum(fixed_lanes(device, tuple(bucket_weights), no_gps, appearance, coarse, wrong))
     goals = features.catalog_goals(env, appearance) if policy is not None and features.visual else None
     env.reset(seed)
     goal_source = RefreshedGoals(env, features, goals, goal_refresh_steps) if goals is not None else None
@@ -192,7 +192,7 @@ def evaluate_explore(env, features, policy, seed=0, appearance=1.0, no_gps=1.0):
     """Deterministic policy under the explore command (no goal) for one reset of the horizon: surface
     tiles observed by each environment's first episode (native coverage), and how it ended."""
     n, device = env.n, env.device
-    env.write_curriculum(torch.tensor(UNIFORM_WEIGHTS + (no_gps, appearance), device=device, dtype=torch.float32))
+    env.write_curriculum(fixed_lanes(device, no_gps=no_gps, appearance=appearance))
     env.reset(seed)
     spatial = (SpatialMemory(n, env.height // 16, env.width // 16, env.metadata["camera"], device)
                if policy.spatial else None)

@@ -13,7 +13,7 @@ from PIL import Image
 
 from .cli import (DEFAULT_LIBRARY, ROOT, TEST_SEED, TEST_STYLE, TRAIN_STYLE, VALIDATION_SEED,
                   VALIDATION_STYLE, build_policy, load_checkpoint, sha256, validate_checkpoint)
-from .curriculum import UNIFORM_WEIGHTS
+from .curriculum import fixed_lanes
 from .features import RefreshedGoals, checkpoint_features, crop_goals, square_goal_box
 from .memory import CHANNELS, EGO, EGO_RADIUS, SpatialMemory, observe as observe_memory
 from .model import GOAL_COMMAND, deterministic_action, saliency_targets
@@ -132,7 +132,7 @@ def capture(args, saved, features, seed, style, no_gps_fraction, appearance, gro
             device, horizon = env.device, env.horizon
             h, w = env.height, env.width
             patch_h, patch_w = h // 16, w // 16
-            lanes = torch.tensor(UNIFORM_WEIGHTS + (no_gps_fraction, appearance), device=device, dtype=torch.float32)
+            lanes = fixed_lanes(device, no_gps=no_gps_fraction, appearance=appearance)
             env.write_curriculum(lanes)
             goals = features.catalog_goals(env, appearance) if features.visual else None
             env.reset(seed)

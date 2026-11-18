@@ -84,7 +84,7 @@ def data(args):
     from sim_rl.cli import DEFAULT_LIBRARY, TEST_SEED, TEST_STYLE, TRAIN_STYLE
     from sim_rl.native import CudaEnv
     from sim_rl.perception import OU_BIAS, OU_SIGMA, OU_THETA
-    from sim_rl.curriculum import UNIFORM_WEIGHTS
+    from sim_rl.curriculum import fixed_lanes
     layout = json.loads((ROOT / "assets/city/layout.json").read_text())["objects"]
     names = sorted({object_phrase(o["asset"]) for o in layout if o["class"] in ("vehicle", "building", "vegetation", "prop")})
     rng = random.Random(args.seed)
@@ -96,7 +96,7 @@ def data(args):
         with CudaEnv(DEFAULT_LIBRARY, args.num_envs, seed, 320, 240, style, "velocity",
                      start_distance=(8.0, 60.0)) as env, env.execution():
             device = env.device
-            env.write_curriculum(torch.tensor(UNIFORM_WEIGHTS + (0.0, 1.0), device=device))
+            env.write_curriculum(fixed_lanes(device))
             env.reset(seed)
             generator = torch.Generator(device=device).manual_seed(seed)
             bias = torch.tensor(OU_BIAS, device=device)

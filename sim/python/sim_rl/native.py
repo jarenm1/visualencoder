@@ -10,8 +10,8 @@ from pathlib import Path
 import torch
 
 DEFAULT_CITY = Path(__file__).resolve().parents[3] / "assets" / "city"
-TASK = "city-drone-goal-v4"
-ABI_VERSION = 7
+TASK = "city-drone-goal-v5"
+ABI_VERSION = 8
 ACTION_DIM = 4
 HORIZON = 1200
 CONTROL_HZ = 30
@@ -22,13 +22,15 @@ CONTROL_MODES = {"velocity": 0, "rates": 1}
 HOVER_ACTIONS = {"velocity": (0.0, 0.0, 0.0, 0.0), "rates": (-0.2, 0.0, 0.0, 0.0)}
 # Fields: 0 obs, 1 proprio, 2 reward, 3 done, 4 success, 5 privileged, 6 collision,
 # 7 episodes, 8 diagnostics, 9 catalog index, 10 goal views, 11 curriculum (writable),
-# 12 ended bucket, 13 out_of_bounds, 14 ended gps_available, 15 goal crops, 16 episode diagnostics,
+# 12 ended bucket, 13 out_of_bounds, 14 ended hint mode, 15 goal crops, 16 episode diagnostics,
 # 17 patch depth, 18 patch object (both training labels, never actor input).
 FIELD_COUNT = 19
 PATCH = 16
 DIAGNOSTICS_WIDTH = 28
-CURRICULUM_WIDTH = 5  # w_visible, w_partial, w_hidden, p_no_gps, appearance strength
-PROPRIO_WIDTH = 19
+# w_visible, w_partial, w_hidden, p_no_gps (no hint), appearance strength, p_coarse, p_wrong (of hinted)
+CURRICULUM_WIDTH = 7
+PROPRIO_WIDTH = 20
+HINT_MODES = ("none", "precise", "coarse", "wrong")
 PRIVILEGED_WIDTH = 29
 REQUIRED_METADATA = ("abi_version", "task", "action_dim", "control_hz", "physics_hz", "horizon",
                      "catalog_size", "city_fingerprint", "city_path", "control_mode", "action_names",
@@ -157,7 +159,7 @@ class CudaEnv:
                 ((CURRICULUM_WIDTH,), "<f4"),          # 11 curriculum lanes (writable)
                 ((n,), "<f4"),                         # 12 ended bucket, -1 if not done
                 ((n,), "<f4"),                         # 13 out_of_bounds
-                ((n,), "<f4"),                         # 14 ended gps_available
+                ((n,), "<f4"),                         # 14 ended hint mode (HINT_MODES index), -1 if not done
                 ((n, 4), "<f4"),                       # 15 goal crops
                 ((n, 3), "<f4"),                       # 16 episode diagnostics, never actor input
                 ((n, patches), "<f4"),                 # 17 patch depth (label)
@@ -177,7 +179,7 @@ class CudaEnv:
                     self.tensors.append(view)
             (self.obs, self.proprio, self.reward, self.done, self.success, self.privileged,
              self.collision, self.episode_counts, self.diagnostics, self.catalog_index, self.goal_views,
-             self.curriculum, self.ended_bucket, self.out_of_bounds, self.ended_gps, self.goal_crops,
+             self.curriculum, self.ended_bucket, self.out_of_bounds, self.ended_hint, self.goal_crops,
              self.episode_diagnostics, self.patch_depth, self.patch_object) = self.tensors
         except BaseException:
             self.close()
@@ -236,7 +238,7 @@ class CudaEnv:
             raise RuntimeError(self.error())
 
     def write_curriculum(self, lanes):
-        """Enqueue an in-place device copy of [w_visible, w_partial, w_hidden, p_no_gps, appearance]."""
+        """Enqueue an in-place device copy of the CURRICULUM_WIDTH lanes (curriculum.py)."""
         self._check_stream()
         if lanes.device != self.device or lanes.shape != (CURRICULUM_WIDTH,) or lanes.dtype != torch.float32:
             raise ValueError(f"curriculum lanes must be CUDA:0 float32[{CURRICULUM_WIDTH}]")

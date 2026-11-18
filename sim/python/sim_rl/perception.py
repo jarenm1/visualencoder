@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .curriculum import UNIFORM_WEIGHTS
+from .curriculum import fixed_lanes
 from .native import PATCH, CudaEnv
 
 CLASSES = ("none", "building", "vegetation", "vehicle", "prop")
@@ -91,7 +91,7 @@ def collect_labelled(env, count, seed, stride, appearance):
     prior = torch.empty((rounds * n, patches, PRIOR_WIDTH), device=device)
     depth = torch.empty((rounds * n, patches), device=device)
     classes = torch.empty((rounds * n, patches), dtype=torch.long, device=device)
-    env.write_curriculum(torch.tensor(UNIFORM_WEIGHTS + (0.0, appearance), device=device, dtype=torch.float32))
+    env.write_curriculum(fixed_lanes(device, appearance=appearance))
     env.reset(seed)
     generator = torch.Generator(device=device).manual_seed(seed)
     bias = torch.tensor(OU_BIAS, device=device)

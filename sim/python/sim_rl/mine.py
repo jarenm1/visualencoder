@@ -22,7 +22,7 @@ import torch
 
 from .cli import (TEST_SEED, TEST_STYLE, TRAIN_STYLE, VALIDATION_SEED, VALIDATION_STYLE, build_policy,
                   emit, load_checkpoint, sha256, validate_checkpoint)
-from .curriculum import UNIFORM_WEIGHTS
+from .curriculum import fixed_lanes
 from .features import checkpoint_features, crop_goals
 from .model import deterministic_action, saliency_targets
 from .native import CudaEnv
@@ -66,7 +66,7 @@ def mine_split(args, saved, features, split):
         policy = build_policy(env, features, saved)
         policy.eval()
         grid_h, grid_w = env.height // 16, env.width // 16
-        env.write_curriculum(torch.tensor(UNIFORM_WEIGHTS + (0.0, args.appearance), device=env.device))
+        env.write_curriculum(fixed_lanes(env.device, appearance=args.appearance))
         table = features.catalog_goals(env, args.appearance)
         generator = torch.Generator(device=env.device).manual_seed(seed)
         for round_index in range(args.rounds):

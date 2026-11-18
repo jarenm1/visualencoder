@@ -18,7 +18,7 @@ import torch
 from .native import CURRICULUM_WIDTH, CudaEnv
 
 GATHERED = ("obs", "proprio", "reward", "done", "success", "privileged", "collision", "diagnostics",
-            "ended_bucket", "out_of_bounds", "ended_gps", "episode_diagnostics", "patch_depth", "patch_object")
+            "ended_bucket", "out_of_bounds", "ended_hint", "episode_diagnostics", "patch_depth", "patch_object")
 SHARED = ("device", "width", "height", "style", "control_mode", "library", "action_dim", "horizon",
           "control_hz", "target_classes", "layout_classes", "action_names", "action_scales", "metadata",
           "task_contract")

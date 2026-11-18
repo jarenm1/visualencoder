@@ -25,8 +25,8 @@ use task::*;
 
 /// Fixed visibility and projection aspect (width / height).
 const CAMERA_ASPECT: f32 = 4.0 / 3.0;
-/// Default curriculum lanes: uniform buckets, GPS always available, full appearance randomization.
-const DEFAULT_LANES: [f32; CURRICULUM_LANES] = [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 0.0, 1.0];
+/// Default curriculum lanes: uniform buckets, always a hint (all precise), full appearance randomization.
+const DEFAULT_LANES: [f32; CURRICULUM_LANES] = [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 0.0, 1.0, 0.0, 0.0];
 
 struct TaskKernels {
     reset: Function,
@@ -342,7 +342,7 @@ impl Env {
             bucket: self.outputs[12].cu_deviceptr() as *mut f32,
             episodes: self.outputs[7].cu_deviceptr() as *mut u64,
             catalog_index: self.outputs[9].cu_deviceptr() as *mut i32,
-            gps_available: self.outputs[14].cu_deviceptr() as *mut f32,
+            ended_hint: self.outputs[14].cu_deviceptr() as *mut f32,
             crops: self.outputs[15].cu_deviceptr() as *mut f32,
             keys: self.keys.cu_deviceptr() as *mut u32,
             coverage_seen: self.coverage_seen.cu_deviceptr() as *mut u32,
@@ -563,7 +563,7 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, district: &drone::D
         "landing": {"max_speed_mps": dynamics::LANDING_SPEED, "max_tilt_rad": dynamics::LANDING_TILT_RAD},
         "ceiling_m": dynamics::CEILING,
         "reward": {
-            "terms": "(max(d_prev, 3) - max(d_box, 3)) - 0.01 + 0.1*near*clamp(1 - speed/3, 0, 1) + 10*terminal_success - 10*terminal_failure; near = within 6 m of the box and facing it",
+            "terms": "search: 0.02 * new observed surface tiles until the target anchor is first in view (or with a precise hint), then (max(d_prev, 3) - max(d_box, 3)); - 0.01 per step; + 3 once on first being near; + 0.1 per holding step; + 10 success / - 10 failure; near = within 6 m of the box and facing it; holding = near and speed <= 1 m/s",
             "done": "success || crash || oob || step >= horizon; no bootstrap",
         },
         "sensors": {
@@ -574,8 +574,8 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, district: &drone::D
                 "6-8 body velocity (+noise sd 0.1) / 5",
                 "9 height above landable surface (+noise sd 0.03) / 10",
                 "10-13 last applied action",
-                "14-16 noisy target-centre offset in heading frame (x right, y up, z = -forward) / 32; 0 when GPS unavailable",
-                "17 remaining horizon fraction", "18 gps_available (0/1)",
+                "14-16 hinted target-centre offset in heading frame (x right, y up, z = -forward) / 32; 0 without a hint",
+                "17 remaining horizon fraction", "18 hint available (0/1)", "19 hint's claimed radius / 32 (0 without a hint)",
             ],
         },
         "privileged": {
@@ -594,7 +594,7 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, district: &drone::D
                 "0-2 position", "3-5 target centre", "6-9 quaternion xyzw", "10-12 world velocity",
                 "13 thrust N", "14 target class (layout index)", "15 bucket", "16 catalog index", "17 step",
                 "18 landed", "19 start landed", "20 initial box distance", "21 visible fraction at start",
-                "22 episode (low 24 bits)", "23 gps_available (0/1)", "24-26 target half extents",
+                "22 episode (low 24 bits)", "23 hint mode (0 none, 1 precise, 2 coarse, 3 wrong)", "24-26 target half extents",
                 "27 target object (layout index)",
             ],
         },
@@ -629,7 +629,7 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, district: &drone::D
             {"index": 11, "name": "curriculum", "dtype": "float32", "shape": [CURRICULUM_LANES]},
             {"index": 12, "name": "bucket", "dtype": "float32", "shape": ["n"]},
             {"index": 13, "name": "oob", "dtype": "float32", "shape": ["n"]},
-            {"index": 14, "name": "gps_available", "dtype": "float32", "shape": ["n"]},
+            {"index": 14, "name": "ended_hint", "dtype": "float32", "shape": ["n"]},
             {"index": 15, "name": "goal_crops", "dtype": "float32", "shape": ["n", 4]},
             {"index": 16, "name": "episode_diagnostics", "dtype": "float32", "shape": ["n", 3],
              "layout": ["current unique observed tiles", "ended episode unique observed tiles",
@@ -654,9 +654,12 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, district: &drone::D
             "mass_kg": dynamics::MASS,
         });
     }
-    json["gps"] = serde_json::json!({
-        "radius_m": [GPS_MIN_RADIUS, GPS_MAX_RADIUS], "vertical_m": GPS_VERTICAL,
-        "per_episode_available": "unit >= lanes[3] (p_no_gps): 1 never available, 0 always",
+    json["hints"] = serde_json::json!({
+        "modes": ["none", "precise", "coarse", "wrong"],
+        "sampling": "none with probability lanes[3]; else coarse with lanes[5], wrong with lanes[6], precise otherwise",
+        "precise_radius_m": HINT_PRECISE_RADIUS, "coarse_radius_m": HINT_COARSE_RADIUS,
+        "error": "uniform in the claimed disc (precise, coarse); wrong: HINT_WRONG_ERROR m off while claiming a precise radius",
+        "wrong_error_m": HINT_WRONG_ERROR, "vertical_m": HINT_VERTICAL,
     });
     json["appearance"] = serde_json::json!({
         "strength": "curriculum lane 4 in [0, 1]; 0 = plain render",

@@ -83,12 +83,12 @@ def iou(box, boxes):
 def frames(args):
     """Save start frames and cameras of a fresh held-out batch (same seed/envs replay later)."""
     from sim_rl.cli import DEFAULT_LIBRARY, TEST_SEED, TEST_STYLE
-    from sim_rl.curriculum import UNIFORM_WEIGHTS
+    from sim_rl.curriculum import fixed_lanes
     from sim_rl.native import CudaEnv
     args.out.mkdir(parents=True, exist_ok=True)
     seed = TEST_SEED if args.seed is None else args.seed
     with CudaEnv(DEFAULT_LIBRARY, args.num_envs, seed, 320, 240, TEST_STYLE, "velocity") as env, env.execution():
-        env.write_curriculum(torch.tensor(UNIFORM_WEIGHTS + (0.0, args.appearance), device=env.device))
+        env.write_curriculum(fixed_lanes(env.device, appearance=args.appearance))
         env.reset(seed)
         images = (env.obs.clamp(0, 1) * 255).round().to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
         diagnostics = env.diagnostics.cpu().numpy().astype(float)

@@ -79,13 +79,17 @@ class GpsPursuitTest(unittest.TestCase):
 
 
 class CurriculumLaneTest(unittest.TestCase):
-    def test_lanes_carry_bucket_weights_then_no_gps_then_appearance(self):
-        lanes = Curriculum("adaptive", torch.device("cpu"), 0.25, 0.5).lanes()
-        torch.testing.assert_close(lanes, torch.tensor([0.8, 0.15, 0.05, 0.25, 0.5]))
+    def test_lanes_carry_bucket_weights_then_no_gps_appearance_and_hint_mix(self):
+        lanes = Curriculum("adaptive", torch.device("cpu"), 0.25, 0.5, 0.3, 0.1).lanes()
+        torch.testing.assert_close(lanes, torch.tensor([0.8, 0.15, 0.05, 0.25, 0.5, 0.3, 0.1]))
 
     def test_uniform_mode_starts_uniform(self):
         lanes = Curriculum("uniform", torch.device("cpu"), 0.0).lanes()
-        torch.testing.assert_close(lanes, torch.tensor([1 / 3, 1 / 3, 1 / 3, 0.0, 1.0]))
+        torch.testing.assert_close(lanes, torch.tensor([1 / 3, 1 / 3, 1 / 3, 0.0, 1.0, 0.0, 0.0]))
+
+    def test_hint_mix_must_fit_in_the_hinted_episodes(self):
+        with self.assertRaises(ValueError):
+            Curriculum("uniform", torch.device("cpu"), 0.0, 1.0, 0.7, 0.4)
 
     def test_no_gps_fraction_must_be_a_probability(self):
         with self.assertRaises(ValueError):
