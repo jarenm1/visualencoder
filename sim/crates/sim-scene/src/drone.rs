@@ -245,6 +245,22 @@ fn candidate(ctx: &Ctx, index: usize) -> Result<Candidate> {
     bail!("candidate {index} found no placeable object in {MAX_OBJECTS} draws of {MAX_ATTEMPTS} attempts")
 }
 
+/// Probe length (metres) of the open-air test for starts.
+const ENCLOSURE_PROBE_M: f32 = 25.0;
+
+/// A hollow building's interior passes the clearance sweep, but no flight leaves it (the solvability
+/// verifier found 17% of test starts inside suburban houses). A start is enclosed when the rays
+/// straight up and in eight horizontal directions all hit geometry within ENCLOSURE_PROBE_M.
+fn enclosed(scene: &CityScene, start: Vec3) -> bool {
+    let blocked = |direction: Vec3| {
+        scene.sweep_hits(start.to_array(), (start + direction * ENCLOSURE_PROBE_M).to_array(), 0.0, LANDABLE)
+    };
+    blocked(Vec3::Y) && (0..8).all(|k| {
+        let angle = k as f32 * core::f32::consts::FRAC_PI_4;
+        blocked(Vec3::new(angle.cos(), 0.0, angle.sin()))
+    })
+}
+
 fn attempt(ctx: &Ctx, object: u32, rng: &mut Rng) -> Option<Candidate> {
     let scene = ctx.scene;
     let plane = scene.landable.height;
@@ -264,7 +280,7 @@ fn attempt(ctx: &Ctx, object: u32, rng: &mut Rng) -> Option<Candidate> {
         return None;
     }
     let clearance = if landed { drone::RADIUS } else { FLYING_CLEARANCE };
-    if scene.sweep_hits(start.to_array(), start.to_array(), clearance, LANDABLE) {
+    if scene.sweep_hits(start.to_array(), start.to_array(), clearance, LANDABLE) || enclosed(scene, start) {
         return None;
     }
 
@@ -490,6 +506,7 @@ fn rules(scene: &CityScene, ctx: &Ctx, size: usize, counts: [usize; BUCKETS], ep
             "landed_clearance_m": drone::RADIUS,
             "flying_height_m": FLYING_HEIGHT,
             "flying_clearance_m": FLYING_CLEARANCE,
+            "open_air": format!("rejected when rays up and in 8 horizontal directions all hit geometry within {ENCLOSURE_PROBE_M} m (inside a hollow building)"),
             "tilt_max_rad": START_TILT_RAD,
             "speed_max_mps": START_SPEED,
             "rate_max_rps": START_RATE,

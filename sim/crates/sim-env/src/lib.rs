@@ -20,7 +20,7 @@ use sim_state::BodyState;
 use sim_state::collision::{BvhNode, Triangle};
 use sim_state::drone as dynamics;
 use sim_state::drone::EpisodeSpec;
-use kernels::{Buffers, Config, EnvState, ImageArgs, LabelArgs};
+use kernels::{Buffers, Config, EnvState, ImageArgs, LabelArgs, OccupancyArgs};
 use task::*;
 
 /// Fixed visibility and projection aspect (width / height).
@@ -38,6 +38,7 @@ struct TaskKernels {
     retarget: Function,
     coverage: Function,
     patch_labels: Function,
+    occupancy: Function,
 }
 
 impl TaskKernels {
@@ -54,6 +55,7 @@ impl TaskKernels {
             retarget: module.load_function(kernels::device::retarget_CUDA_SIGNATURE.entry)?,
             coverage: module.load_function(kernels::device::coverage_CUDA_SIGNATURE.entry)?,
             patch_labels: module.load_function(kernels::device::patch_labels_CUDA_SIGNATURE.entry)?,
+            occupancy: module.load_function(kernels::device::occupancy_CUDA_SIGNATURE.entry)?,
         })
     }
 
@@ -91,6 +93,17 @@ impl TaskKernels {
             launch_kernel_on_stream(&self.coverage, (config.n.div_ceil(256), 1, 1),
                 (256, 1, 1), 0, stream, &mut args)?;
         }
+        Ok(())
+    }
+
+    unsafe fn launch_occupancy(&self, stream: &CudaStream, mut buffers: Buffers, mut config: Config,
+        mut grid: OccupancyArgs, voxels: u32) -> Result<()> {
+        let mut args = [
+            (&raw mut buffers).cast::<c_void>(),
+            (&raw mut config).cast::<c_void>(),
+            (&raw mut grid).cast::<c_void>(),
+        ];
+        unsafe { launch_kernel_on_stream(&self.occupancy, (voxels.div_ceil(256), 1, 1), (256, 1, 1), 0, stream, &mut args)? };
         Ok(())
     }
 
@@ -419,6 +432,20 @@ impl Env {
             kernels.launch(&kernels.retarget, stream, buffers, config, Some((&raw mut targets).cast()))
         })?;
         self.render_into(0, true)
+    }
+
+    /// Enqueues collision occupancy of a voxel grid into `out` (u8 per voxel, x fastest, then y, then
+    /// z; device memory the caller owns until stream() completes): 1 where a sphere of `radius` at
+    /// the voxel centre touches collision geometry.
+    pub unsafe fn occupancy(&mut self, origin: [f32; 3], cell: f32, dims: [u32; 3], radius: f32, out: *mut u8)
+        -> Result<()> {
+        ensure!(!out.is_null(), "occupancy output pointer must not be null");
+        ensure!(cell > 0.0 && radius >= 0.0, "occupancy cell must be positive and radius non-negative");
+        let voxels = u64::from(dims[0]) * u64::from(dims[1]) * u64::from(dims[2]);
+        ensure!(voxels > 0 && voxels <= u64::from(u32::MAX), "occupancy grid must hold 1..u32::MAX voxels");
+        let grid = OccupancyArgs { origin: [origin[0], origin[1], origin[2], 0.0], dims: [dims[0], dims[1], dims[2], 0],
+            cell, radius, out };
+        unsafe { self.kernels.launch_occupancy(self.gpu.cuda_stream(), self.buffers(), self.config, grid, voxels as u32) }
     }
 
     /// Free flight for interactive use (never training): only the city edge and a 100 m ceiling are

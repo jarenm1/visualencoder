@@ -90,6 +90,17 @@ pub unsafe extern "C" fn sim_env_retarget(handle: *mut c_void, targets: *const f
     })
 }
 
+/// Collision occupancy of an nx x ny x nz voxel grid (origin = grid corner, metres) into `out`
+/// (CUDA u8, x fastest), enqueued on the env stream.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sim_env_occupancy(handle: *mut c_void, origin_x: f32, origin_y: f32, origin_z: f32,
+    cell: f32, nx: u32, ny: u32, nz: u32, radius: f32, out: *mut u8) -> i32 {
+    boundary(-1, || {
+        unsafe { environment(handle)?.occupancy([origin_x, origin_y, origin_z], cell, [nx, ny, nz], radius, out)?; }
+        Ok(0)
+    })
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sim_env_set_free_flight(handle: *mut c_void, enabled: u32) -> i32 {
     boundary(-1, || {

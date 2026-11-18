@@ -121,6 +121,18 @@ pub(crate) struct Buffers {
     pub episode_diagnostics: *mut f32,
 }
 
+/// Arguments of the occupancy kernel: a voxel grid (x fastest, then y, then z) tested against the
+/// collision geometry with a sphere of `radius` at each voxel centre.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct OccupancyArgs {
+    pub origin: [f32; 4],
+    pub dims: [u32; 4],
+    pub cell: f32,
+    pub radius: f32,
+    pub out: *mut u8,
+}
+
 /// Arguments of the per-pixel appearance kernel.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -168,7 +180,7 @@ pub(crate) struct LabelArgs {
 
 #[cuda_module]
 pub(crate) mod device {
-    use super::{Buffers, Config, EnvState, ImageArgs, LabelArgs};
+    use super::{Buffers, Config, EnvState, ImageArgs, LabelArgs, OccupancyArgs};
     use crate::task::{
         APPEARANCE_SALT, CAMERA_FLOATS, COS_LANDING_TILT, CONTROL_RATES, DIAGNOSTIC_DIM, DISTRICT_MARGIN,
         EVENT_CRASH, EVENT_OOB, HEIGHT_SCALE, HINT_COARSE, HINT_COARSE_RADIUS, HINT_NONE, HINT_PRECISE,
@@ -1294,6 +1306,22 @@ pub(crate) mod device {
             *buffers.states.add(i) = st;
             observe_env(buffers, config, i);
         }
+    }
+
+    /// Occupancy of a voxel grid for planners and the solvability verifier: 1 where a sphere of
+    /// `radius` at the voxel centre touches collision geometry (the control kernel's crash test).
+    #[kernel]
+    pub unsafe fn occupancy(buffers: Buffers, config: Config, args: OccupancyArgs) {
+        let i = thread::index_1d().get();
+        let (nx, ny, nz) = (args.dims[0] as usize, args.dims[1] as usize, args.dims[2] as usize);
+        if i >= nx * ny * nz { return; }
+        let p = [
+            args.origin[0] + ((i % nx) as f32 + 0.5) * args.cell,
+            args.origin[1] + (((i / nx) % ny) as f32 + 0.5) * args.cell,
+            args.origin[2] + ((i / (nx * ny)) as f32 + 0.5) * args.cell,
+        ];
+        let hit = unsafe { sweep_hits(buffers.nodes, config.node_count, buffers.triangles, p, p, args.radius, LANDABLE) };
+        unsafe { *args.out.add(i) = hit as u8 };
     }
 
     /// Actual-camera surface coverage: the goal reward's search term before the first sighting,

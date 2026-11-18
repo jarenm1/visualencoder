@@ -242,6 +242,40 @@ Held-out test of `best.pt` (256 episodes per mode, 8–60 m): **16.4% with GPS, 
 
 Memory adds about 4 points on the refreshed test and about 5 on fixed goal (single seed, 256 episodes per cell; the 95% interval of a 15% rate is about ±4.5 points). The explore command keeps goal success while its own validation coverage grew from 285 to 1,556 observed tiles per episode (1M→8M) and explore-command collisions fell from 42% to 18%. Patience selects on goal success only, so it stopped `drone11` while coverage was still improving.
 
+### Task v5 (`city-drone-goal-v5`, ABI 8)
+
+Commander/pilot split: Gemma decides, the policy flies. v5 makes the pilot's task match that.
+
+- **Reward, search → reach → hold** (`sim_state::drone::goal_reward`):
+  - until the target's anchor is first in view (or a precise hint locates it), 0.02 per newly observed surface tile. Box-distance progress toward a target the policy cannot observe was noise to it.
+  - after that, distance progress (no reward closer than 3 m);
+  - +3 once on first entering the facing 6 m band;
+  - +0.1 per holding step, replacing the braking term (which paid for slow flight in the band even facing away);
+  - −0.01 per step and ±10 for the outcome.
+- **Target hints** replace the GPS lane. Each episode gets one hint, fixed for the episode:
+  - **none:** probability `--no-gps-fraction`.
+  - **precise:** 1–5 m claimed radius, error uniform in it; GPS-like.
+  - **coarse:** 10–40 m claimed radius, error uniform in it (`--coarse-hint-fraction` of hinted episodes).
+  - **wrong:** 30–80 m off while claiming 1–5 m (`--wrong-hint-fraction`).
+
+  Proprioception lanes 14–16 carry the hinted offset, 18 the availability and 19 the claimed radius, so the pilot learns to use hints but trust its eyes. Curriculum lanes are now `[w_visible, w_partial, w_hidden, p_no_hint, appearance, p_coarse, p_wrong]`; `curriculum.fixed_lanes` builds them.
+- **Look-alike masking** (`--mask-confusion`, `ppo.py`): a goal step where the saliency believes the target is in view but its peak patch shows another object of the target's class is an encoder error. Such steps get zero weight in the policy and value losses. The supervised saliency loss still trains the matcher on them. Learning curves log `confusion_rate`, and runs save `confusion-by-catalog.pt` for failure mining.
+- **Catalog override** (native field 19 `next_catalog`): writing an index makes that environment's next episode start from that catalog entry. Used by the verifier and prioritized replay.
+- v4 checkpoints cannot run on v5: one more sensor lane. The `--init-from` load also rejects other tasks.
+
+### Solvability verifier (`train.py verify`, `sim_rl/verifier.py`)
+
+Hard-case post-training samples what the pilot fails, so impossible episodes must be excluded first. A privileged-state policy would not work as the verifier: it sees the target but not the obstacles.
+
+The verifier is geometric, using the simulator's own collision test:
+- the native `occupancy` kernel runs the control kernel's sphere-vs-BVH crash test at voxel centres;
+- free space is 1 m voxels of the district, inflated by the drone radius plus 0.25 m;
+- an episode is solvable when the start's free component reaches the 6 m standoff band with a clear line of sight to the target box.
+
+The first pass found **17% of test episodes started inside hollow suburban houses**: sealed 100–400 voxel pockets, 80% of them landed starts, mostly in the "hidden" bucket. They pass the clearance sweep, but no flight leaves them. Every evaluation before this fix included them, so earlier success rates are understated, especially hidden.
+
+The catalog builder now rejects starts that are enclosed: rays up and in 8 horizontal directions all hit within 25 m. After the fix, 99.7% of test episodes (`runs/verifier/test.pt`) and 99.3% of training episodes (`runs/verifier/train-s0.pt`) are solvable; the rest are labelled per entry.
+
 ### Multi-city training
 
 After 2M steps every single-city run kept improving on its training districts while held-out success fell and collisions rose: the policy memorizes one layout. `--train-cities DIR...` trains on `--city` plus more cities built by `scene/build_city.py` (`blender -b --python scene/build_city.py -- --assets assets/kenney --out assets/geometry/train-103 --seed 103 --family train`, about 45 s each; `heldout-*` builds are never trained on). `sim_rl/cities.py` `CityPool` runs one native environment per city (n/K drones each, own CUDA stream) and gathers their fields into the trainer's [n, ...] buffers with device copies; catalogue indices are offset per city so the concatenated goal tables index as before. Each city gets a smaller episode catalogue (`--city-catalog-size`, default 16384; a 65536-entry goal table is 2.3 GiB). Each extra city costs about 0.3 GiB of device memory besides its table. Validation and the final test stay on `--city`'s held-out districts; `eval --city assets/geometry/heldout-10001` tests an unseen city.

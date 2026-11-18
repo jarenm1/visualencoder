@@ -484,6 +484,30 @@ def count_eval_command(args, started):
     run(args, started)
 
 
+def verify_command(args, started):
+    """Label every catalog entry of one split solvable or not (verifier.py) and summarize."""
+    import numpy as np  # noqa: PLC0415
+    from .verifier import REASONS, verify  # noqa: PLC0415
+    seed, style = {"train": (args.seed, TRAIN_STYLE), "validation": (VALIDATION_SEED, VALIDATION_STYLE),
+                   "test": (TEST_SEED, TEST_STYLE)}[args.split]
+    result = verify(args.library, args.city, seed, style, tuple(args.start_distance), args.catalog_size,
+                    args.num_envs, lambda done, total: print(json.dumps({"read": done, "of": total}), flush=True)
+                    if done % (args.num_envs * 32) == 0 or done == total else None)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({key: torch.as_tensor(value) if hasattr(value, "shape") else value for key, value in result.items()},
+               args.out)
+    reason, bucket, kind = result["reason"], result["meta"][:, 1], result["meta"][:, 2]
+    summary = {"split": args.split, "seed": seed, "entries": int(len(reason)),
+               "solvable": float((reason == 0).mean()),
+               "reasons": {name: int((reason == k).sum()) for k, name in enumerate(REASONS)},
+               "solvable_by_bucket": {b: float((reason[bucket == i] == 0).mean())
+                                      for i, b in enumerate(("visible", "partial", "hidden")) if (bucket == i).any()},
+               "solvable_by_class": {str(int(c)): float((reason[kind == c] == 0).mean()) for c in np.unique(kind)},
+               "seconds": round(time.monotonic() - started, 1)}
+    print(json.dumps(summary), flush=True)
+    emit(summary, args.out.with_suffix(".json"))
+
+
 def perception_command(args, started):
     from .perception import perception_command as run
     run(args, started)
@@ -779,6 +803,15 @@ def parser():
     counting.add_argument("--appearance", type=float, default=1.0)
     counting.add_argument("--out", type=Path, required=True)
     counting.set_defaults(func=count_eval_command)
+
+    verifier = commands.add_parser("verify", help="label catalog entries solvable (geometric verifier)")
+    add_native(verifier)
+    verifier.add_argument("--split", choices=("train", "validation", "test"), default="train")
+    verifier.add_argument("--start-distance", type=float, nargs=2, default=[8.0, 60.0], metavar=("MIN", "MAX"))
+    verifier.add_argument("--catalog-size", type=int, default=65536)
+    verifier.add_argument("--num-envs", type=int, default=256, help="catalog entries read per reset")
+    verifier.add_argument("--out", type=Path, required=True)
+    verifier.set_defaults(func=verify_command)
 
     cohorts = commands.add_parser("eval-cohorts", help="paired fixed-goal hidden and far-target evaluations")
     add_native(cohorts)

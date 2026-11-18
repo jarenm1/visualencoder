@@ -84,6 +84,8 @@ class CudaEnv:
             "sim_env_stream": ([ct.c_void_p], ct.c_uint64),
             "sim_env_render_goals": ([ct.c_void_p, ct.c_uint32], ct.c_int32),
             "sim_env_retarget": ([ct.c_void_p, ct.c_void_p], ct.c_int32),
+            "sim_env_occupancy": ([ct.c_void_p, ct.c_float, ct.c_float, ct.c_float, ct.c_float, ct.c_uint32,
+                                   ct.c_uint32, ct.c_uint32, ct.c_float, ct.c_void_p], ct.c_int32),
             "sim_env_set_free_flight": ([ct.c_void_p, ct.c_uint32], ct.c_int32),
             "sim_env_create_with_options": ([ct.c_uint32, ct.c_uint64, ct.c_uint32, ct.c_uint32,
                 ct.c_uint32, ct.c_uint32, ct.c_char_p, ct.c_float, ct.c_float, ct.c_uint32], ct.c_void_p),
@@ -222,6 +224,17 @@ class CudaEnv:
         self._check_stream()
         if self.lib.sim_env_render_goals(self.handle, first) != 0:
             raise RuntimeError(self.error())
+
+    def occupancy(self, origin, cell, dims, radius):
+        """uint8 [nx, ny, nz] voxel grid from corner ``origin`` (metres): 1 where a sphere of ``radius``
+        at the voxel centre touches collision geometry (the crash test), on the env stream."""
+        self._check_stream()
+        nx, ny, nz = dims
+        out = torch.empty((nz, ny, nx), device=self.device, dtype=torch.uint8)
+        if self.lib.sim_env_occupancy(self.handle, *map(float, origin), float(cell), nx, ny, nz, float(radius),
+                                      ct.c_void_p(out.data_ptr())) != 0:
+            raise RuntimeError(self.error())
+        return out.permute(2, 1, 0)
 
     def retarget(self, targets):
         """Replace current-episode targets: CUDA float32 [n, 8] rows [centre xyz, layout object
