@@ -185,14 +185,18 @@ def make_config(args):
 
 
 def open_env(args, n, seed, style):
-    """The training split simulates ``--city`` plus any ``--train-cities`` (a CityPool)."""
+    """The training split simulates ``--city`` plus any ``--train-cities`` (a CityPool). With train
+    cities, validation also uses the per-city catalogue so the goal tables fit beside the pool
+    (the final test keeps the full catalogue)."""
     start = getattr(args, "start_distance", None)
     start = tuple(start) if start else None
-    if style == TRAIN_STYLE and getattr(args, "train_cities", None):
+    cities = getattr(args, "train_cities", None)
+    if style == TRAIN_STYLE and cities:
         return CityPool(args.library, n, seed, args.width, args.height, style, args.control,
-                        (args.city, *args.train_cities), start_distance=start, catalog_size=args.city_catalog_size)
+                        (args.city, *cities), start_distance=start, catalog_size=args.city_catalog_size)
+    catalog = args.city_catalog_size if style == VALIDATION_STYLE and cities else None
     return CudaEnv(args.library, n, seed, args.width, args.height, style, args.control, args.city,
-                   start_distance=start)
+                   start_distance=start, catalog_size=catalog)
 
 
 def open_env_checkpoint(args, metadata, seed, style):
