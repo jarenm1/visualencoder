@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "sim/python"), str(ROOT / "src")]
 
 from agent import Agent, summarize  # noqa: E402
+from references import ReferenceLibrary  # noqa: E402
 from gemma_goal import MATCH_IOU, detect, iou, project_boxes, start_camera  # noqa: E402
 from sim_rl.cli import (DEFAULT_LIBRARY, TEST_STYLE, build_policy, load_checkpoint,  # noqa: E402
                         validate_checkpoint)
@@ -94,6 +95,9 @@ class Pilot:
                 from peft import PeftModel
                 model = PeftModel.from_pretrained(model, args.adapter).eval()
             self.gemma = (model, AutoProcessor.from_pretrained(args.model))
+        # Type references for objects Gemma names but cannot box yet (category goals, references.py).
+        self.references = (ReferenceLibrary(args.references, self.device)
+                           if args.references and (args.references / "index.json").exists() else None)
         self.requests = queue.Queue()
         self.lock = threading.Lock()
         self.frame, self.goal_image, self.frame_id = b"", b"", 0
@@ -215,7 +219,16 @@ class Pilot:
         elif action["action"] == "explore":
             self.explore()
         elif action["action"] == "go" and action["box"] is None:
-            note += f", {action['label']} not visible"
+            phrase = self.references.match(action["label"]) if self.references is not None else None
+            if phrase is None:
+                note += f", {action['label']} not visible"
+            else:
+                # Search by type: the pilot looks for anything like the reference until Gemma can box
+                # the instance, whose crop then replaces it (success is only the instance).
+                source = f"type reference: {phrase}"
+                self.command.fill_(GOAL_COMMAND)
+                self.set_goal(self.references.image(phrase), source, fresh=self.goal_info.get("source") != source)
+                note += f", {action['label']} not visible: searching by the {phrase} reference"
         elif action["action"] == "go":
             try:
                 self.box_goal(action["box"], f"agent: {action['label']}")
@@ -452,6 +465,8 @@ def main():
     parser.add_argument("--model", default="google/gemma-4-E4B-it")
     parser.add_argument("--gemma-4bit", action="store_true", help="4-bit NF4 Gemma language model (fits 8 GB)")
     parser.add_argument("--adapter", type=Path, help="grounding LoRA for the agent's boxes (runs/gemma-tune/lora-sum)")
+    parser.add_argument("--references", type=Path, default=ROOT / "runs/reference-library",
+                        help="type reference library (references.py) for objects not yet boxable")
     args = parser.parse_args()
     pilot = Pilot(args)
     server = ThreadingHTTPServer((args.host, args.port), Handler)

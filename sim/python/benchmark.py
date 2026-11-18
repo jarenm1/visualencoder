@@ -139,6 +139,8 @@ def main():
     parser.add_argument("--appearance", type=float, default=1.0)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--adapter", type=Path, help="grounding LoRA (gemma_tune.py) used for the boxes")
+    parser.add_argument("--references", type=Path, default=ROOT / "runs/reference-library",
+                        help="type reference library (references.py); a missing folder disables type search")
     args = parser.parse_args()
     args.gemma, args.hz = True, 0.0
     pilot = Pilot(args)
