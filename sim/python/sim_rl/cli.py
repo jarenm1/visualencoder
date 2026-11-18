@@ -111,7 +111,9 @@ def training_settings(args):
             "goal_refresh_steps": args.goal_refresh_steps,
             "goal_box_source": "simulator" if args.goal_refresh_steps else None,
             "start_distance": args.start_distance, "memory": memory,
-            "explore_fraction": args.explore_fraction, "commands": commands_of(args)}
+            "explore_fraction": args.explore_fraction, "commands": commands_of(args),
+            "init_from": None if args.init_from is None else {"path": str(args.init_from),
+                                                               "sha256": sha256(args.init_from)}}
 
 
 def commands_of(args):
@@ -252,6 +254,24 @@ def training_record(steps, elapsed, values):
     }
 
 
+def warm_start(policy, state):
+    """Initialize ``policy`` from an earlier checkpoint's weights. Tensors of equal shape are copied;
+    first layers that gained input lanes (the command one-hot appended last) keep the old columns and
+    start the new ones at zero, so the warm-started policy initially acts exactly as before."""
+    own = policy.state_dict()
+    for name, value in state.items():
+        if name not in own:
+            continue
+        target = own[name]
+        if target.shape == value.shape:
+            target.copy_(value)
+        elif target.dim() == 2 and target.shape[0] == value.shape[0] and target.shape[1] > value.shape[1]:
+            target.zero_()
+            target[:, :value.shape[1]].copy_(value)
+        else:
+            raise ValueError(f"cannot warm-start {name}: {tuple(value.shape)} -> {tuple(target.shape)}")
+
+
 def train_command(args, started):
     seed_all(args.seed)
     config = make_config(args)
@@ -267,6 +287,8 @@ def train_command(args, started):
             open_env(args, args.eval_envs, VALIDATION_SEED, VALIDATION_STYLE) as validation_env:
         with env.execution():
             policy = build_policy(env, features, memory_heads=args.memory_heads, commands=commands_of(args))
+            if args.init_from is not None:
+                warm_start(policy, load_checkpoint(args.init_from)["model"])
             trainer = Trainer(env, features, policy, config)
             trainer.warmup(args.seed)
             metadata = provenance(env, features, training_settings(args))
@@ -566,6 +588,8 @@ def add_learner(parser):
     parser.add_argument("--explore-fraction", type=float, default=DEFAULTS.explore_fraction,
                         help="fraction of training episodes given the explore command (coverage reward) "
                              "instead of the goal; > 0 makes the policy command-conditioned")
+    parser.add_argument("--init-from", type=Path,
+                        help="warm-start from this checkpoint's weights (same encoder; new command lanes start at zero)")
     parser.add_argument("--curriculum", choices=CURRICULUM_MODES, default="adaptive")
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--no-gps-fraction", type=float, default=DEFAULTS.no_gps_fraction,
