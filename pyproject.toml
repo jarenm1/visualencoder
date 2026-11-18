@@ -24,6 +24,7 @@ dependencies = [
     "ipywidgets>=8.1.9",
     "accelerate>=1.10",
     "tensorrt-cu13>=11.4",
+    "peft>=0.17",
 ]
 
 [project.scripts]

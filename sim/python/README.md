@@ -184,6 +184,28 @@ By family, hits are cars 41/49, buildings and trees 49/81, street props 4/20 (li
 
 
 
+## Perception, spatial memory, counting and the agent (ABI v7)
+
+**Perception heads** (`sim_rl/perception.py`, `train.py perception`): a small conv head on the frozen 15×20 token grid predicts per-patch log depth, a "has geometry" logit and the object class (none, building, vegetation, vehicle, prop). Supervision is the native label fields (never actor input). A ground-plane prior from the drone's own altimeter height and gravity direction (each patch ray's distance to the ground, its elevation, whether it reaches the ground) is concatenated to the tokens. Frames come from exploratory Ornstein–Uhlenbeck flights at 8–60 m. `runs/perception-v4` (16,384 train / 3,072 held-out frames, 16 epochs):
+
+| Encoder | Depth abs-rel | δ<1.25 | Class mIoU | Vehicle IoU |
+|---|---|---|---|---|
+| `lingbot:small` | 0.204 | 0.718 | 0.714 | 0.720 |
+| `baseline` | 0.173 | 0.786 | 0.743 | 0.763 |
+| `mean` | 0.178 | 0.775 | 0.732 | 0.747 |
+
+Without the ground prior `mean` reaches 0.214 / 0.70.
+
+**Spatial memory** (`sim_rl/memory.py`): a 128×128 top-down map at 1.5 m (±96 m) per environment, in the episode's start frame. Pose is dead-reckoned from the noisy gyro and body-velocity sensors (heading rate of the levelled forward axis, not ω·up, which drifted 0.2 rad in 10 s); measured position error 0.06 m median after 10 s. Each patch ray is cast to its predicted depth: the hit cell takes the goal evidence (the policy's saliency, P(this patch rather than not in view)), cells part-way along the ray are marked looked-at; the newest look at a cell replaces its evidence. With labelled depth a seen target lands within 3 m of its box every time; with predicted depth about half the time (range error, bearing exact). The actor reads a 32×32 heading-aligned crop (±48 m) through a small CNN plus the strongest candidate (forward, right, distance, evidence); an auxiliary loss decodes the target's body-frame offset from the memory features. `--memory-heads runs/perception-v4/mean.pt` enables it; the heads are frozen inside the checkpoint.
+
+**Counting** (`sim_rl/tracks.py`, `train.py count-eval`): patches classified vehicle within 35 m are clustered per frame (≥2 patches), associated to tracks with a range-dependent gate (3 m + 0.25 × range, 1/range weights), merged when tracks converge, and confirmed after 3 frames. On 128 held-out 15 s exploratory flights the count matches the number of cars seen in ≥3 frames on average (1.77 vs 1.77), mean absolute error 0.81, exact 44%, within one 80%.
+
+**Explore command** (`--explore-fraction`): a share of training episodes gets the explore command instead of the goal; the actor and critic take a one-hot command, the goal input and the memory's goal evidence are zero, and the reward is newly observed surface tiles (native coverage counter) minus a step cost and the crash/leave penalty. Validation reports the explore command's mean observed tiles alongside goal success.
+
+**Agent** (`sim/python/agent.py`, live play with `--gemma` and a memory checkpoint): a typed instruction starts a loop in which Gemma sees the camera frame and a text summary of the memory (area looked at, confirmed cars with offsets, goal evidence) and answers `explore`, `go` (a box in the current frame, which becomes the goal crop) or `answer`. It replans every 5 simulated seconds or when a skill ends; simulated time waits while Gemma thinks. Switching goals keeps the map and the car tracks.
+
+**Gemma grounding post-train** (`sim/python/gemma_tune.py`): exploratory-flight frames with per-patch object labels give "Fly to the [nearest] <name>." → box examples and absent names → `[]`; LoRA on the language model's projections; `eval` compares base and tuned hit and false-box rates on held-out districts.
+
 ## Patch-goal run (ABI v6)
 
 `runs/drone9-mean-patch-seed0`: `drone8`'s exact settings (fresh seed 0, TensorRT FP16 `mean`, 128 envs, oracle refresh every 30 steps, 2M steps, sustained-hold task, unchanged reward) with one change: `--goal patch`, the patch-matching saliency head. 2,007,040 steps in 1409 s. Validation GPS success at 0.5M / 1M / 1.5M / 2M: 4.3% / 5.5% / 14.5% / 12.5%; `best.pt` = 1.5M.
