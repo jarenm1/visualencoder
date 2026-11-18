@@ -124,6 +124,15 @@ def load(folder):
     return [json.loads(line) for line in (folder / "examples.jsonl").read_text().splitlines()]
 
 
+def phrasing(row, rng):
+    """Training instruction: "the nearest X" rows are asked half the time as plain "the X" (same
+    nearest box), the way the agent words it; the first adapter, trained only on "the nearest X"
+    for repeated names, declined plain requests whenever several X were in view."""
+    if "the nearest " in row["instruction"] and rng.random() < 0.5:
+        return row["instruction"].replace("the nearest ", "the ")
+    return row["instruction"]
+
+
 def train(args):
     from peft import LoraConfig, get_peft_model
     from transformers import AutoProcessor
@@ -144,7 +153,7 @@ def train(args):
         row = rng.choice(absent if rng.random() < args.absent_fraction else visible)
         image = Image.open(args.out / "train" / row["image"]).convert("RGB")
         messages = [{"role": "user", "content": [{"type": "image", "image": image},
-                                                 {"type": "text", "text": prompt(row["instruction"])}]}]
+                                                 {"type": "text", "text": prompt(phrasing(row, rng))}]}]
         context = processor.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt",
                                                 add_generation_prompt=True)
         target = processor.tokenizer(row["answer"] + processor.tokenizer.eos_token, add_special_tokens=False,
@@ -177,20 +186,30 @@ def evaluate(args):
         if name != "base":
             from peft import PeftModel
             model = PeftModel.from_pretrained(model, args.out / name).eval()
-        hits = boxed = false_box = visible = absent = 0
+        counts = {key: 0 for key in ("visible", "hits", "boxed", "plain", "plain_hits", "absent", "false_box")}
         for row in rows:
             image = Image.open(args.out / "test" / row["image"]).convert("RGB")
-            text, _ = ask(model, processor, image, prompt(row["instruction"]))
-            box = parse_box(text)
             if row["box"] is None:
-                absent += 1
-                false_box += box is not None
-            else:
-                visible += 1
-                boxed += box is not None
-                hits += box is not None and float(iou(np.array(row["box"]), np.array([box]))[0]) >= MATCH_IOU
-        results[name] = {"visible": visible, "visible_hit": hits / max(visible, 1), "visible_boxed": boxed / max(visible, 1),
-                         "absent": absent, "absent_false_box": false_box / max(absent, 1)}
+                text, _ = ask(model, processor, image, prompt(row["instruction"]))
+                counts["absent"] += 1
+                counts["false_box"] += parse_box(text) is not None
+                continue
+            # "the nearest X" rows are also asked as plain "the X" (how the agent words it)
+            for instruction in {row["instruction"], row["instruction"].replace("the nearest ", "the ")}:
+                text, _ = ask(model, processor, image, prompt(instruction))
+                box = parse_box(text)
+                hit = box is not None and float(iou(np.array(row["box"]), np.array([box]))[0]) >= MATCH_IOU
+                if instruction == row["instruction"]:
+                    counts["visible"] += 1
+                    counts["boxed"] += box is not None
+                    counts["hits"] += hit
+                if "nearest" in row["instruction"] and "nearest" not in instruction:
+                    counts["plain"] += 1
+                    counts["plain_hits"] += hit
+        results[name] = {"visible": counts["visible"], "visible_hit": counts["hits"] / max(counts["visible"], 1),
+                         "visible_boxed": counts["boxed"] / max(counts["visible"], 1),
+                         "plain_phrasing": counts["plain"], "plain_phrasing_hit": counts["plain_hits"] / max(counts["plain"], 1),
+                         "absent": counts["absent"], "absent_false_box": counts["false_box"] / max(counts["absent"], 1)}
         print(json.dumps({name: results[name]}), flush=True)
     (args.out / f"eval-{args.adapter}.json").write_text(json.dumps(results, indent=2) + "\n")
 
