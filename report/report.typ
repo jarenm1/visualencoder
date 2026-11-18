@@ -201,6 +201,8 @@ This separate pilot uses goal-facing, altitude-stabilized kinematic control, not
 
 #include "perception.typ"
 
+#include "memory.typ"
+
 #include "onboard.typ"
 
 = Conclusion
