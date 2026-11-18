@@ -129,13 +129,15 @@ class Pilot:
         crop = crop_goals(self.env.goal_views[:1], self.env.goal_crops[:1])
         self.set_goal(crop, "catalog goal")
 
-    def set_goal(self, crop, source, box=None, match_iou=None):
+    def set_goal(self, crop, source, box=None, match_iou=None, fresh=True):
         """A new goal resets the recurrent state and the old goal's map evidence; what the drone has
-        looked at and the car tracks stay."""
+        looked at and the car tracks stay. ``fresh=False`` (the same target re-boxed) only updates
+        the goal image, as the training-time goal refresh does."""
         self.goal = self.features.goal_embedding(crop)
-        self.hidden.zero_()
-        if self.spatial is not None:
-            self.spatial.map[:, 0].zero_()
+        if fresh:
+            self.hidden.zero_()
+            if self.spatial is not None:
+                self.spatial.map[:, 0].zero_()
         self.goal_revision += 1
         self.goal_started = time.monotonic()
         d = self.env.diagnostics[0].cpu().numpy()
@@ -159,11 +161,14 @@ class Pilot:
         best = int(overlap.argmax())
         if overlap[best] < MATCH_IOU:
             raise RuntimeError(f"{source}: box frames no city object (best IoU {overlap[best]:.2f} < {MATCH_IOU})")
+        same = (int(self.command[0]) == GOAL_COMMAND and self.goal_info.get("source") != "explore"
+                and int(diagnostics[0, 27]) == int(self.objects["index"][best]))
         row = [*self.objects["center"][best], float(self.objects["index"][best]), *self.objects["half"][best],
                float(self.env.layout_classes.index(self.objects["class"][best]))]
         self.retarget = torch.tensor([row], device=self.device, dtype=torch.float32)
         self.env.retarget(self.retarget)
-        self.set_goal(crop, f"{source}: {self.objects['asset'][best]}", box=box, match_iou=round(float(overlap[best]), 3))
+        self.set_goal(crop, f"{source}: {self.objects['asset'][best]}", box=box, match_iou=round(float(overlap[best]), 3),
+                      fresh=not same)
 
     def instruct(self, text):
         """With a spatial-memory policy, the instruction starts the Gemma agent (agent.py), which plans
@@ -183,28 +188,34 @@ class Pilot:
         return (self.env.obs[0].clamp(0, 1) * 255).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy()
 
     def explore(self):
-        """Explore command: no goal; the memory keeps what was seen."""
+        """Explore command: no goal and no goal evidence; the memory keeps what was seen. Continuing
+        an explore skill keeps the policy's recurrent state."""
+        if int(self.command[0]) == EXPLORE_COMMAND:
+            return
         self.command.fill_(EXPLORE_COMMAND)
         self.goal = torch.zeros_like(self.goal)
         self.hidden.zero_()
+        if self.spatial is not None:
+            self.spatial.map[:, 0].zero_()
         with self.lock:
             self.goal_info = {**self.goal_info, "source": "explore", "revision": self.goal_revision}
 
     def think(self, skill_ended):
         """Agent planning step (simulated time waits while Gemma answers)."""
         agent = self.agent
-        skill = "explore" if int(self.command[0]) == EXPLORE_COMMAND else self.goal_info.get("source", "goal")
-        summary = summarize(self.spatial, self.tracks, agent.elapsed(self.steps), skill)
+        summary = summarize(self.spatial, self.tracks, agent.elapsed(self.steps), agent.skill)
         action, text, latency = agent.plan(self.steps, Image.fromarray(self.camera_frame()), summary)
         note = f"{latency:.1f} s"
         if action is None:
             note += f", unparsed: {text[:120]}"
         elif action["action"] == "explore":
             self.explore()
+        elif action["action"] == "go" and action["box"] is None:
+            note += f", {action['label']} not visible"
         elif action["action"] == "go":
             try:
-                self.command.fill_(GOAL_COMMAND)
                 self.box_goal(action["box"], f"agent: {action['label']}")
+                self.command.fill_(GOAL_COMMAND)
             except RuntimeError as error:
                 note += f", {error}"
         with self.lock:

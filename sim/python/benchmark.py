@@ -1,8 +1,9 @@
 """Task benchmark: the whole onboard stack (Gemma agent + memory policy) on count, find and explore.
 
-Each episode starts a fresh held-out free flight (live.py's Pilot, headless), gives the agent one
-instruction and runs until the agent answers, the drone crashes or leaves the city, or the time limit
-passes. Gemma plans (simulated time waits while it thinks); the policy flies every step.
+Each episode starts a fresh held-out free flight (live.py's Pilot, headless) without GPS and without
+a goal image, gives the agent one instruction and runs until the agent answers, the drone crashes or
+leaves the city, or the time limit passes. Gemma plans (simulated time waits while it thinks); the
+policy flies every step.
 
   count    "How many cars are in this area? ..." -> the first number in the answer, against the
            distinct cars actually seen during the flight (labelled object of >= 2 patches in >= 3
@@ -57,10 +58,13 @@ def parse_count(text):
 def run_episode(pilot, task, seed, lookup):
     pilot.new_episode(seed)
     pilot.last_outcome = None
-    target = pilot.object_info[int(pilot.env.diagnostics[0, 27])]["asset"]
+    target_index = int(pilot.env.diagnostics[0, 27])
+    target = pilot.object_info[target_index]["asset"]
+    pilot.explore()   # no goal image or goal evidence: the instruction is all the drone is told
     instruction = f"Fly to the {object_phrase(target)}." if task == "find" else INSTRUCTIONS[task]
     pilot.instruct(instruction)
-    limit = EXPLORE_SECONDS if task == "explore" else TIME_LIMIT_SECONDS
+    # The agent's last plan, at TIME_LIMIT_SECONDS, only accepts an answer; explore stops earlier.
+    limit = EXPLORE_SECONDS if task == "explore" else TIME_LIMIT_SECONDS + 1.0
     seen_frames = torch.zeros(lookup.shape[0], device=pilot.device)
     agent, outcome, started = pilot.agent, "time limit", time.monotonic()
     while agent.elapsed(pilot.steps) < limit:
@@ -75,7 +79,8 @@ def run_episode(pilot, task, seed, lookup):
             pilot.agent = agent
             break
         if task == "find" and pilot.last_outcome == "success" and before != "success":
-            outcome = "success"
+            # Native success is for the current (possibly re-boxed) target; only the named one counts.
+            outcome = "success" if int(pilot.env.diagnostics[0, 27]) == target_index else "wrong object"
             break
         if agent.answer is not None:
             outcome = "answered"
@@ -83,7 +88,8 @@ def run_episode(pilot, task, seed, lookup):
     agent = pilot.agent
     row = {"task": task, "seed": seed, "instruction": instruction, "outcome": outcome,
            "seconds": round(agent.elapsed(pilot.steps), 1), "answer": agent.answer,
-           "decisions": [h["action"] for h in agent.history], "wall_s": round(time.monotonic() - started, 1)}
+           "decisions": [h["action"] for h in agent.history], "wall_s": round(time.monotonic() - started, 1),
+           "transcript": agent.transcript}
     if task == "count":
         row.update(truth=int((seen_frames >= CONFIRM_HITS).sum()), estimate=parse_count(agent.answer),
                    memory_count=int(pilot.tracks.count()[0]))
@@ -127,17 +133,24 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--appearance", type=float, default=1.0)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--adapter", type=Path, help="grounding LoRA (gemma_tune.py) used for the boxes")
     args = parser.parse_args()
     args.gemma, args.hz = True, 0.0
     pilot = Pilot(args)
+    if args.adapter is not None:
+        from peft import PeftModel
+        model, processor = pilot.gemma
+        pilot.gemma = (PeftModel.from_pretrained(model, args.adapter).eval(), processor)
     rows = []
     with pilot.env.execution():
+        pilot.lanes[3] = 1.0   # no GPS: the policy gets no target offset, only the camera
+        pilot.env.write_curriculum(pilot.lanes)
         lookup = object_classes(pilot.env)
         for task in args.tasks.split(","):
             for episode in range(args.episodes):
                 row = run_episode(pilot, task, 1_000_003 * (args.seed + 1) + episode, lookup)
                 rows.append(row)
-                print(json.dumps(row), flush=True)
+                print(json.dumps({key: value for key, value in row.items() if key != "transcript"}), flush=True)
     result = {"checkpoint": str(args.checkpoint), "gemma_4bit": args.gemma_4bit, "summary": summarize(rows), "rows": rows}
     print(json.dumps(result["summary"]), flush=True)
     args.out.parent.mkdir(parents=True, exist_ok=True)
