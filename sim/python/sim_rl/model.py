@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .memory import CANDIDATE_WIDTH, CHANNELS
+from .memory import CANDIDATE_WIDTH, CHANNELS, VIEW_WIDTH
 from .native import PRIVILEGED_WIDTH, PROPRIO_WIDTH
 from .perception import PatchHeads
 
@@ -196,7 +196,8 @@ class ActorCritic(nn.Module):
     visual: target saliency over frozen tokens + proprioception (+ saliency auxiliary loss);
             with ``memory``, also the spatial-memory crop (memory.py), built from frozen per-patch
             depth heads (``perception``) and the saliency, with an auxiliary loss that decodes the
-            target's body-frame offset from the memory features.
+            target's body-frame offset from the memory features. ``depth_view`` adds the heads'
+            nearest predicted depth over a 3x5 grid of the image (an obstacle view).
     state:  privileged + proprioception (no vision).
     hint:   proprioception only.
     ``commands`` > 1 adds a one-hot command (COMMANDS) to the actor and critic inputs: one policy
@@ -205,7 +206,7 @@ class ActorCritic(nn.Module):
     """
 
     def __init__(self, mode, token_dim, goal_dim, grid_h, grid_w, action_dim=4, goal="global", memory=False,
-                 commands=1):
+                 commands=1, depth_view=False):
         super().__init__()
         if mode not in MODES:
             raise ValueError(f"unknown policy mode {mode}")
@@ -221,13 +222,20 @@ class ActorCritic(nn.Module):
         else:
             self.attention = TargetSaliency(token_dim, goal_dim, grid_h, grid_w)
         self.memory_width = 0
+        self.depth_view = depth_view
+        if depth_view and not memory:
+            raise ValueError("the depth view comes from the spatial memory's perception heads")
         if memory:
             self.perception = PatchHeads(token_dim, grid_h, grid_w).requires_grad_(False)
             self.memory_encoder = MemoryEncoder(CHANNELS)
+            self.memory_vector_width = CANDIDATE_WIDTH + (VIEW_WIDTH if depth_view else 0)
             self.memory_width = MEMORY_FEATURES + CANDIDATE_WIDTH
             self.memory_probe = nn.Linear(self.memory_width, 3)
+        # The depth view goes last (after the command), so warm starts from policies without it
+        # only gain zero-initialized trailing input columns.
         width = {"visual": VISUAL_WIDTH + self.memory_width + PROPRIO_WIDTH,
-                 "state": PRIVILEGED_WIDTH + PROPRIO_WIDTH, "hint": PROPRIO_WIDTH}[mode] + (commands if commands > 1 else 0)
+                 "state": PRIVILEGED_WIDTH + PROPRIO_WIDTH, "hint": PROPRIO_WIDTH}[mode] \
+            + (commands if commands > 1 else 0) + (VIEW_WIDTH if depth_view else 0)
         self.trunk = nn.Sequential(_orthogonal(nn.Linear(width, HIDDEN), math.sqrt(2)),
                                    nn.LayerNorm(HIDDEN), nn.Tanh())
         self.recurrent = nn.GRUCell(HIDDEN, HIDDEN)
@@ -248,18 +256,22 @@ class ActorCritic(nn.Module):
 
     def actor_inputs_and_features(self, cls, tokens, goal, proprio, privileged, memory=None, command=None):
         """Returns (actor inputs, saliency logits or None) so training reuses one saliency pass.
-        ``memory`` is (ego crop, candidate) from memory.observe when the policy has spatial memory;
-        ``command`` [n] long (COMMANDS index) when the policy takes more than one command."""
+        ``memory`` is (ego crop, memory vector) from memory.observe when the policy has spatial
+        memory; ``command`` [n] long (COMMANDS index) when the policy takes more than one command."""
         if self.mode == "visual":
             features, logits = self.attention(goal, cls, tokens)
             if self.spatial:
-                features = torch.cat((features, self.memory_encoder(*memory)), dim=-1)
+                ego, vector = memory
+                features = torch.cat((features, self.memory_encoder(ego, vector[:, :CANDIDATE_WIDTH])), dim=-1)
             inputs, logits = torch.cat((features, proprio), dim=-1), logits
         elif self.mode == "state":
             inputs, logits = torch.cat((privileged, proprio), dim=-1), None
         else:
             inputs, logits = proprio, None
-        return self.with_command(inputs, command), logits
+        inputs = self.with_command(inputs, command)
+        if self.depth_view:
+            inputs = torch.cat((inputs, memory[1][:, CANDIDATE_WIDTH:]), dim=-1)
+        return inputs, logits
 
     def with_command(self, inputs, command):
         if self.commands == 1:

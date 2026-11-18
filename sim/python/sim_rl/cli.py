@@ -67,15 +67,18 @@ def mode_of(features):
     return "visual" if features.visual else features.spec
 
 
-def build_policy(env, features, saved=None, memory_heads=None, commands=1):
+def build_policy(env, features, saved=None, memory_heads=None, commands=1, depth_view=False):
     """Visual arms attend over the frozen patch grid; the grid is height//16 x width//16.
-    ``saved`` loads a checkpoint (its recorded spatial memory and commands included); ``memory_heads``
-    starts a new spatial-memory policy from frozen perception heads trained on this exact encoder;
-    ``commands`` > 1 makes a new policy command-conditioned (goal, explore)."""
-    memory = memory_heads is not None or bool(saved and saved["metadata"].get("memory"))
+    ``saved`` loads a checkpoint (its recorded spatial memory, depth view and commands included);
+    ``memory_heads`` starts a new spatial-memory policy from frozen perception heads trained on this
+    exact encoder; ``commands`` > 1 makes a new policy command-conditioned (goal, explore);
+    ``depth_view`` gives a new memory policy the heads' coarse obstacle view."""
+    recorded = saved["metadata"].get("memory") if saved is not None else None
+    memory = memory_heads is not None or bool(recorded)
     commands = saved["metadata"].get("commands", 1) if saved is not None else commands
+    depth_view = bool(recorded.get("depth_view")) if recorded else depth_view
     policy = ActorCritic(mode_of(features), features.dim, features.goal_dim, env.height // 16, env.width // 16,
-                         env.action_dim, features.goal, memory, commands).to(env.device)
+                         env.action_dim, features.goal, memory, commands, depth_view).to(env.device)
     if memory_heads is not None:
         policy.perception.load_state_dict(load_heads(memory_heads, features, env.device).state_dict())
     if saved is not None:
@@ -107,7 +110,8 @@ def training_settings(args):
     memory = None if args.memory_heads is None else {
         "heads": str(args.memory_heads), "heads_sha256": sha256(args.memory_heads),
         "grid": GRID, "cell_m": CELL, "ego": EGO, "ego_radius_m": EGO_RADIUS,
-        "pose": "dead reckoning from noisy gyro and body velocity", "depth": "frozen monocular patch heads"}
+        "pose": "dead reckoning from noisy gyro and body velocity", "depth": "frozen monocular patch heads",
+        "depth_view": args.depth_view}
     return {"curriculum": args.curriculum, "no_gps_fraction": args.no_gps_fraction,
             "aux_coefficient": args.aux_coefficient, "appearance": args.appearance,
             "goal_refresh_steps": args.goal_refresh_steps,
@@ -306,7 +310,8 @@ def train_command(args, started):
     with open_env(args, args.num_envs, args.seed, TRAIN_STYLE) as env, \
             open_env(args, args.eval_envs, VALIDATION_SEED, VALIDATION_STYLE) as validation_env:
         with env.execution():
-            policy = build_policy(env, features, memory_heads=args.memory_heads, commands=commands_of(args))
+            policy = build_policy(env, features, memory_heads=args.memory_heads, commands=commands_of(args),
+                                  depth_view=args.depth_view)
             if args.init_from is not None:
                 warm_start(policy, load_checkpoint(args.init_from)["model"])
             trainer = Trainer(env, features, policy, config)
@@ -522,7 +527,8 @@ def benchmark_command(args, started):
         config = make_config(args)
         with open_env(args, n, args.seed, TRAIN_STYLE) as env:
             with env.execution():
-                policy = build_policy(env, features, memory_heads=args.memory_heads, commands=commands_of(args))
+                policy = build_policy(env, features, memory_heads=args.memory_heads, commands=commands_of(args),
+                                      depth_view=args.depth_view)
                 trainer = Trainer(env, features, policy, config)
                 trainer.warmup(args.seed)
                 hover = torch.tensor(HOVER_ACTIONS[env.control_mode], device=env.device).expand(n, -1).contiguous()
@@ -544,7 +550,8 @@ def profile_command(args, started):
     config = make_config(args)
     with open_env(args, args.num_envs, args.seed, TRAIN_STYLE) as env:
         with env.execution():
-            policy = build_policy(env, features, memory_heads=args.memory_heads, commands=commands_of(args))
+            policy = build_policy(env, features, memory_heads=args.memory_heads, commands=commands_of(args),
+                                  depth_view=args.depth_view)
             trainer = Trainer(env, features, policy, config)
             trainer.warmup(args.seed)
             result = capture(trainer, args.out, args.iterations)
@@ -558,7 +565,8 @@ def memory_check_command(args, started):
     allocated = []
     with open_env(args, args.num_envs, args.seed, TRAIN_STYLE) as env:
         with env.execution():
-            policy = build_policy(env, features, memory_heads=args.memory_heads, commands=commands_of(args))
+            policy = build_policy(env, features, memory_heads=args.memory_heads, commands=commands_of(args),
+                                  depth_view=args.depth_view)
             trainer = Trainer(env, features, policy, config)
             trainer.warmup(args.seed)
             for _ in range(args.repeats):
@@ -605,6 +613,9 @@ def add_learner(parser):
     add_precision(parser)
     parser.add_argument("--memory-heads", type=Path,
                         help="perception heads (train.py perception) for this encoder: enables the spatial memory")
+    parser.add_argument("--depth-view", action="store_true",
+                        help="with --memory-heads: the actor also reads the heads' nearest predicted depth "
+                             "over a 3x5 image grid (obstacle view)")
     parser.add_argument("--explore-fraction", type=float, default=DEFAULTS.explore_fraction,
                         help="fraction of training episodes given the explore command (coverage reward) "
                              "instead of the goal; > 0 makes the policy command-conditioned")

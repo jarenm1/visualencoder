@@ -10,10 +10,13 @@ its newest observation, so a false match fades once the drone looks again ("look
 there"), and a match stays on the map after it leaves the view.
 
 The actor reads an ego-centric, heading-aligned crop of the map and the strongest candidate's
-offset; nothing here issues a command. Maps live on the GPU in the episode's start frame
-(x = initial forward, y = initial left) and reset with the episode.
+offset, and (``depth_view`` policies) a coarse obstacle view: the nearest predicted depth in each
+cell of a 3x5 grid over the image. Nothing here issues a command. Maps live on the GPU in the
+episode's start frame (x = initial forward, y = initial left) and reset with the episode.
 """
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn.functional as F
@@ -27,6 +30,9 @@ EGO = 32                         # ego crop cells per side
 EGO_RADIUS = 48.0                # metres from the drone to the crop edge
 CHANNELS = 2                     # goal evidence, looked-at
 CANDIDATE_WIDTH = 4              # forward, right, distance (/EGO_RADIUS), evidence
+VIEW_GRID = (3, 5)               # depth view cells: rows top..bottom, columns left..right
+VIEW_WIDTH = VIEW_GRID[0] * VIEW_GRID[1]
+VIEW_RANGE_M = 60.0              # farther (or no surface) reads as 0 nearness
 FREE_FRACTIONS = (0.25, 0.5, 0.75)
 CANDIDATE_FLOOR = 0.05           # weaker best evidence reports no candidate
 RATE_SCALE, VELOCITY_SCALE = 3.5, 5.0   # proprio normalisation (native sensors 3-5, 6-8)
@@ -34,7 +40,7 @@ RATE_SCALE, VELOCITY_SCALE = 3.5, 5.0   # proprio normalisation (native sensors 
 
 class SpatialMemory:
     def __init__(self, n, grid_h, grid_w, camera, device):
-        self.n, self.device = n, device
+        self.n, self.device, self.grid = n, device, (grid_h, grid_w)
         self.map = torch.zeros((n, CHANNELS, GRID, GRID), device=device)
         self.position = torch.zeros((n, 2), device=device)
         self.yaw = torch.zeros(n, device=device)
@@ -109,11 +115,20 @@ class SpatialMemory:
         return float(offset[0] * c + offset[1] * s), float(offset[0] * s - offset[1] * c)
 
 
+def depth_view(depth, grid):
+    """[n, P] predicted patch depth in metres (0: no surface) -> [n, VIEW_WIDTH] nearness
+    1 - log1p(d) / log1p(VIEW_RANGE_M) of the nearest patch in each view cell (1 = touching)."""
+    d = torch.where(depth > 0, depth, torch.full_like(depth, VIEW_RANGE_M)).clamp(max=VIEW_RANGE_M)
+    nearest = -F.adaptive_max_pool2d(-d.view(-1, 1, *grid), VIEW_GRID).flatten(1)
+    return 1 - torch.log1p(nearest) / math.log1p(VIEW_RANGE_M)
+
+
 @torch.no_grad()
 def observe(policy, memory, cls, tokens, goal, proprio, starts, goal_mask=None):
     """One memory tick before the actor acts: reset finished episodes, project this frame, and
-    return the actor's memory inputs (ego crop, candidate). ``goal_mask`` [n] zeroes the goal
-    evidence of environments without a goal (explore commands)."""
+    return the actor's memory inputs (ego crop, memory vector: the candidate, plus the depth view
+    for ``depth_view`` policies). ``goal_mask`` [n] zeroes the goal evidence of environments
+    without a goal (explore commands)."""
     memory.reset(starts)
     _, logits = policy.attention(goal, cls, tokens)
     evidence = torch.sigmoid(logits[:, :-1] - logits[:, -1:])
@@ -122,4 +137,7 @@ def observe(policy, memory, cls, tokens, goal, proprio, starts, goal_mask=None):
     depth, memory.classes = policy.perception.predict(tokens, ground_prior(proprio, memory.rays))
     memory.update(proprio, depth, evidence)
     memory.depth = depth
-    return memory.ego(), memory.candidate()
+    vector = memory.candidate()
+    if policy.depth_view:
+        vector = torch.cat((vector, depth_view(depth, memory.grid)), -1)
+    return memory.ego(), vector

@@ -9,7 +9,7 @@ from torch.profiler import record_function
 
 from .curriculum import MODES as CURRICULUM_MODES, Curriculum
 from .features import RefreshedGoals
-from .memory import CANDIDATE_WIDTH, CHANNELS, EGO, SpatialMemory, observe as observe_memory
+from .memory import CHANNELS, EGO, SpatialMemory, observe as observe_memory
 from .model import EXPLORE_COMMAND, GOAL_COMMAND, saliency_loss, squashed_entropy, squashed_log_prob
 from .native import HOVER_ACTIONS, PRIVILEGED_WIDTH, PROPRIO_WIDTH
 
@@ -143,7 +143,7 @@ class Trainer:
         if policy.spatial:
             self.spatial = SpatialMemory(n, env.height // 16, env.width // 16, env.metadata["camera"], env.device)
             self.memory_ego = torch.empty((t, n, CHANNELS, EGO, EGO), device=env.device, dtype=torch.bfloat16)
-            self.memory_candidate = allocate(t, n, CANDIDATE_WIDTH)
+            self.memory_vector = allocate(t, n, policy.memory_vector_width)
         else:
             self.spatial = None
         self.current_cls = self.current_tokens = None
@@ -232,7 +232,7 @@ class Trainer:
                 memory = self._memory(self.rollout_goals[t].float() if self.features.visual else None)
                 if memory is not None:
                     self.memory_ego[t].copy_(memory[0])
-                    self.memory_candidate[t].copy_(memory[1])
+                    self.memory_vector[t].copy_(memory[1])
                 inputs, _ = self._inputs(self.cls[t] if self.features.visual else None,
                                          self.tokens[t] if self.features.visual else None,
                                          self.rollout_goals[t].float() if self.features.visual else None,
@@ -296,7 +296,7 @@ class Trainer:
                     goal_rows = command.flatten(0, 1) == GOAL_COMMAND
                     if self.features.visual:
                         memory = ((self.memory_ego[times, env_ids].flatten(0, 1),
-                                   self.memory_candidate[times, env_ids].flatten(0, 1))
+                                   self.memory_vector[times, env_ids].flatten(0, 1))
                                   if self.spatial is not None else None)
                         inputs, attended = self._inputs(self.cls[times, env_ids].flatten(0, 1),
                                                         self.tokens[times, env_ids].flatten(0, 1),

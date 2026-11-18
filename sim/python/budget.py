@@ -77,7 +77,8 @@ def main():
 
     grid_h, grid_w = meta["height"] // 16, meta["width"] // 16
     policy = ActorCritic("visual", features.dim, features.goal_dim, grid_h, grid_w, meta["action_dim"], features.goal,
-                         bool(meta.get("memory")), meta.get("commands", 1)).to(device).eval()
+                         bool(meta.get("memory")), meta.get("commands", 1),
+                         bool((meta.get("memory") or {}).get("depth_view"))).to(device).eval()
     policy.load_state_dict(saved["model"])
     proprio = torch.zeros(1, PROPRIO_WIDTH, device=device)
     proprio[:, 1] = -1.0   # level gravity
