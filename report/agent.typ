@@ -27,7 +27,9 @@ Getting the loop to work at all took three fixes, none of them a flight rule:
 - at the deadline the only accepted action is an answer.
 
 Find fails in two opposite ways. The base model boxes a look-alike (a building for "truck"), and the
-drone often crashes into it. The first grounding adapter boxes almost nothing because of a data artifact:
-repeated names were always phrased "the nearest X", so the agent's plain "the X" was learned as a refusal.
-Crashes also end 10–20% of explore flights. Both point at the policy's held-out collision rate, which the
-single-city runs do not fix.
+drone often crashes into it. The first grounding adapters box almost nothing. Their loss was averaged over
+answer tokens, so the single token that decides box or "[]" weighed 1/25 of a box answer but 1/3 of a
+refusal; training loss was low while greedy decoding refused. Summing the answer-token loss (and also
+training the agent's plain "the X" wording of repeated names) gives the first adapter that beats the
+base model on held-out frames: 55% vs 43.5% hits at IoU ≥ 0.3, and 25% vs 50.5% boxes for absent objects.
+Crashes also end 10–20% of explore flights, which points at the policy's held-out collision rate.
