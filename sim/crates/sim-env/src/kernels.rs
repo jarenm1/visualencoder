@@ -111,6 +111,8 @@ pub(crate) struct Buffers {
     pub ended_hint: *mut f32,
     /// Goal crop rectangles written by `goal_view` (n x [x0, y0, x1, y1]).
     pub crops: *mut f32,
+    /// Writable per-env reset override: catalog index of the next episode (-1: sample), consumed.
+    pub next_catalog: *mut i32,
     /// Appearance key per camera slot: the catalog index whose appearance it renders.
     pub keys: *mut u32,
     /// Per-env 128x128 observed surface-tile ledger, 512 words; never policy input.
@@ -418,15 +420,21 @@ pub(crate) mod device {
         }
         let p_no_hint = unsafe { probability(buffers, 3) };
         let pick = unit(base, LANE_BUCKET) * sum;
-        let bucket = if pick < w[0] { 0usize } else if pick < w[0] + w[1] { 1usize } else { 2usize };
-        let count = config.bucket_count[bucket];
+        let sampled_bucket = if pick < w[0] { 0usize } else if pick < w[0] + w[1] { 1usize } else { 2usize };
+        let count = config.bucket_count[sampled_bucket];
         let within = unit(base, LANE_CATALOG) * count as f32;
         let mut within = within as u32;
         if within >= count {
             within = count - 1;
         }
-        let index = config.bucket_first[bucket] + within;
+        // A caller-chosen catalog entry (verifier labelling, prioritized replay) replaces the
+        // sampled one once; its bucket is the catalog's.
+        let forced = unsafe { *buffers.next_catalog.add(i) };
+        let index = if forced >= 0 && (forced as u32) < config.catalog_size { forced as u32 }
+            else { config.bucket_first[sampled_bucket] + within };
+        unsafe { *buffers.next_catalog.add(i) = -1 };
         let spec = unsafe { *buffers.catalog.add(index as usize) };
+        let bucket = spec.meta[1] as usize;
 
         let rot = spec.start_rotation;
         let position = xyz(spec.start_position);

@@ -14,7 +14,7 @@ pub const CATALOG_SIZE: usize = 65536;
 pub const MIN_CATALOG_SIZE: usize = 4096;
 /// Floats per camera slot: view (16), view-projection (16), eye (4).
 pub const CAMERA_FLOATS: usize = 36;
-pub const FIELD_COUNT: usize = 19;
+pub const FIELD_COUNT: usize = 20;
 /// Patch size of the frozen encoders' token grid; per-patch labels use the same grid.
 pub const PATCH: u32 = 16;
 /// Per-patch label samples per side (LABEL_SIDE^2 pixels per patch).

@@ -23,8 +23,9 @@ HOVER_ACTIONS = {"velocity": (0.0, 0.0, 0.0, 0.0), "rates": (-0.2, 0.0, 0.0, 0.0
 # Fields: 0 obs, 1 proprio, 2 reward, 3 done, 4 success, 5 privileged, 6 collision,
 # 7 episodes, 8 diagnostics, 9 catalog index, 10 goal views, 11 curriculum (writable),
 # 12 ended bucket, 13 out_of_bounds, 14 ended hint mode, 15 goal crops, 16 episode diagnostics,
-# 17 patch depth, 18 patch object (both training labels, never actor input).
-FIELD_COUNT = 19
+# 17 patch depth, 18 patch object (both training labels, never actor input),
+# 19 next catalog (writable reset override: the next episode's catalog index, -1 samples).
+FIELD_COUNT = 20
 PATCH = 16
 DIAGNOSTICS_WIDTH = 28
 # w_visible, w_partial, w_hidden, p_no_gps (no hint), appearance strength, p_coarse, p_wrong (of hinted)
@@ -164,6 +165,7 @@ class CudaEnv:
                 ((n, 3), "<f4"),                       # 16 episode diagnostics, never actor input
                 ((n, patches), "<f4"),                 # 17 patch depth (label)
                 ((n, patches), "<i4"),                 # 18 patch object (label)
+                ((n,), "<i4"),                         # 19 next catalog (writable reset override)
             ]
             with self.execution():
                 for field, (shape, typestr) in enumerate(specifications):
@@ -180,7 +182,7 @@ class CudaEnv:
             (self.obs, self.proprio, self.reward, self.done, self.success, self.privileged,
              self.collision, self.episode_counts, self.diagnostics, self.catalog_index, self.goal_views,
              self.curriculum, self.ended_bucket, self.out_of_bounds, self.ended_hint, self.goal_crops,
-             self.episode_diagnostics, self.patch_depth, self.patch_object) = self.tensors
+             self.episode_diagnostics, self.patch_depth, self.patch_object, self.next_catalog) = self.tensors
         except BaseException:
             self.close()
             raise

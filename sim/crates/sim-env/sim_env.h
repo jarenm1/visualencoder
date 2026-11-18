@@ -62,7 +62,10 @@ enum sim_env_field {
     SIM_ENV_FIELD_PATCH_DEPTH = 17,
     /* int32 [n, P]: city layout object most of the patch shows, -1 if none. Training label only. */
     SIM_ENV_FIELD_PATCH_OBJECT = 18,
-    SIM_ENV_FIELD_COUNT = 19
+    /* int32 [n], writable: catalog index the environment's next episode starts from, consumed
+     * (reset to -1) by that reset; -1 samples a bucket and entry as usual. */
+    SIM_ENV_FIELD_NEXT_CATALOG = 19,
+    SIM_ENV_FIELD_COUNT = 20
 };
 
 /* Creates an environment batch of n drones.

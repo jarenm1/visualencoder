@@ -259,6 +259,8 @@ impl Env {
             allocate(count * 3 * 4)?,
             allocate(count * patches * 4)?,
             allocate(count * patches * 4)?,
+            // Writable reset overrides: -1 everywhere until the caller asks for a catalog entry.
+            DeviceBuffer::from_host(stream, bytemuck::cast_slice(&vec![-1i32; count]))?,
         ];
 
         let exchange = Exchange::new(gpu.clone(), vec![state.clone(), cameras.clone(), rendered.clone()])?;
@@ -344,6 +346,7 @@ impl Env {
             catalog_index: self.outputs[9].cu_deviceptr() as *mut i32,
             ended_hint: self.outputs[14].cu_deviceptr() as *mut f32,
             crops: self.outputs[15].cu_deviceptr() as *mut f32,
+            next_catalog: self.outputs[19].cu_deviceptr() as *mut i32,
             keys: self.keys.cu_deviceptr() as *mut u32,
             coverage_seen: self.coverage_seen.cu_deviceptr() as *mut u32,
             episode_diagnostics: self.outputs[16].cu_deviceptr() as *mut f32,
@@ -674,6 +677,8 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, district: &drone::D
             "layout": "training label, never actor input: mean planar depth (m) of the samples on the patch's object (of all hits if it names none), 0 if no geometry"}));
         fields.push(serde_json::json!({"index": 18, "name": "patch_object", "dtype": "int32", "shape": ["n", "P"],
             "layout": "training label, never actor input: layout object index hit by most samples, -1 if none"}));
+        fields.push(serde_json::json!({"index": 19, "name": "next_catalog", "dtype": "int32", "shape": ["n"],
+            "layout": "writable: catalog index the environment's next episode starts from (bucket from the catalog), consumed (reset to -1) at that reset; -1 samples as usual"}));
     }
     json["camera_effects"] = serde_json::json!({
         "scope": "monocular lens and sensor timing, each a per-episode uniform times appearance strength",
