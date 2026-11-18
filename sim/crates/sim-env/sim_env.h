@@ -71,11 +71,12 @@ enum sim_env_field {
 void *sim_env_create(uint32_t n, uint64_t seed, uint32_t width, uint32_t height,
                      uint32_t style, uint32_t control_mode, const char *city_path);
 
-/* Same task with a different catalog start-box-distance range (metres), for far-target cohorts.
+/* Same task with a different catalog start-box-distance range (metres), for far-target cohorts,
+ * and catalog size (4096..65536 episodes; sim_env_create uses 8-30 m and 65536).
  * min_distance > 6, max_distance > min_distance, both finite. */
-void *sim_env_create_with_start_distance(uint32_t n, uint64_t seed, uint32_t width, uint32_t height,
+void *sim_env_create_with_options(uint32_t n, uint64_t seed, uint32_t width, uint32_t height,
                      uint32_t style, uint32_t control_mode, const char *city_path,
-                     float min_distance, float max_distance);
+                     float min_distance, float max_distance, uint32_t catalog_size);
 
 /* Null-terminated UTF-8 JSON describing layouts, dynamics and sign conventions.
  * Owned by the environment; valid until sim_env_destroy(). */

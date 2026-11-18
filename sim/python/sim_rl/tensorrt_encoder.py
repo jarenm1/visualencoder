@@ -46,6 +46,9 @@ class TensorRTEncoder:
         self.logger = trt.Logger(trt.Logger.WARNING)
         self.runtime = trt.Runtime(self.logger)
         self.engines = {}
+        # One execution context (and its scratch memory) serves every stream, so each call waits
+        # for the previous call's work: concurrent use on two streams corrupted goal embeddings.
+        self.done = None
 
     def __call__(self, images):
         if images.dtype != torch.float32 or images.device != self.device or images.dim() != 4:
@@ -57,7 +60,10 @@ class TensorRTEncoder:
         cls = torch.empty((batch, *context.get_tensor_shape("cls")[1:]), dtype=torch.float16, device=self.device)
         patches = torch.empty((batch, *context.get_tensor_shape("patches")[1:]), dtype=torch.float16,
                               device=self.device)
-        stream = torch.cuda.current_stream(self.device).cuda_stream
+        current = torch.cuda.current_stream(self.device)
+        if self.done is not None:
+            current.wait_event(self.done)
+        stream = current.cuda_stream
         for start in range(0, batch, MAX_BATCH):
             end = min(start + MAX_BATCH, batch)
             context.set_input_shape("image", (end - start, 3, height, width))
@@ -66,6 +72,8 @@ class TensorRTEncoder:
             context.set_tensor_address("patches", patches[start:end].data_ptr())
             if not context.execute_async_v3(stream):
                 raise RuntimeError("TensorRT encoder execution failed")
+        self.done = torch.cuda.Event()
+        self.done.record(current)
         return cls, patches
 
     def _engine(self, height, width):

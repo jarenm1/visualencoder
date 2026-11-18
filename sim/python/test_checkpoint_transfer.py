@@ -17,7 +17,7 @@ def _fixture(directory: str):
     library.write_bytes(b"provenance fixture")
     env = SimpleNamespace(
         action_dim=4, horizon=HORIZON, control_hz=30, control_mode="velocity", catalog_size=256,
-        width=224, height=224, library=library,
+        width=224, height=224, library=library, city_fingerprints=("city-fixture",),
         task_contract={"task": TASK, "abi_version": ABI_VERSION, "horizon": HORIZON,
                        "dynamics": {"velocity_scales": [4.0, 2.0, 1.5]},
                        "sensors": {"proprio_width": 19}, "privileged": {"width": 29},
@@ -64,6 +64,21 @@ class TaskTransferTests(unittest.TestCase):
             features.visual, features.spec = False, "state"
             with self.assertRaisesRegex(ValueError, "explicit visual-policy evaluation"):
                 validate_checkpoint(old, env, features, for_task_transfer=True)
+
+    def test_checkpoint_evaluates_in_another_city(self):
+        """City content is not part of the policy contract (multi-city training, held-out cities);
+        checkpoints written before that change recorded their city inside the contract."""
+        with TemporaryDirectory() as directory:
+            env, features, _ = _fixture(directory)
+            current = deepcopy(native_provenance(env, features))
+            saved = {"format": CHECKPOINT_FORMAT, "metadata": current, "model": {}}
+            saved["metadata"]["native_task_contract"].update(city_fingerprint="training-city",
+                                                             landable={"triangles": 7})
+            saved["metadata"]["cities"] = ["training-city"]
+            validate_checkpoint(saved, env, features)
+            saved["metadata"]["native_task_contract"]["sensors"] = {"proprio_width": 20}
+            with self.assertRaisesRegex(ValueError, "native_task_contract differs"):
+                validate_checkpoint(saved, env, features)
 
 
 if __name__ == "__main__":

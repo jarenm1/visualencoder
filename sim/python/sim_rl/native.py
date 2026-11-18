@@ -15,6 +15,8 @@ ABI_VERSION = 7
 ACTION_DIM = 4
 HORIZON = 1200
 CONTROL_HZ = 30
+CATALOG_SIZE = 65536                   # native default episode catalogue per environment
+DEFAULT_START_DISTANCE = (8.0, 30.0)   # native default start distance (m from the target box)
 CONTROL_MODES = {"velocity": 0, "rates": 1}
 # Zero velocity commands hover; rates mode keeps the v3 hover throttle bias.
 HOVER_ACTIONS = {"velocity": (0.0, 0.0, 0.0, 0.0), "rates": (-0.2, 0.0, 0.0, 0.0)}
@@ -31,7 +33,10 @@ PRIVILEGED_WIDTH = 29
 REQUIRED_METADATA = ("abi_version", "task", "action_dim", "control_hz", "physics_hz", "horizon",
                      "catalog_size", "city_fingerprint", "city_path", "control_mode", "action_names",
                      "action_scales", "target_classes")
-SPLIT_SPECIFIC_METADATA = ("city_path", "city", "style", "split", "district", "catalog", "fields")
+# Which city (and where in it) an environment simulates is not part of the policy contract:
+# multi-city training and held-out-city evaluation depend on that.
+SPLIT_SPECIFIC_METADATA = ("city_path", "city", "city_fingerprint", "landable", "style", "split", "district",
+                           "catalog", "catalog_size", "fields")
 
 
 class _CudaAllocation:
@@ -51,7 +56,7 @@ class CudaEnv:
     Vulkan shared buffers are internal: every exposed pointer is CUDA-only.
     """
     def __init__(self, library, n, seed, width, height, style, control_mode, city_path=DEFAULT_CITY,
-                 start_distance=None):
+                 start_distance=None, catalog_size=None):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required; no CPU environment fallback")
         if n < 1 or width < 48 or height < 32 or width % 16 or height % 16:
@@ -77,8 +82,8 @@ class CudaEnv:
             "sim_env_render_goals": ([ct.c_void_p, ct.c_uint32], ct.c_int32),
             "sim_env_retarget": ([ct.c_void_p, ct.c_void_p], ct.c_int32),
             "sim_env_set_free_flight": ([ct.c_void_p, ct.c_uint32], ct.c_int32),
-            "sim_env_create_with_start_distance": ([ct.c_uint32, ct.c_uint64, ct.c_uint32, ct.c_uint32,
-                ct.c_uint32, ct.c_uint32, ct.c_char_p, ct.c_float, ct.c_float], ct.c_void_p),
+            "sim_env_create_with_options": ([ct.c_uint32, ct.c_uint64, ct.c_uint32, ct.c_uint32,
+                ct.c_uint32, ct.c_uint32, ct.c_char_p, ct.c_float, ct.c_float, ct.c_uint32], ct.c_void_p),
             "sim_env_destroy": ([ct.c_void_p], None),
             "sim_env_error": ([], ct.c_char_p),
         }
@@ -89,10 +94,11 @@ class CudaEnv:
                 raise RuntimeError(f"city navigation requires sim_env ABI v{ABI_VERSION} symbol {name}") from error
             function.argtypes, function.restype = args, result
         create_args = (n, seed, width, height, style, CONTROL_MODES[control_mode], os.fsencode(self.city_path))
-        if start_distance is None:
+        if start_distance is None and catalog_size is None:
             self.handle = self.lib.sim_env_create(*create_args)
         else:
-            self.handle = self.lib.sim_env_create_with_start_distance(*create_args, *start_distance)
+            self.handle = self.lib.sim_env_create_with_options(
+                *create_args, *(start_distance or DEFAULT_START_DISTANCE), catalog_size or CATALOG_SIZE)
         if not self.handle:
             raise RuntimeError(self.error())
         self._owners, self.tensors = [], []
@@ -113,6 +119,7 @@ class CudaEnv:
             self.horizon = int(self.metadata["horizon"])
             self.control_hz = int(self.metadata["control_hz"])
             self.catalog_size = int(self.metadata["catalog_size"])
+            self.city_fingerprints = (self.metadata["city_fingerprint"],)
             self.target_classes = tuple(self.metadata["target_classes"])
             self.layout_classes = tuple(self.metadata["city"]["classes"])
             self.action_names = tuple(self.metadata["action_names"])
@@ -121,9 +128,9 @@ class CudaEnv:
                 raise ValueError(f"unsupported {TASK} action/horizon/control contract")
             if len(self.action_names) != ACTION_DIM or len(self.action_scales) != ACTION_DIM:
                 raise ValueError("native metadata must name and scale exactly four control channels")
-            # Location and split-specific content (district, catalog, field shapes) are
-            # excluded; dynamics, sensors, reward, camera, appearance, city content, control
-            # mode and every other rule must match checkpoints exactly.
+            # Location and split-specific content (city, district, catalog, field shapes) are
+            # excluded; dynamics, sensors, reward, camera, appearance, control mode and every
+            # other rule must match checkpoints exactly.
             self.task_contract = {key: value for key, value in self.metadata.items()
                                   if key not in SPLIT_SPECIFIC_METADATA}
             pointer = self.lib.sim_env_stream(self.handle)

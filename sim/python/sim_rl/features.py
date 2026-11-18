@@ -142,6 +142,8 @@ class FrozenFeatures:
         entry's randomized appearance at ``appearance`` strength), which is cropped to its goal box
         and encoded. Episodes look up their row by ``env.catalog_index``.
         """
+        if hasattr(env, "joined"):   # CityPool: per-city tables, catalog indices already offset
+            return env.joined(lambda city: self.catalog_goals(city, appearance))
         cache = env.__dict__.setdefault("goal_tables", {})
         key = (self.fingerprint, self.goal, float(appearance))
         if key not in cache:

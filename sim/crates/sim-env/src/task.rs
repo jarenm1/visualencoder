@@ -8,7 +8,10 @@ pub const ACTION_DIM: usize = 4;
 pub const SENSOR_DIM: usize = 19;
 pub const PRIVILEGED_DIM: usize = 29;
 pub const DIAGNOSTIC_DIM: usize = 28;
+/// Default (and largest) episode catalogue per environment; smaller ones down to the catalogue
+/// builder's candidate minimum are allowed (multi-city training).
 pub const CATALOG_SIZE: usize = 65536;
+pub const MIN_CATALOG_SIZE: usize = 4096;
 /// Floats per camera slot: view (16), view-projection (16), eye (4).
 pub const CAMERA_FLOATS: usize = 36;
 pub const FIELD_COUNT: usize = 19;

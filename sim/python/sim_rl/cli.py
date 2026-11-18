@@ -10,11 +10,12 @@ from pathlib import Path
 
 import torch
 
+from .cities import CityPool
 from .curriculum import MODES as CURRICULUM_MODES
 from .evaluation import evaluate, evaluate_explore, heuristics_for
 from .features import ARMS, GOALS, PRECISIONS, FrozenFeatures, checkpoint_features
 from .model import ActorCritic
-from .native import ABI_VERSION, CONTROL_MODES, DEFAULT_CITY, HOVER_ACTIONS, TASK, CudaEnv
+from .native import ABI_VERSION, CONTROL_MODES, DEFAULT_CITY, HOVER_ACTIONS, SPLIT_SPECIFIC_METADATA, TASK, CudaEnv
 from .perception import load_heads
 from .ppo import BUCKET_WIDTH, LOSS_NAMES, LOSS_WIDTH, RESULT_WIDTH, ROLLOUT_WIDTH, Config, Trainer
 from .probe import collect_frames, protocol_of, run_encoder, write_markdown
@@ -93,6 +94,7 @@ def native_provenance(env, features):
         "encoder_fingerprint": features.fingerprint, "preprocessing": features.preprocessing, "goal": features.goal,
         "actor_inputs": ACTOR_INPUTS[mode], "critic_inputs": CRITIC_INPUTS,
         "native_task_contract": env.task_contract, "native_library_sha256": sha256(env.library),
+        "cities": list(env.city_fingerprints),
     }
 
 
@@ -111,6 +113,9 @@ def training_settings(args):
             "goal_refresh_steps": args.goal_refresh_steps,
             "goal_box_source": "simulator" if args.goal_refresh_steps else None,
             "start_distance": args.start_distance, "memory": memory,
+            "train_cities": None if not args.train_cities else {
+                "paths": [str(path) for path in (args.city, *args.train_cities)],
+                "catalog_size_per_city": args.city_catalog_size},
             "explore_fraction": args.explore_fraction, "commands": commands_of(args),
             "init_from": None if args.init_from is None else {"path": str(args.init_from),
                                                                "sha256": sha256(args.init_from)}}
@@ -145,7 +150,10 @@ def load_checkpoint(path, *, for_task_transfer=False):
 
 
 def validate_checkpoint(saved, env, features, *, for_task_transfer=False):
-    recorded = saved["metadata"]
+    recorded = dict(saved["metadata"])
+    # Checkpoints before multi-city training recorded their city inside the contract.
+    recorded["native_task_contract"] = {key: value for key, value in recorded["native_task_contract"].items()
+                                        if key not in SPLIT_SPECIFIC_METADATA}
     expected = native_provenance(env, features)
     transfer = (recorded.get("task"), recorded.get("abi_version")) != (TASK, ABI_VERSION)
     if transfer:
@@ -177,9 +185,14 @@ def make_config(args):
 
 
 def open_env(args, n, seed, style):
+    """The training split simulates ``--city`` plus any ``--train-cities`` (a CityPool)."""
     start = getattr(args, "start_distance", None)
+    start = tuple(start) if start else None
+    if style == TRAIN_STYLE and getattr(args, "train_cities", None):
+        return CityPool(args.library, n, seed, args.width, args.height, style, args.control,
+                        (args.city, *args.train_cities), start_distance=start, catalog_size=args.city_catalog_size)
     return CudaEnv(args.library, n, seed, args.width, args.height, style, args.control, args.city,
-                   start_distance=tuple(start) if start else None)
+                   start_distance=start)
 
 
 def open_env_checkpoint(args, metadata, seed, style):
@@ -360,7 +373,7 @@ def train_command(args, started):
         "task": TASK, "abi_version": ABI_VERSION, "control_mode": metadata["control_mode"],
         "policy_mode": metadata["policy_mode"], "encoder": metadata["encoder"], "seed": args.seed,
         "width": metadata["width"], "height": metadata["height"], "control_hz": metadata["control_hz"],
-        "city_fingerprint": metadata["native_task_contract"]["city_fingerprint"],
+        "cities": metadata["cities"],
         "steps": trainer.steps, "no_gps_fraction": args.no_gps_fraction, "aux_coefficient": args.aux_coefficient,
         "goal_refresh_steps": config.goal_refresh_steps,
         "goal_box_source": metadata["goal_box_source"],
@@ -590,6 +603,12 @@ def add_learner(parser):
                              "instead of the goal; > 0 makes the policy command-conditioned")
     parser.add_argument("--init-from", type=Path,
                         help="warm-start from this checkpoint's weights (same encoder; new command lanes start at zero)")
+    parser.add_argument("--train-cities", type=Path, nargs="*", default=[],
+                        help="more city directories (scene/build_city.py) trained alongside --city; "
+                             "--num-envs splits evenly. Validation and test stay on --city's held-out districts")
+    parser.add_argument("--city-catalog-size", type=int, default=16384,
+                        help="episode catalogue per city with --train-cities (each city's goal table is "
+                             "catalogue x goal_dim bf16; 65536 is 2.3 GiB)")
     parser.add_argument("--curriculum", choices=CURRICULUM_MODES, default="adaptive")
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--no-gps-fraction", type=float, default=DEFAULTS.no_gps_fraction,

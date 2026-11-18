@@ -43,15 +43,18 @@ pub unsafe extern "C" fn sim_env_create(n: u32, seed: u64, width: u32, height: u
     })
 }
 
+/// `sim_env_create` with a start-distance range (metres from the target's box surface) and an
+/// episode catalogue size (`MIN_CATALOG_SIZE..=CATALOG_SIZE`).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sim_env_create_with_start_distance(n: u32, seed: u64, width: u32, height: u32,
-    style: u32, control_mode: u32, city_path: *const c_char, min_distance: f32, max_distance: f32) -> *mut c_void {
+pub unsafe extern "C" fn sim_env_create_with_options(n: u32, seed: u64, width: u32, height: u32,
+    style: u32, control_mode: u32, city_path: *const c_char, min_distance: f32, max_distance: f32,
+    catalog_size: u32) -> *mut c_void {
     boundary(std::ptr::null_mut(), || {
         ensure!(!city_path.is_null(), "city_path must not be null");
         let path = unsafe { CStr::from_ptr(city_path) }.to_str()?;
         ensure!(!path.is_empty(), "city_path must not be empty");
-        Ok(Box::into_raw(Box::new(Env::new_with_start_distance(n, seed, width, height, style,
-            control_mode, Path::new(path), [min_distance, max_distance])?)).cast())
+        Ok(Box::into_raw(Box::new(Env::new_with_options(n, seed, width, height, style, control_mode,
+            Path::new(path), [min_distance, max_distance], catalog_size as usize)?)).cast())
     })
 }
 

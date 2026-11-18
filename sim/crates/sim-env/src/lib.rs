@@ -152,7 +152,16 @@ impl Env {
 
     pub fn new_with_start_distance(n: u32, seed: u64, width: u32, height: u32, style: u32,
         control_mode: u32, city_path: &Path, start_distance: [f32; 2]) -> Result<Self> {
+        Self::new_with_options(n, seed, width, height, style, control_mode, city_path, start_distance, CATALOG_SIZE)
+    }
+
+    /// `catalog_size` episodes per environment catalogue (default `CATALOG_SIZE`); multi-city
+    /// training uses smaller per-city catalogues so their goal tables fit together.
+    pub fn new_with_options(n: u32, seed: u64, width: u32, height: u32, style: u32, control_mode: u32,
+        city_path: &Path, start_distance: [f32; 2], catalog_size: usize) -> Result<Self> {
         ensure!(n > 0, "environment count must be positive");
+        ensure!((MIN_CATALOG_SIZE..=CATALOG_SIZE).contains(&catalog_size),
+            "catalog size must be in {MIN_CATALOG_SIZE}..={CATALOG_SIZE}, got {catalog_size}");
         ensure!(style <= 2, "style must be 0 (training), 1 (validation), or 2 (final test)");
         ensure!(control_mode == CONTROL_VELOCITY || control_mode == CONTROL_RATES,
             "control_mode must be 0 (velocity) or 1 (rates), got {control_mode}");
@@ -168,8 +177,8 @@ impl Env {
         ensure!(city.nodes.len() <= u32::MAX as usize && city.triangles.len() <= u32::MAX as usize,
             "city collision index counts exceed u32");
 
-        let catalog = drone::build_catalog_with_start_distance(&city, style, CATALOG_SIZE, seed, start_distance)?;
-        ensure!(catalog.episodes.len() == CATALOG_SIZE, "catalog size mismatch");
+        let catalog = drone::build_catalog_with_start_distance(&city, style, catalog_size, seed, start_distance)?;
+        ensure!(catalog.episodes.len() == catalog_size, "catalog size mismatch");
         let district = drone::district(style, city.half_extent);
 
         let gpu = Gpu::new(0)?;
@@ -257,7 +266,7 @@ impl Env {
             dynamics::CAMERA_NEAR, dynamics::CAMERA_FAR).to_cols_array();
         let config = Config {
             n,
-            catalog_size: CATALOG_SIZE as u32,
+            catalog_size: catalog_size as u32,
             node_count: city.nodes.len() as u32,
             seed,
             control_mode,
@@ -601,7 +610,7 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, district: &drone::D
             "non_level": city.landable.non_level,
         },
         "catalog": {
-            "size": CATALOG_SIZE,
+            "size": catalog.episodes.len(),
             "bucket_ranges": catalog.bucket_ranges,
             "rules": catalog.rules,
         },
@@ -635,7 +644,7 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, district: &drone::D
     json["control_mode"] = control_mode_name.into();
     json["action_names"] = action_names.into();
     json["action_scales"] = action_scales.into();
-    json["catalog_size"] = CATALOG_SIZE.into();
+    json["catalog_size"] = catalog.episodes.len().into();
     json["target_classes"] = drone::TARGET_CLASSES.into();
     if control_mode != CONTROL_RATES {
         json["velocity_loop"] = serde_json::json!({
