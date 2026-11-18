@@ -256,8 +256,20 @@ The whole onboard stack on three instructions, 20 held-out free flights each, no
 |---|---|---|---|---|---|---|
 | base | 5% / 5% / 4.2 | 10% | 10% | 55% | 23,774 | 20% |
 | LoRA `lora` | 5% / 5% / 4.2 | 10% | 0% | 10% | 26,385 | 10% |
+| LoRA `lora-sum`, count within 35 m | **25% / 60% / 1.39** | 10% | 5% | 45% | 24,795 | 25% |
 
-These count numbers scored against every car seen at any range over a 120 s flight (mean 6.9) while the tracker only counts within 35 m; the benchmark now scores within that range and reports both. Gemma answers with the memory's count (it relays the summary faithfully), so count error is perception and memory recall. `find` fails in two ways. With base grounding Gemma boxes the wrong object (a building for "truck") and the drone often crashes into it. With the LoRA it declines almost every box, so the drone never commits to a target. Crashes are the policy's: they also end 10–20% of explore flights.
+The first two rows scored count against every car seen at any range over a 120 s flight (mean 6.9), while the tracker only counts within 35 m. The `lora-sum` row scores within that range (mean 3.55 cars); the memory's own track count is exact on 30% of flights. Gemma answers with the memory's count (it relays the summary faithfully), so count error is perception and memory recall.
+
+Of the 20 `lora-sum` find flights:
+- 5 (truck, sedan, van) ended with grounding saying "not visible" while the planner kept choosing `go` instead of exploring.
+- 7 boxed a building or tree and crashed within 1.4–7 s.
+- 2 crashed later on the approach.
+- 1 boxed "large stone" 23 times and never completed the hold.
+- 1 reached a different object.
+- 1 succeeded.
+- The remaining 3 mixed explore and go without ever boxing the target.
+
+Crashes are the largest failure (9 of 20). The planner's failure to explore after "not visible" comes next (5). Then the hold rule: in the replay analysis 12 of 16 episodes never entered the 6 m band, and a drone parked 1 m from a large tree for 37 s earned no hold credit because the target's anchor point was never in frame.
 
 ## Patch-goal run (ABI v6)
 

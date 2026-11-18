@@ -14,11 +14,13 @@ crop becomes the policy's goal. The policy flies every step. @tab-tasks reports 
     table.hline(stroke: 0.5pt),
     [Base Gemma], [5% / 4.2], [10% (55%)], [23,774 (20%)],
     [Grounding LoRA], [5% / 4.2], [0% (10%)], [26,385 (10%)],
+    [Grounding LoRA, summed loss#super[\*]], [25% / 1.39], [5% (45%)], [24,795 (25%)],
     table.hline(),
   ),
-  caption: [Count is scored against every car seen at any range over a 120 s flight (mean 6.9), while the
-  onboard tracker counts within 35 m. Gemma's answer equals the memory's track count, so the count
-  error is perception and memory recall, not language.],
+  caption: [The first two rows score count against every car seen at any range over a 120 s flight
+  (mean 6.9) while the onboard tracker counts within 35 m; #super[\*]scored within 35 m (mean 3.55; 60%
+  within one). Gemma's answer equals the memory's track count, so count error is perception and memory
+  recall, not language.],
 ) <tab-tasks>
 
 Getting the loop to work at all took three fixes, none of them a flight rule:
