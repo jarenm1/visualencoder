@@ -159,6 +159,45 @@ pub(crate) struct ImageArgs {
     /// static goal reference views.
     pub moving: u32,
     pub tan_half_vfov: f32,
+    /// Per-camera appearance constants (n entries), written by `camera_look` before the image
+    /// kernels of the same frame read them.
+    pub looks: *mut Look,
+}
+
+/// Per-camera monocular lens and sensor timing for one frame (all zero at appearance 0).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Lens {
+    /// Radial distortion: source radius = r (1 + k r^2), r normalized by the half-diagonal.
+    pub k: f32,
+    pub vignette: f32,
+    pub exposure: f32,
+    pub readout: f32,
+    /// Image motion from body rates: pan and tilt (pixels/s) and roll (rad/s).
+    pub pan: f32,
+    pub tilt: f32,
+    pub roll: f32,
+    pub cx: f32,
+    pub cy: f32,
+    pub radius: f32,
+}
+
+/// Everything about one camera's frame that is constant across its pixels: the strength, lens,
+/// sky gradient and the global photometric transform. Computed once per camera per frame.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Look {
+    pub strength: f32,
+    pub lens: Lens,
+    pub sky_top: [f32; 3],
+    pub sky_horizon: [f32; 3],
+    pub fog_density: f32,
+    /// Exposure gain before vignetting.
+    pub exposure_gain: f32,
+    pub contrast: f32,
+    pub gamma: f32,
+    pub sigma: f32,
+    pub balance: [f32; 3],
 }
 
 /// Per-patch training labels (never actor input): metric depth and the layout object hit.
@@ -180,7 +219,7 @@ pub(crate) struct LabelArgs {
 
 #[cuda_module]
 pub(crate) mod device {
-    use super::{Buffers, Config, EnvState, ImageArgs, LabelArgs, OccupancyArgs};
+    use super::{Buffers, Config, EnvState, ImageArgs, LabelArgs, Lens, Look, OccupancyArgs};
     use crate::task::{
         APPEARANCE_SALT, CAMERA_FLOATS, COS_LANDING_TILT, CONTROL_RATES, DIAGNOSTIC_DIM, DISTRICT_MARGIN,
         EVENT_CRASH, EVENT_OOB, HEIGHT_SCALE, HINT_COARSE, HINT_COARSE_RADIUS, HINT_NONE, HINT_PRECISE,
@@ -989,22 +1028,7 @@ pub(crate) mod device {
         [y2 + 0.956 * i2 + 0.621 * q2, y2 - 0.272 * i2 - 0.647 * q2, y2 - 1.106 * i2 + 1.703 * q2]
     }
 
-    /// Per-camera monocular lens and sensor timing for one frame (all zero at appearance 0).
-    #[derive(Clone, Copy)]
-    struct Lens {
-        /// Radial distortion: source radius = r (1 + k r^2), r normalized by the half-diagonal.
-        k: f32,
-        vignette: f32,
-        exposure: f32,
-        readout: f32,
-        /// Image motion from body rates: pan and tilt (pixels/s) and roll (rad/s).
-        pan: f32,
-        tilt: f32,
-        roll: f32,
-        cx: f32,
-        cy: f32,
-        radius: f32,
-    }
+    // Lens: see the host-side struct (shared with the per-camera look table).
 
     #[inline(always)]
     unsafe fn lens(args: ImageArgs, camera: usize, s: f32) -> Lens {
@@ -1056,11 +1080,44 @@ pub(crate) mod device {
         [(word & 0xff) as f32 / 255.0, ((word >> 8) & 0xff) as f32 / 255.0, ((word >> 16) & 0xff) as f32 / 255.0]
     }
 
+    /// Per-camera constants of one frame (see `Look`), one thread per camera; the image kernels
+    /// of the same frame read them instead of rehashing them at every pixel.
+    #[kernel]
+    pub unsafe fn camera_look(args: ImageArgs) {
+        let camera = thread::index_1d().get();
+        let plane = (args.width * args.height) as usize;
+        if camera >= args.pixels as usize / plane {
+            return;
+        }
+        let raw = unsafe { *args.lanes.add(4) };
+        let s = if raw != raw { 0.0 } else { clampf(raw, 0.0, 1.0) };
+        let key = unsafe { *args.keys.add(camera) };
+        // Sky: blue to overcast grey at the top, warmer and lighter toward the horizon.
+        let top = lerp3([0.35, 0.55, 0.85], [0.70, 0.72, 0.75], appearance_unit(key, 0, 0));
+        let horizon = lerp3([clampf(top[0] * 1.25, 0.0, 1.0), clampf(top[1] * 1.2, 0.0, 1.0), clampf(top[2] * 1.1, 0.0, 1.0)],
+            [0.95, 0.65, 0.45], 0.6 * appearance_unit(key, 0, 1));
+        let look = Look {
+            strength: s,
+            lens: unsafe { lens(args, camera, s) },
+            sky_top: top,
+            sky_horizon: horizon,
+            fog_density: s * appearance_unit(key, 0, 2) * 0.02,
+            exposure_gain: float::ex2_approx_f32(s * signed(appearance_unit(key, 0, 3)) * 0.6),
+            contrast: 1.0 + s * signed(appearance_unit(key, 0, 7)) * 0.2,
+            gamma: float::ex2_approx_f32(s * signed(appearance_unit(key, 0, 8)) * 0.3),
+            sigma: s * appearance_unit(key, 0, 9) * 0.03,
+            balance: [1.0 + s * signed(appearance_unit(key, 0, 4)) * 0.12,
+                1.0 + s * signed(appearance_unit(key, 0, 5)) * 0.12,
+                1.0 + s * signed(appearance_unit(key, 0, 6)) * 0.12],
+        };
+        unsafe { *args.looks.add(camera) = look };
+    }
+
     // Per-pixel randomized appearance, keyed by the catalog entry so an episode and its goal
     // view share one look: monocular lens (radial distortion, vignette, motion blur and rolling
     // shutter from body rates), per-material hue/saturation/value, sky gradient, depth fog,
     // exposure, white balance, contrast, gamma and sensor noise. Strength 0 reproduces the plain
-    // render.
+    // render. Per-camera constants come from `camera_look`.
     #[kernel]
     pub unsafe fn appearance(args: ImageArgs) {
         let index = thread::index_1d().get();
@@ -1071,9 +1128,9 @@ pub(crate) mod device {
         let camera = index / plane;
         let pixel = index - camera * plane;
         let row = pixel / args.width as usize;
-        let raw = unsafe { *args.lanes.add(4) };
-        let s = if raw != raw { 0.0 } else { clampf(raw, 0.0, 1.0) };
-        let l = unsafe { lens(args, camera, s) };
+        let look = unsafe { *args.looks.add(camera) };
+        let s = look.strength;
+        let l = look.lens;
         let u = (pixel - row * args.width as usize) as f32 + 0.5;
         let v = row as f32 + 0.5;
         let t_row = row_time(l, args.height, v);
@@ -1095,36 +1152,27 @@ pub(crate) mod device {
             let depth = f32::from_bits(unsafe { *args.rendered.add(args.pixels as usize + source) });
             let id = unsafe { *args.rendered.add(2 * args.pixels as usize + source) };
             let key = unsafe { *args.keys.add(camera) };
-            // Sky: blue to overcast grey at the top, warmer and lighter toward the horizon.
-            let top = lerp3([0.35, 0.55, 0.85], [0.70, 0.72, 0.75], appearance_unit(key, 0, 0));
-            let horizon = lerp3([clampf(top[0] * 1.25, 0.0, 1.0), clampf(top[1] * 1.2, 0.0, 1.0), clampf(top[2] * 1.1, 0.0, 1.0)],
-                [0.95, 0.65, 0.45], 0.6 * appearance_unit(key, 0, 1));
             if id == 0 {
                 let t = row as f32 / maxf((args.height - 1) as f32, 1.0);
-                c = lerp3(c, lerp3(top, horizon, t), s);
+                c = lerp3(c, lerp3(look.sky_top, look.sky_horizon, t), s);
             } else {
                 let material = if id - 1 < args.mesh_count { 1 + unsafe { *args.materials.add((id - 1) as usize) } } else { 0 };
                 c = recolor(c, s * signed(appearance_unit(key, material, 0)) * 0.35,
                     1.0 + s * signed(appearance_unit(key, material, 1)) * 0.4,
                     1.0 + s * signed(appearance_unit(key, material, 2)) * 0.25);
-                let density = s * appearance_unit(key, 0, 2) * 0.02;
-                let fog = 1.0 - float::ex2_approx_f32(-density * depth * core::f32::consts::LOG2_E);
-                c = lerp3(c, horizon, fog);
+                let fog = 1.0 - float::ex2_approx_f32(-look.fog_density * depth * core::f32::consts::LOG2_E);
+                c = lerp3(c, look.sky_horizon, fog);
             }
             let du = (u - l.cx) / l.radius;
             let dv = (v - l.cy) / l.radius;
             let shade = 1.0 - l.vignette * (du * du + dv * dv);
-            let exposure = float::ex2_approx_f32(s * signed(appearance_unit(key, 0, 3)) * 0.6) * shade;
-            let contrast = 1.0 + s * signed(appearance_unit(key, 0, 7)) * 0.2;
-            let gamma = float::ex2_approx_f32(s * signed(appearance_unit(key, 0, 8)) * 0.3);
-            let sigma = s * appearance_unit(key, 0, 9) * 0.03;
+            let exposure = look.exposure_gain * shade;
             let noise = mix(((index as u64) << 20) ^ ((args.frame as u64) << 52) ^ key as u64);
             let mut k = 0usize;
             while k < 3 {
-                let balance = 1.0 + s * signed(appearance_unit(key, 0, 4 + k as u32)) * 0.12;
-                let v = (c[k] * balance * exposure - 0.5) * contrast + 0.5;
+                let v = (c[k] * look.balance[k] * exposure - 0.5) * look.contrast + 0.5;
                 let grain = (unit(noise, 3 * k as u32) + unit(noise, 3 * k as u32 + 1) + unit(noise, 3 * k as u32 + 2) - 1.5) * 2.0;
-                c[k] = clampf(power(clampf(v, 0.0, 1.0), gamma) + sigma * grain, 0.0, 1.0);
+                c[k] = clampf(power(clampf(v, 0.0, 1.0), look.gamma) + look.sigma * grain, 0.0, 1.0);
                 k += 1;
             }
         }
@@ -1183,9 +1231,7 @@ pub(crate) mod device {
         let i = index / per;
         let patch = index - i * per;
         let (px, py) = ((patch % columns) as u32, (patch / columns) as u32);
-        let raw = unsafe { *args.lanes.add(4) };
-        let s = if raw != raw { 0.0 } else { clampf(raw, 0.0, 1.0) };
-        let l = unsafe { lens(args, i, s) };
+        let l = unsafe { (*args.looks.add(i)).lens };
         let body = unsafe { *buffers.bodies.add(i) };
         let (off, forward, up) = camera_basis(body.rotation);
         let eye = add(xyz(body.position), off);

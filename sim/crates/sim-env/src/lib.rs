@@ -21,7 +21,7 @@ use sim_state::BodyState;
 use sim_state::collision::{BvhNode, Triangle};
 use sim_state::drone as dynamics;
 use sim_state::drone::EpisodeSpec;
-use kernels::{Buffers, Config, EnvState, ImageArgs, LabelArgs, OccupancyArgs};
+use kernels::{Buffers, Config, EnvState, ImageArgs, LabelArgs, Look, OccupancyArgs};
 use profile::Profiler;
 pub use profile::{RENDER_STATS, STAGES};
 use task::*;
@@ -43,6 +43,7 @@ struct TaskKernels {
     observe: Function,
     goal_view: Function,
     appearance: Function,
+    camera_look: Function,
     retarget: Function,
     coverage: Function,
     patch_labels: Function,
@@ -60,6 +61,7 @@ impl TaskKernels {
             observe: module.load_function(kernels::device::observe_CUDA_SIGNATURE.entry)?,
             goal_view: module.load_function(kernels::device::goal_view_CUDA_SIGNATURE.entry)?,
             appearance: module.load_function(kernels::device::appearance_CUDA_SIGNATURE.entry)?,
+            camera_look: module.load_function(kernels::device::camera_look_CUDA_SIGNATURE.entry)?,
             retarget: module.load_function(kernels::device::retarget_CUDA_SIGNATURE.entry)?,
             coverage: module.load_function(kernels::device::coverage_CUDA_SIGNATURE.entry)?,
             patch_labels: module.load_function(kernels::device::patch_labels_CUDA_SIGNATURE.entry)?,
@@ -83,10 +85,16 @@ impl TaskKernels {
         Ok(())
     }
 
+    /// Per-camera look table, then the per-pixel appearance that reads it.
     unsafe fn launch_appearance(&self, stream: &CudaStream, mut args: ImageArgs) -> Result<()> {
-        let blocks = args.pixels.div_ceil(256);
+        let cameras = args.pixels / (args.width * args.height);
         let mut pointers = [(&raw mut args).cast::<c_void>()];
-        unsafe { launch_kernel_on_stream(&self.appearance, (blocks, 1, 1), (256, 1, 1), 0, stream, &mut pointers)? };
+        unsafe {
+            launch_kernel_on_stream(&self.camera_look, (cameras.div_ceil(64), 1, 1), (64, 1, 1), 0, stream,
+                &mut pointers)?;
+            launch_kernel_on_stream(&self.appearance, (args.pixels.div_ceil(256), 1, 1), (256, 1, 1), 0, stream,
+                &mut pointers)?;
+        }
         Ok(())
     }
 
@@ -150,6 +158,8 @@ pub struct Env {
     exclusions: DeviceBuffer<u8>,
     materials: DeviceBuffer<u8>,
     keys: DeviceBuffer<u8>,
+    /// Per-camera appearance constants of the current frame (kernels::Look).
+    looks: DeviceBuffer<u8>,
     coverage_seen: DeviceBuffer<u8>,
     label_boxes: DeviceBuffer<u8>,
     label_cell_start: DeviceBuffer<u8>,
@@ -264,6 +274,7 @@ impl Env {
         let rgb_bytes = count * 3 * height as usize * width as usize * 4;
         let states = allocate(count * size_of::<EnvState>())?;
         let keys = allocate(count * 4)?;
+        let looks = allocate(count * size_of::<Look>())?;
         let coverage_seen = allocate(count * 512 * 4)?;
         let patches = (width / PATCH * (height / PATCH)) as usize;
         let outputs: [DeviceBuffer<u8>; FIELD_COUNT] = [
@@ -330,6 +341,7 @@ impl Env {
             exclusions,
             materials,
             keys,
+            looks,
             coverage_seen,
             label_boxes,
             label_cell_start,
@@ -555,6 +567,7 @@ impl Env {
             frame: self.frame,
             moving: observation as u32,
             tan_half_vfov: self.config.tan_half_vfov,
+            looks: self.looks.cu_deviceptr() as *mut Look,
         };
         let labels = LabelArgs {
             boxes: self.label_boxes.cu_deviceptr() as *const [f32; 8],
