@@ -190,10 +190,79 @@ function present(source, time) {
     x += panel.width;
   }
   displayedTime = Math.min(time, environment().duration_seconds);
+  drawOutcome(frame);
+  showEpisodeStatus(frame);
   timeline.value = String(displayedTime);
   timeline.setAttribute("aria-valuetext", `frame ${frame + 1} of ${environment().frame_count}`);
   busy(false);
   playIcon();
+}
+
+// How each episode ended, in plain words. "out_of_bounds" is leaving the training district
+// (an invisible boundary) or the ceiling; "collision" is touching geometry or a hard landing.
+const OUTCOME_LABELS = {
+  success: "SUCCESS", collision: "CRASH", out_of_bounds: "LEFT AREA", timeout: "TIMEOUT",
+};
+const OUTCOME_COLOURS = {
+  success: "#4f9d4f", collision: "#c04848", out_of_bounds: "#c04848", timeout: "#b8932f",
+};
+const BANNER_SECONDS = 1.0;
+
+function field(name) { return manifest.state_fields?.indexOf(name) ?? -1; }
+
+// Distance from the drone to the target's box, height and speed at a recorded frame.
+function flightAt(frame) {
+  const states = environment().states;
+  if (!Array.isArray(states) || states.length === 0) return null;
+  const at = (k) => states[Math.min(k, states.length - 1)];
+  const s = at(frame);
+  const p = [field("world_x"), field("world_y"), field("world_z")].map((i) => s[i]);
+  const c = [field("target_x"), field("target_y"), field("target_z")].map((i) => s[i]);
+  const h = [field("target_half_x"), field("target_half_y"), field("target_half_z")].map((i) => s[i]);
+  const gap = Math.hypot(...p.map((v, i) => Math.max(Math.abs(v - c[i]) - h[i], 0)));
+  const q = frame > 0 ? at(frame - 1) : s;
+  const prev = [field("world_x"), field("world_y"), field("world_z")].map((i) => q[i]);
+  const speed = Math.hypot(...p.map((v, i) => v - prev[i])) * manifest.control_hz;
+  return { gap, height: p[1], speed, landed: s[field("landed")] > 0.5, visible: s[field("target_visible")] > 0.5 };
+}
+
+function drawOutcome(frame) {
+  const env = environment();
+  if (env.duration_seconds - frame / manifest.control_hz > BANNER_SECONDS) return;
+  const label = OUTCOME_LABELS[env.outcome] ?? env.outcome;
+  const size = Math.max(16, Math.round(screen.height / 9));
+  context.save();
+  context.font = `600 ${size}px system-ui, sans-serif`;
+  const width = context.measureText(label).width + size;
+  context.globalAlpha = 0.85;
+  context.fillStyle = OUTCOME_COLOURS[env.outcome] ?? "#555";
+  context.fillRect((screen.width - width) / 2, size * 0.4, width, size * 1.5);
+  context.globalAlpha = 1;
+  context.fillStyle = "#fff";
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  context.fillText(label, screen.width / 2, size * 1.15);
+  context.restore();
+}
+
+function showEpisodeStatus(frame) {
+  const env = environment();
+  const status = $("status");
+  status.replaceChildren();
+  const outcome = document.createElement("b");
+  outcome.className = env.outcome;
+  outcome.textContent = OUTCOME_LABELS[env.outcome] ?? env.outcome;
+  const visibility = ["visible", "partly hidden", "hidden"][env.bucket] ?? "?";
+  const head = `env ${env.id} (${selected + 1}/${manifest.environments.length})  ends: `;
+  const start = `  at ${env.duration_seconds.toFixed(1)} s · target ${env.target_class}, ${visibility} at start`
+    + ` · ${env.gps_available ? "hint" : "no hint"} · ${env.start_landed ? "landed" : "flying"} start`;
+  const flight = flightAt(frame);
+  const now = flight
+    ? `\nt ${(frame / manifest.control_hz).toFixed(1)} s · ${flight.gap.toFixed(1)} m to target`
+      + ` · height ${flight.height.toFixed(1)} m · ${flight.speed.toFixed(1)} m/s`
+      + `${flight.landed ? " · on ground" : ""}${flight.visible ? " · target in view" : ""}`
+    : "";
+  status.append(head, outcome, start + now);
 }
 
 function fail(message) {
