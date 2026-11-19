@@ -131,6 +131,13 @@ PYTHONPATH=sim/python nix develop path:sim --command .venv/bin/python sim/python
   --envs 64 256 1024 --sizes 320x240 128x96 --out reports/sim-profile.json
 ```
 
+All cameras render in one pass into an atlas. A compute pass culls 16 m city chunks per camera, picks each chunk's level of detail (quadric levels that keep palette colour seams, then vertex-clustering levels; the coarsest level whose geometric error projects to at most 1 px) and compacts the visible draws in order for `drawIndirectCount`. `sim_lod.py` measures LOD budgets against exact rendering (throughput, pixel and label error, frozen-encoder feature cosine) and writes the sweep table; `SIM_LOD_PIXELS` overrides the budget for such sweeps and the metadata records the value in use:
+
+```sh
+PYTHONPATH=sim/python nix develop path:sim --command .venv/bin/python sim/python/sim_lod.py \
+  --budgets 0.5 1 2 4 --out reports/sim-lod.json
+```
+
 The earlier fixed-altitude gap and city-block tasks (`report/navigation.typ`, `report/city-navigation.typ`, `sim/verification.json`) are historical results of superseded task versions; their checkpoints are rejected by the current ABI.
 
 

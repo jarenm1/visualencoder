@@ -46,7 +46,19 @@ pub struct MeshData {
     pub indices: Vec<u32>,
     /// None retains the instance-only material used by procedural smoke scenes.
     pub material: Option<MeshMaterial>,
+    /// Coarser index lists over the same `vertices`, in increasing `error` (at most MAX_LODS).
+    pub lods: Vec<MeshLod>,
 }
+
+/// One simplified level of detail: `indices` reference the parent mesh's vertices and `error`
+/// bounds its geometric deviation from the full mesh in mesh units (metres for the city).
+pub struct MeshLod {
+    pub indices: Vec<u32>,
+    pub error: f32,
+}
+
+/// Levels of detail per mesh beyond the full mesh (renderer DrawInfo and cull.wgsl ABI).
+pub const MAX_LODS: usize = 4;
 
 impl MeshData {
     /// Unit cube centered on the origin, with separate vertices for flat normals.
@@ -68,7 +80,7 @@ impl MeshData {
             let base = face * 4;
             indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
         }
-        Self { vertices, indices, material: None }
+        Self { vertices, indices, material: None, lods: Vec::new() }
     }
 
     /// Unit XZ plane centered on the origin, with its front face pointing +Y.
@@ -82,6 +94,7 @@ impl MeshData {
             ],
             indices: vec![0, 2, 1, 0, 3, 2],
             material: None,
+            lods: Vec::new(),
         }
     }
 
@@ -115,7 +128,7 @@ impl MeshData {
                 if ring + 1 != rings { indices.extend_from_slice(&[a, c, b]); }
             }
         }
-        Self { vertices, indices, material: None }
+        Self { vertices, indices, material: None, lods: Vec::new() }
     }
 
     /// Unit cylinder: radius 0.5, height 1 along Y, centered on the origin, with flat caps.
@@ -140,7 +153,7 @@ impl MeshData {
         }
         push_disc(&mut vertices, &mut indices, segments, 0.5, 1.0);
         push_disc(&mut vertices, &mut indices, segments, -0.5, -1.0);
-        Self { vertices, indices, material: None }
+        Self { vertices, indices, material: None, lods: Vec::new() }
     }
 
     /// Unit cone: base radius 0.5 at y = -0.5, apex at y = +0.5, with a flat base.
@@ -165,7 +178,7 @@ impl MeshData {
             indices.extend_from_slice(&[base, apex, next_base]);
         }
         push_disc(&mut vertices, &mut indices, segments, -0.5, -1.0);
-        Self { vertices, indices, material: None }
+        Self { vertices, indices, material: None, lods: Vec::new() }
     }
 
     /// Unit octahedron with vertices at ±0.5 on the coordinate axes; flat-shaded faces.
@@ -189,7 +202,7 @@ impl MeshData {
                 }
             }
         }
-        Self { vertices, indices, material: None }
+        Self { vertices, indices, material: None, lods: Vec::new() }
     }
 
     /// Unit torus in the XZ plane, centered on the origin; outer extent is exactly 0.5 in x and z.
@@ -225,7 +238,7 @@ impl MeshData {
                 indices.extend_from_slice(&[a, c, b, a, d, c]);
             }
         }
-        Self { vertices, indices, material: None }
+        Self { vertices, indices, material: None, lods: Vec::new() }
     }
  }
 

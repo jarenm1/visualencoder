@@ -1,0 +1,189 @@
+{
+ "device": "NVIDIA GeForce RTX 5070 Ti",
+ "rows": [
+  {
+   "lod_pixels": 0.0,
+   "min_pixels": 0.0,
+   "startup_s": 29.12,
+   "envs": 1024,
+   "width": 320,
+   "height": 240,
+   "steps_per_second": 26219,
+   "stages_ms": {
+    "host_enqueue_ms": 0.6076,
+    "wall_ms": 38.2378,
+    "gpu_step_ms": 38.0614,
+    "control_ms": 4.1198,
+    "finish_ms": 1.1682,
+    "observe_ms": 1.0074,
+    "render_handoff_ms": 23.222,
+    "appearance_ms": 8.1613,
+    "labels_ms": 0.3267,
+    "coverage_ms": 0.056,
+    "vk_cull_ms": 0.8223,
+    "vk_camera_passes_ms": 20.3517,
+    "vk_pack_ms": 1.8766,
+    "vk_total_ms": 23.0626,
+    "vk_gaps_ms": 0.012,
+    "handoff_ms": 0.1594
+   },
+   "profiled_steps": 60,
+   "render": {
+    "draws_per_camera": 5754.0,
+    "scene_triangles": 1799347.0,
+    "cameras": 1024.0,
+    "visible_draws_per_camera": 317.1435546875,
+    "visible_triangles_per_camera": 144125.0263671875,
+    "max_visible_triangles": 339130.0,
+    "indirect_commands_per_frame": 324755.0
+   },
+   "fidelity": {
+    "pixel_mae": 0.0,
+    "pixels_over_0.1": 0.0,
+    "patch_depth_mae_m": 0.0,
+    "patch_object_agreement": 1.0,
+    "cls_cosine": 1.0,
+    "patch_cosine": 1.0,
+    "patch_cosine_p01": 0.9999998807907104
+   }
+  },
+  {
+   "lod_pixels": 1.0,
+   "min_pixels": 0.0,
+   "startup_s": 30.09,
+   "envs": 1024,
+   "width": 320,
+   "height": 240,
+   "steps_per_second": 27482,
+   "stages_ms": {
+    "host_enqueue_ms": 0.58,
+    "wall_ms": 36.5543,
+    "gpu_step_ms": 36.3785,
+    "control_ms": 4.1209,
+    "finish_ms": 1.1655,
+    "observe_ms": 1.0176,
+    "render_handoff_ms": 21.5025,
+    "appearance_ms": 8.174,
+    "labels_ms": 0.3318,
+    "coverage_ms": 0.0662,
+    "vk_cull_ms": 0.8256,
+    "vk_camera_passes_ms": 18.6399,
+    "vk_pack_ms": 1.8709,
+    "vk_total_ms": 21.3484,
+    "vk_gaps_ms": 0.012,
+    "handoff_ms": 0.1541
+   },
+   "profiled_steps": 60,
+   "render": {
+    "draws_per_camera": 5754.0,
+    "scene_triangles": 1799347.0,
+    "cameras": 1024.0,
+    "visible_draws_per_camera": 317.1435546875,
+    "visible_triangles_per_camera": 115450.3193359375,
+    "max_visible_triangles": 292987.0,
+    "indirect_commands_per_frame": 324755.0
+   },
+   "fidelity": {
+    "pixel_mae": 0.0003596927320662265,
+    "pixels_over_0.1": 0.0011017184976177912,
+    "patch_depth_mae_m": 0.01837696088477969,
+    "patch_object_agreement": 0.9991580049196879,
+    "cls_cosine": 0.9995427131652832,
+    "patch_cosine": 0.9995776414871216,
+    "patch_cosine_p01": 0.9937339425086975
+   }
+  },
+  {
+   "lod_pixels": 2.0,
+   "min_pixels": 0.0,
+   "startup_s": 29.4,
+   "envs": 1024,
+   "width": 320,
+   "height": 240,
+   "steps_per_second": 27973,
+   "stages_ms": {
+    "host_enqueue_ms": 0.6166,
+    "wall_ms": 35.9066,
+    "gpu_step_ms": 35.7395,
+    "control_ms": 4.1204,
+    "finish_ms": 1.1672,
+    "observe_ms": 1.0137,
+    "render_handoff_ms": 20.8688,
+    "appearance_ms": 8.1589,
+    "labels_ms": 0.3389,
+    "coverage_ms": 0.0717,
+    "vk_cull_ms": 0.8314,
+    "vk_camera_passes_ms": 17.9803,
+    "vk_pack_ms": 1.8918,
+    "vk_total_ms": 20.7154,
+    "vk_gaps_ms": 0.0119,
+    "handoff_ms": 0.1534
+   },
+   "profiled_steps": 60,
+   "render": {
+    "draws_per_camera": 5754.0,
+    "scene_triangles": 1799347.0,
+    "cameras": 1024.0,
+    "visible_draws_per_camera": 317.1435546875,
+    "visible_triangles_per_camera": 106791.111328125,
+    "max_visible_triangles": 267686.0,
+    "indirect_commands_per_frame": 324755.0
+   },
+   "fidelity": {
+    "pixel_mae": 0.0007008266402408481,
+    "pixels_over_0.1": 0.002226596426529189,
+    "patch_depth_mae_m": 0.03504359411696593,
+    "patch_object_agreement": 0.998619814713796,
+    "cls_cosine": 0.9992913007736206,
+    "patch_cosine": 0.9993899265925089,
+    "patch_cosine_p01": 0.9905087550481161
+   }
+  },
+  {
+   "lod_pixels": 4.0,
+   "min_pixels": 0.0,
+   "startup_s": 29.99,
+   "envs": 1024,
+   "width": 320,
+   "height": 240,
+   "steps_per_second": 28420,
+   "stages_ms": {
+    "host_enqueue_ms": 0.5876,
+    "wall_ms": 35.3123,
+    "gpu_step_ms": 35.135,
+    "control_ms": 4.1245,
+    "finish_ms": 1.1692,
+    "observe_ms": 1.0245,
+    "render_handoff_ms": 20.2422,
+    "appearance_ms": 8.1764,
+    "labels_ms": 0.3366,
+    "coverage_ms": 0.0617,
+    "vk_cull_ms": 0.8311,
+    "vk_camera_passes_ms": 17.3725,
+    "vk_pack_ms": 1.8707,
+    "vk_total_ms": 20.0895,
+    "vk_gaps_ms": 0.0152,
+    "handoff_ms": 0.1526
+   },
+   "profiled_steps": 60,
+   "render": {
+    "draws_per_camera": 5754.0,
+    "scene_triangles": 1799347.0,
+    "cameras": 1024.0,
+    "visible_draws_per_camera": 317.1435546875,
+    "visible_triangles_per_camera": 99776.5712890625,
+    "max_visible_triangles": 246011.0,
+    "indirect_commands_per_frame": 324755.0
+   },
+   "fidelity": {
+    "pixel_mae": 0.0019128139829263091,
+    "pixels_over_0.1": 0.00628611259162426,
+    "patch_depth_mae_m": 0.0644959316899379,
+    "patch_object_agreement": 0.9962673882643381,
+    "cls_cosine": 0.998152365287145,
+    "patch_cosine": 0.9976008236408234,
+    "patch_cosine_p01": 0.9651398460070292
+   }
+  }
+ ]
+}

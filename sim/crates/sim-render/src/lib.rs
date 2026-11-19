@@ -16,7 +16,7 @@ mod mesh;
 mod renderer;
 
 pub use camera::{Camera, CameraGpu};
-pub use mesh::{BaseColorImage, BaseColorTexture, MeshData, MeshMaterial, MeshVertex, WrapMode};
+pub use mesh::{BaseColorImage, BaseColorTexture, MAX_LODS, MeshData, MeshLod, MeshMaterial, MeshVertex, WrapMode};
 pub use renderer::{RENDER_TIMESTAMPS, RenderBindings, Renderer};
 
 /// Surface parameters in linear RGB; the packed output is sRGB-encoded RGBA8.
@@ -105,6 +105,10 @@ pub struct RenderConfig {
     pub lighting: Lighting,
     /// sRGB-encoded background, matching the packed output color space.
     pub background: [f64; 4],
+    /// Level-of-detail budget: each camera draws a mesh's coarsest level whose geometric error
+    /// projects to at most this many pixels at the mesh's nearest bounding-sphere point.
+    /// Zero always draws the full mesh.
+    pub lod_pixels: f32,
 }
 
 impl Default for RenderConfig {
@@ -114,6 +118,7 @@ impl Default for RenderConfig {
             height: 240,
             lighting: Lighting::default(),
             background: [0.12, 0.18, 0.25, 1.0],
+            lod_pixels: 0.0,
         }
     }
 }

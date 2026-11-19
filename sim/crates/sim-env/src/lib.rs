@@ -30,6 +30,11 @@ use task::*;
 const CAMERA_ASPECT: f32 = 4.0 / 3.0;
 /// Default curriculum lanes: uniform buckets, always a hint (all precise), full appearance randomization.
 const DEFAULT_LANES: [f32; CURRICULUM_LANES] = [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 0.0, 1.0, 0.0, 0.0];
+/// Level-of-detail budget in pixels of geometric error (renderer RenderConfig::lod_pixels).
+/// 1 px keeps 99.9% of patch labels and a mean patch-feature cosine of 0.9995 against exact
+/// rendering (reports/sim-lod-sloppy.json). SIM_LOD_PIXELS overrides it for measurement sweeps;
+/// the value in use is always recorded in the metadata.
+const LOD_PIXELS: f32 = 1.0;
 
 struct TaskKernels {
     reset: Function,
@@ -202,7 +207,11 @@ impl Env {
         let gpu = Gpu::new(0)?;
         let kernels = TaskKernels::load(&gpu)?;
         let device = gpu.device();
-        let render_config = RenderConfig { width, height, ..Default::default() };
+        let lod_pixels = match std::env::var("SIM_LOD_PIXELS") {
+            Ok(value) => value.parse::<f32>().map_err(|error| anyhow::anyhow!("SIM_LOD_PIXELS={value:?}: {error}"))?,
+            Err(_) => LOD_PIXELS,
+        };
+        let render_config = RenderConfig { width, height, lod_pixels, ..Default::default() };
         let state = SharedBuffer::new(gpu.clone(), u64::from(n) * size_of::<BodyState>() as u64,
             wgpu::BufferUsages::STORAGE, "city drone bodies")?;
         let cameras = SharedBuffer::new(gpu.clone(), u64::from(n) * CAMERA_FLOATS as u64 * 4,
@@ -305,7 +314,7 @@ impl Env {
             projection_z: projection[10],
             projection_w: projection[14],
         };
-        let metadata = task_metadata(&city, &catalog, &district, &city_path, style, control_mode)?;
+        let metadata = task_metadata(&city, &catalog, &district, &city_path, style, control_mode, lod_pixels)?;
         let mut env = Self {
             exchange,
             renderer,
@@ -447,22 +456,26 @@ impl Env {
     /// Scene and culling statistics of the last render (profile::render_stats). Blocks.
     pub fn render_stats(&mut self) -> Result<[f64; RENDER_STATS]> {
         let device = self.gpu.device();
-        let source = self.renderer.indirect();
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("render stats readback"), size: source.size(),
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
-        });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("render stats") });
-        encoder.copy_buffer_to_buffer(source, 0, &readback, 0, source.size());
-        self.gpu.submit([encoder.finish()]);
-        let slice = readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::PollType::wait_indefinitely())?;
-        let bytes = slice.get_mapped_range().map_err(|error| anyhow::anyhow!("mapping draw commands: {error:?}"))?;
-        let stats = profile::render_stats(bytemuck::cast_slice(&bytes[..]), self.renderer.draw_count(), self.config.n);
-        drop(bytes);
-        readback.unmap();
-        Ok(stats)
+        let read = |source: &wgpu::Buffer| -> Result<Vec<u32>> {
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("render stats readback"), size: source.size(),
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("render stats") });
+            encoder.copy_buffer_to_buffer(source, 0, &readback, 0, source.size());
+            self.gpu.submit([encoder.finish()]);
+            let slice = readback.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::PollType::wait_indefinitely())?;
+            let bytes = slice.get_mapped_range().map_err(|error| anyhow::anyhow!("mapping render stats: {error:?}"))?;
+            let words = bytemuck::cast_slice::<u8, u32>(&bytes[..]).to_vec();
+            drop(bytes);
+            readback.unmap();
+            Ok(words)
+        };
+        let commands = read(self.renderer.indirect())?;
+        let counts = read(self.renderer.counts())?;
+        Ok(profile::render_stats(&commands, &counts, self.renderer.draw_count(), self.renderer.scene_triangles()))
     }
 
     /// Renders the goal reference views of catalog entries `first .. first + n` (clamped to the
@@ -599,7 +612,7 @@ impl Drop for Env {
 }
 
 fn task_metadata(city: &CityScene, catalog: &drone::Catalog, district: &drone::District, city_path: &Path,
-    style: u32, control_mode: u32) -> Result<CString> {
+    style: u32, control_mode: u32, lod_pixels: f32) -> Result<CString> {
     let exclusions: Vec<serde_json::Value> = district.exclusions.iter()
         .map(|(lo, hi)| serde_json::json!({"min": lo, "max": hi})).collect();
     const SPLIT_NAMES: [&str; 3] = ["train", "validation", "test"];
@@ -782,6 +795,11 @@ fn task_metadata(city: &CityScene, catalog: &drone::Catalog, district: &drone::D
         fields.push(serde_json::json!({"index": 19, "name": "next_catalog", "dtype": "int32", "shape": ["n"],
             "layout": "writable: catalog index the environment's next episode starts from (bucket from the catalog), consumed (reset to -1) at that reset; -1 samples as usual"}));
     }
+    json["render"] = serde_json::json!({
+        "level_of_detail_px": lod_pixels,
+        "level_of_detail": "quadric levels keeping colour seams, then vertex-clustering levels; each camera \
+            draws a chunk's coarsest level whose geometric error projects to at most level_of_detail_px pixels",
+    });
     json["camera_effects"] = serde_json::json!({
         "scope": "monocular lens and sensor timing, each a per-episode uniform times appearance strength",
         "distortion": format!("radial, source r = r (1 + k r^2), r over the half-diagonal, k <= {LENS_DISTORTION}"),

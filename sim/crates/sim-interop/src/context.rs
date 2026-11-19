@@ -70,9 +70,11 @@ impl Gpu {
             format!("no NVIDIA Vulkan adapter matches CUDA ordinal {cuda_ordinal} UUID {uuid:02x?}; no fallback is permitted")
         })?;
         let limits = adapter.limits();
-        // GPU-generated indexed draws address persistent instance ranges directly.
-        let required = wgpu::Features::INDIRECT_FIRST_INSTANCE;
-        ensure!(adapter.features().contains(required), "matched Vulkan adapter lacks indirect first-instance draws");
+        // GPU-generated indexed draws address persistent instance ranges directly; the cull pass
+        // compacts each camera's visible draws and supplies their count (drawIndirectCount).
+        let required = wgpu::Features::INDIRECT_FIRST_INSTANCE | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT;
+        ensure!(adapter.features().contains(required),
+            "matched Vulkan adapter lacks indirect first-instance or indirect-count draws");
         // Pass timestamps are optional: they only serve the native step profiler.
         let features = required | (adapter.features() & wgpu::Features::TIMESTAMP_QUERY);
         ensure!(

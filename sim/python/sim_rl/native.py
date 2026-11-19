@@ -37,9 +37,10 @@ REQUIRED_METADATA = ("abi_version", "task", "action_dim", "control_hz", "physics
                      "catalog_size", "city_fingerprint", "city_path", "control_mode", "action_names",
                      "action_scales", "target_classes")
 # Which city (and where in it) an environment simulates is not part of the policy contract:
-# multi-city training and held-out-city evaluation depend on that.
+# multi-city training and held-out-city evaluation depend on that. Geometry level of detail
+# ("render") is scene content too: recorded for provenance, not compared.
 SPLIT_SPECIFIC_METADATA = ("city_path", "city", "city_fingerprint", "landable", "style", "split", "district",
-                           "catalog", "catalog_size", "fields")
+                           "catalog", "catalog_size", "fields", "render")
 # Native step profiler (sim_env_profile / sim_env_render_stats), in the native order.
 PROFILE_STAGES = ("steps", "host_enqueue_ms", "wall_ms", "gpu_step_ms", "control_ms", "finish_ms", "observe_ms",
                   "render_handoff_ms", "appearance_ms", "labels_ms", "coverage_ms", "vk_cull_ms",

@@ -10,7 +10,7 @@ use std::{collections::{BTreeMap, HashMap}, path::Path, sync::Arc};
 use anyhow::{Context, Result, ensure};
 use glam::{Mat3, Mat4, Vec3};
 use sha2::{Digest, Sha256};
-use sim_render::{BaseColorImage, BaseColorTexture, Instance, MeshData, MeshMaterial, MeshVertex, WrapMode};
+use sim_render::{BaseColorImage, BaseColorTexture, Instance, MAX_LODS, MeshData, MeshLod, MeshMaterial, MeshVertex, WrapMode};
 use sim_state::collision::{BvhNode, LANDABLE, Triangle};
 
 pub mod drone;
@@ -56,6 +56,16 @@ const CHUNK_METRES: f32 = 16.0;
 const LEAF_TRIANGLES: usize = 8;
 const ASSETS: [(&str, &str); 6] = [("building.glb", "building"), ("vegetation.glb", "vegetation"),
     ("vehicle.glb", "vehicle"), ("road.glb", "road"), ("prop.glb", "prop"), ("ground.glb", "ground")];
+// Levels of detail: target fractions of a chunk's triangles, simplified from the full chunk.
+// Near levels keep topology and colour seams; far levels use vertex clustering (sloppy), which
+// ignores topology and seams but reaches any triangle budget.
+// A level is kept only if it removes at least LOD_MIN_SAVING of the previous level's triangles.
+const LOD_FRACTIONS: [f32; 2] = [0.5, 0.25];
+const LOD_SLOPPY_FRACTIONS: [f32; MAX_LODS - 2] = [0.1, 0.03];
+const LOD_MIN_SAVING: f32 = 0.15;
+const LOD_MIN_TRIANGLES: usize = 32;
+// UV distance at which two copies of one corner count as different palette colours.
+const LOD_UV_SEAM: f32 = 1e-4;
 // Every landable vertex must lie within this band of y = 0.
 const LEVEL_BAND: f32 = 0.25;
 // Landable triangles with |n_y| / |n| at or below this cosine are counted as non-level (curbs, steps).
@@ -117,7 +127,9 @@ impl CityScene {
         for ((_, _, key), chunk) in importer.chunks {
             let next = material_ids.len() as u32;
             mesh_materials.push(*material_ids.entry(key).or_insert(next));
-            meshes.push(chunk.mesh);
+            let mut mesh = chunk.mesh;
+            mesh.lods = levels_of_detail(&mesh)?;
+            meshes.push(mesh);
         }
         let instances = (0..meshes.len()).map(|mesh| {
             let mut instance = Instance::static_mesh(mesh);
@@ -237,7 +249,8 @@ impl Importer {
                     let center = (Vec3::from_array(p[0]) + Vec3::from_array(p[1]) + Vec3::from_array(p[2])) / 3.0;
                     let chunk = self.chunks.entry(((center.x / CHUNK_METRES).floor() as i32,
                         (center.z / CHUNK_METRES).floor() as i32, key.clone())).or_insert_with(|| Chunk {
-                            mesh: MeshData { vertices: Vec::new(), indices: Vec::new(), material: Some(material.clone()) }, vertices: HashMap::new() });
+                            mesh: MeshData { vertices: Vec::new(), indices: Vec::new(), material: Some(material.clone()),
+                                lods: Vec::new() }, vertices: HashMap::new() });
                     for index in face {
                         let next = chunk.mesh.vertices.len() as u32;
                         let remapped = *chunk.vertices.entry(serial + u64::from(index)).or_insert_with(|| {
@@ -251,6 +264,62 @@ impl Importer {
         for child in node.children() { self.node(child, world, buffers, images, class)?; }
         Ok(())
     }
+}
+
+/// Quadric-simplified levels of detail of one chunk (meshoptimizer), over the chunk's own
+/// vertices so render object IDs and materials are unchanged. Open borders (where an object is
+/// split between chunks) stay locked, so neighbouring chunks at different levels do not crack.
+/// Errors are absolute (metres) and nondecreasing.
+fn levels_of_detail(mesh: &MeshData) -> Result<Vec<MeshLod>> {
+    let triangles = mesh.indices.len() / 3;
+    if triangles < LOD_MIN_TRIANGLES {
+        return Ok(Vec::new());
+    }
+    let positions = meshopt::VertexDataAdapter::new(bytemuck::cast_slice(&mesh.vertices),
+        size_of::<MeshVertex>(), 0).map_err(|error| anyhow::anyhow!("simplifier vertex layout: {error}"))?;
+    // Flat-shaded palette assets duplicate every corner per face. Copies that differ only in
+    // normal (flat shading) may collapse (Permissive); copies with different UVs sit on a colour
+    // boundary and are protected, so palette colour regions keep their exact outlines.
+    let mut first_uv: HashMap<[u32; 3], [f32; 2]> = HashMap::new();
+    let mut seams: HashMap<[u32; 3], bool> = HashMap::new();
+    for vertex in &mesh.vertices {
+        let key = vertex.position.map(f32::to_bits);
+        let uv = *first_uv.entry(key).or_insert(vertex.uv);
+        let seam = seams.entry(key).or_insert(false);
+        *seam |= (uv[0] - vertex.uv[0]).abs() > LOD_UV_SEAM || (uv[1] - vertex.uv[1]).abs() > LOD_UV_SEAM;
+    }
+    let locks: Vec<meshopt::SimplifyVertex> = mesh.vertices.iter().map(|vertex| {
+        if seams[&vertex.position.map(f32::to_bits)] { meshopt::SimplifyVertex::Protect }
+        else { meshopt::SimplifyVertex::None }
+    }).collect();
+    let mut lods: Vec<MeshLod> = Vec::new();
+    let mut previous = mesh.indices.len();
+    let mut keep = |indices: Vec<u32>, error: f32, lods: &mut Vec<MeshLod>| {
+        if indices.is_empty() || indices.len() as f32 > previous as f32 * (1.0 - LOD_MIN_SAVING) {
+            return;
+        }
+        previous = indices.len();
+        let floor = lods.last().map_or(0.0, |lod: &MeshLod| lod.error);
+        lods.push(MeshLod { indices, error: error.max(floor) });
+    };
+    for fraction in LOD_FRACTIONS {
+        let target = ((triangles as f32 * fraction) as usize).max(1) * 3;
+        let mut error = 0.0f32;
+        // Positions only: the reported error is the geometric deviation in metres.
+        let indices = meshopt::simplify_with_locks(&mesh.indices, &positions, &locks, target, f32::MAX,
+            meshopt::SimplifyOptions::LockBorder | meshopt::SimplifyOptions::ErrorAbsolute
+                | meshopt::SimplifyOptions::Permissive, Some(&mut error));
+        keep(indices, error, &mut lods);
+    }
+    // Sloppy error is relative to the mesh extent; the scale converts it to metres.
+    let scale = meshopt::simplify_scale(&positions);
+    for fraction in LOD_SLOPPY_FRACTIONS {
+        let target = ((triangles as f32 * fraction) as usize).max(1) * 3;
+        let mut error = 0.0f32;
+        let indices = meshopt::simplify_sloppy(&mesh.indices, &positions, target, 1.0, Some(&mut error));
+        keep(indices, error * scale, &mut lods);
+    }
+    Ok(lods)
 }
 
 fn wrap(mode: gltf::texture::WrappingMode) -> WrapMode {
@@ -411,6 +480,29 @@ mod tests {
         let b = mesh.vertices[face[1] as usize].position;
         let c = mesh.vertices[face[2] as usize].position;
         [a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]].map(f32::to_bits)
+    }
+
+    #[test]
+    #[ignore = "requires generated assets/city; prints level-of-detail statistics"]
+    fn real_city_level_of_detail_statistics() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../assets/city");
+        let scene = CityScene::load(&path).unwrap();
+        let full: usize = scene.meshes.iter().map(|m| m.indices.len() / 3).sum();
+        let with_lods = scene.meshes.iter().filter(|m| !m.lods.is_empty()).count();
+        println!("chunks {} with levels {with_lods}, triangles {full}", scene.meshes.len());
+        for level in 0..MAX_LODS {
+            let (mut triangles, mut errors) = (0usize, Vec::new());
+            for mesh in &scene.meshes {
+                // A chunk without this level keeps drawing its coarsest available level.
+                let lod = mesh.lods.get(level).or(mesh.lods.last());
+                triangles += lod.map_or(mesh.indices.len(), |lod| lod.indices.len()) / 3;
+                if let Some(lod) = mesh.lods.get(level) { errors.push(lod.error); }
+            }
+            errors.sort_by(f32::total_cmp);
+            let q = |p: f32| errors.get(((errors.len() as f32 - 1.0) * p) as usize).copied().unwrap_or(f32::NAN);
+            println!("level {}: chunks {} triangles if all chunks use it {} ({:.1}%), error m p10 {:.3} p50 {:.3} p90 {:.3}",
+                level + 1, errors.len(), triangles, 100.0 * triangles as f32 / full as f32, q(0.1), q(0.5), q(0.9));
+        }
     }
 
     #[test]

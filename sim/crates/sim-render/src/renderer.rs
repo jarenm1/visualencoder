@@ -5,7 +5,7 @@ use anyhow::{Result, ensure};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::{BaseColorImage, Camera, CameraGpu, Instance, MeshData, MeshVertex, OutputLayout, RenderConfig, WrapMode};
+use crate::{BaseColorImage, Camera, CameraGpu, Instance, MAX_LODS, MeshData, MeshVertex, OutputLayout, RenderConfig, WrapMode};
 
 /// Timestamps written by `Renderer::render_timed`: cull begin/end, camera pass begin/end,
 /// pack begin/end.
@@ -58,6 +58,19 @@ struct DrawInfo {
     bounds_max: [f32; 4],
     // index_count, first_index, base_vertex (bitcast i32), instance_index
     command: [u32; 4],
+    // Levels of detail 1..=MAX_LODS: first index, index count (0 = absent), error in mesh units.
+    lod_first: [u32; MAX_LODS],
+    lod_count: [u32; MAX_LODS],
+    lod_error: [f32; MAX_LODS],
+}
+
+/// Cull pass parameters; mirrored by cull.wgsl's `Params`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CullParams {
+    tile_height: f32,
+    lod_pixels: f32,
+    _pad: [f32; 2],
 }
 
 #[repr(C)]
@@ -145,6 +158,9 @@ pub struct Renderer {
     body_binding_bytes: u64,
     tiles: Atlas,
     atlas_grid: wgpu::Buffer,
+    cull_params: wgpu::Buffer,
+    counts: wgpu::Buffer,
+    scene_triangles: u64,
     color: Target,
     optical_depth: Target,
     object_id: Target,
@@ -163,9 +179,11 @@ impl Renderer {
         cameras: &[Camera],
     ) -> Result<Self> {
         let limits = device.limits();
-        ensure!(device.features().contains(wgpu::Features::INDIRECT_FIRST_INSTANCE),
-            "renderer requires INDIRECT_FIRST_INSTANCE");
+        ensure!(device.features().contains(wgpu::Features::INDIRECT_FIRST_INSTANCE | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT),
+            "renderer requires INDIRECT_FIRST_INSTANCE and MULTI_DRAW_INDIRECT_COUNT");
         ensure!(config.width > 0 && config.height > 0, "render dimensions must be nonzero");
+        ensure!(config.lod_pixels.is_finite() && config.lod_pixels >= 0.0,
+            "level-of-detail budget must be finite and nonnegative");
         ensure!(config.width <= limits.max_texture_dimension_2d && config.height <= limits.max_texture_dimension_2d,
             "render dimensions exceed device texture limits");
         let camera_count = u32::try_from(cameras.len())?;
@@ -236,6 +254,21 @@ impl Renderer {
             let index_count = u32::try_from(mesh.indices.len())?;
             vertices.extend_from_slice(&mesh.vertices);
             indices.extend_from_slice(&mesh.indices);
+            ensure!(mesh.lods.len() <= MAX_LODS, "mesh {mesh_index} has more than {MAX_LODS} levels of detail");
+            let (mut lod_first, mut lod_count, mut lod_error) = ([0u32; MAX_LODS], [0u32; MAX_LODS], [0f32; MAX_LODS]);
+            let mut previous_error = 0.0f32;
+            for (level, lod) in mesh.lods.iter().enumerate() {
+                ensure!(!lod.indices.is_empty() && lod.indices.len() % 3 == 0
+                    && lod.indices.iter().all(|&index| (index as usize) < mesh.vertices.len()),
+                    "mesh {mesh_index} level of detail {level} has invalid indices");
+                ensure!(lod.error.is_finite() && lod.error >= previous_error,
+                    "mesh {mesh_index} levels of detail must have nondecreasing finite error");
+                previous_error = lod.error;
+                lod_first[level] = u32::try_from(indices.len())?;
+                lod_count[level] = u32::try_from(lod.indices.len())?;
+                lod_error[level] = lod.error;
+                indices.extend_from_slice(&lod.indices);
+            }
             let texture_index = if let Some(texture) = mesh.material.as_ref().and_then(|m| m.base_color_texture.as_ref()) {
                 let image = &texture.image;
                 ensure!(image.width > 0 && image.height > 0
@@ -269,11 +302,12 @@ impl Renderer {
                 grouped_instances.push(gpu);
                 draws.push(DrawInfo { bounds_min: [min.x, min.y, min.z, 0.0],
                     bounds_max: [max.x, max.y, max.z, 0.0],
-                    command: [index_count, first_index, base_vertex as u32, instance_index] });
+                    command: [index_count, first_index, base_vertex as u32, instance_index],
+                    lod_first, lod_count, lod_error });
             }
         }
         let draw_count = u32::try_from(draws.len())?;
-        ensure!(draw_count.div_ceil(64) <= limits.max_compute_workgroups_per_dimension, "too many culling workgroups");
+        let scene_triangles: u64 = draws.iter().map(|draw| u64::from(draw.command[0] / 3)).sum();
         let indirect_bytes = u64::from(draw_count) * u64::from(camera_count) * 20;
         for (label, bytes) in [("draws", draws.len() as u64 * size_of::<DrawInfo>() as u64),
             ("indirect", indirect_bytes),
@@ -287,6 +321,11 @@ impl Renderer {
         let indirect = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("persistent culled draw commands"), size: indirect_bytes,
             // COPY_SRC: the profiler reads the culled commands back on request.
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let counts = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("culled draw counts per camera"), size: u64::from(camera_count) * 4,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -423,6 +462,9 @@ impl Renderer {
             texture_pixels, texture_info, instances, cameras, globals, body_binding_bytes,
             tiles,
             atlas_grid: upload(device, "camera atlas grid", &[tiles], wgpu::BufferUsages::UNIFORM),
+            cull_params: upload(device, "cull parameters", &[CullParams { tile_height: config.height as f32,
+                lod_pixels: config.lod_pixels, _pad: [0.0; 2] }], wgpu::BufferUsages::UNIFORM),
+            counts, scene_triangles,
             color: Target::new(device, tiles, wgpu::TextureFormat::Rgba8Unorm),
             optical_depth: Target::new(device, tiles, wgpu::TextureFormat::R32Float),
             object_id: Target::new(device, tiles, wgpu::TextureFormat::R32Uint),
@@ -432,12 +474,19 @@ impl Renderer {
 
     pub fn output_layout(&self) -> OutputLayout { self.output }
 
-    /// Number of chunk draws per camera (each camera has its own indirect command per draw).
+    /// Number of chunk draws per camera before culling.
     pub fn draw_count(&self) -> u32 { self.draw_count }
 
-    /// Culled indexed-indirect commands of the last render: `cameras x draw_count` records of five
-    /// u32 (index count, instance count 0/1, first index, base vertex, first instance).
+    /// Full-detail triangles of the whole scene.
+    pub fn scene_triangles(&self) -> u64 { self.scene_triangles }
+
+    /// Culled indexed-indirect commands of the last render: camera c's visible commands are the
+    /// first `counts[c]` of its `draw_count` records (five u32 each: index count, instance count,
+    /// first index, base vertex, first instance), in draw order.
     pub fn indirect(&self) -> &wgpu::Buffer { &self.indirect }
+
+    /// Visible command count per camera (u32) of the last render.
+    pub fn counts(&self) -> &wgpu::Buffer { &self.counts }
 
     /// Bind persistent resources once. Buffers must belong to this device and
     /// have STORAGE usage. `states` uses the documented BodyState64 ABI (at least
@@ -496,6 +545,8 @@ impl Renderer {
                 buffer_entry(2, cameras, camera_bytes),
                 wgpu::BindGroupEntry { binding: 3, resource: self.draws.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: self.indirect.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: self.cull_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: self.counts.as_entire_binding() },
             ],
         });
         Ok(RenderBindings { cameras: camera_bindings, pack, cull })
@@ -521,7 +572,8 @@ impl Renderer {
             });
             pass.set_pipeline(&self.cull_pipeline);
             pass.set_bind_group(0, &bindings.cull, &[]);
-            pass.dispatch_workgroups(self.draw_count.div_ceil(64), self.output.cameras, 1);
+            // One workgroup per camera: cull, prefix-sum and compact its visible commands.
+            pass.dispatch_workgroups(1, self.output.cameras, 1);
         }
         let background = self.config.background;
         let attachments = [
@@ -555,8 +607,9 @@ impl Renderer {
                 pass.set_bind_group(0, camera, &[]);
                 pass.set_viewport(x as f32, y as f32, width as f32, height as f32, 0.0, 1.0);
                 pass.set_scissor_rect(x, y, width, height);
-                pass.multi_draw_indexed_indirect(&self.indirect,
-                    camera_index as u64 * u64::from(self.draw_count) * 20, self.draw_count);
+                pass.multi_draw_indexed_indirect_count(&self.indirect,
+                    camera_index as u64 * u64::from(self.draw_count) * 20, &self.counts, camera_index as u64 * 4,
+                    self.draw_count);
             }
         }
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

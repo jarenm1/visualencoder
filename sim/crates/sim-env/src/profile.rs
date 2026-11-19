@@ -143,30 +143,24 @@ impl Profiler {
     }
 }
 
-/// Scene and culling statistics of the last render, from the culled indirect commands:
+/// Scene and culling statistics of the last render, from the compacted indirect commands:
 /// `[draws per camera, scene triangles, cameras, mean visible draws per camera,
 ///   mean visible triangles per camera, max visible triangles in one camera,
 ///   indirect commands issued per frame]`.
 pub const RENDER_STATS: usize = 7;
 
-pub fn render_stats(commands: &[u32], draw_count: u32, cameras: u32) -> [f64; RENDER_STATS] {
+pub fn render_stats(commands: &[u32], counts: &[u32], draw_count: u32, scene_triangles: u64)
+    -> [f64; RENDER_STATS] {
     let draws = draw_count as usize;
-    let mut scene_triangles = 0u64;
     let (mut visible_draws, mut visible_triangles, mut max_triangles) = (0u64, 0u64, 0u64);
-    for camera in 0..cameras as usize {
-        let mut triangles = 0u64;
-        for draw in 0..draws {
-            let record = &commands[(camera * draws + draw) * 5..][..5];
-            if camera == 0 { scene_triangles += u64::from(record[0] / 3); }
-            if record[1] != 0 {
-                visible_draws += 1;
-                triangles += u64::from(record[0] / 3);
-            }
-        }
+    for (camera, &count) in counts.iter().enumerate() {
+        let triangles: u64 = (0..count as usize)
+            .map(|slot| u64::from(commands[(camera * draws + slot) * 5] / 3)).sum();
+        visible_draws += u64::from(count);
         visible_triangles += triangles;
         max_triangles = max_triangles.max(triangles);
     }
-    let per_camera = f64::from(cameras.max(1));
-    [f64::from(draw_count), scene_triangles as f64, f64::from(cameras), visible_draws as f64 / per_camera,
-        visible_triangles as f64 / per_camera, max_triangles as f64, f64::from(draw_count) * f64::from(cameras)]
+    let cameras = counts.len().max(1) as f64;
+    [f64::from(draw_count), scene_triangles as f64, counts.len() as f64, visible_draws as f64 / cameras,
+        visible_triangles as f64 / cameras, max_triangles as f64, visible_draws as f64]
 }
