@@ -43,6 +43,10 @@ impl Gpu {
         let uuid = unsafe { cuda_uuid.assume_init() }.bytes.map(|byte| byte as u8);
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = wgpu::Backends::VULKAN;
+        // Indirect commands come only from the renderer's cull pass, which copies CPU-validated
+        // index ranges and writes instance counts of 0 or 1; wgpu's per-call indirect validation
+        // (a validation dispatch plus host bookkeeping for every indirect draw) is redundant.
+        descriptor.flags = wgpu::InstanceFlags::from_build_config() - wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL;
         let instance = wgpu::Instance::new(descriptor);
         let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
         let mut matched = None;

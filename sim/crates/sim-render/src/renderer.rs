@@ -7,8 +7,8 @@ use wgpu::util::DeviceExt;
 
 use crate::{BaseColorImage, Camera, CameraGpu, Instance, MeshData, MeshVertex, OutputLayout, RenderConfig, WrapMode};
 
-/// Timestamps written by `Renderer::render_timed`: cull begin/end, first camera pass begin,
-/// last camera pass end, pack begin/end.
+/// Timestamps written by `Renderer::render_timed`: cull begin/end, camera pass begin/end,
+/// pack begin/end.
 pub const RENDER_TIMESTAMPS: u32 = 6;
 
 /// GPU instance ABI, shared with cull.wgsl and render.wgsl. `metadata`: body index
@@ -67,20 +67,17 @@ struct TextureInfo {
     data: [u32; 4],
 }
 
+/// One 2D attachment holding every camera's image: camera `c` renders into the tile at column
+/// `c % columns`, row `c / columns`, so all cameras share a single render pass.
 struct Target {
-    array: wgpu::TextureView,
-    layers: Vec<wgpu::TextureView>,
+    view: wgpu::TextureView,
 }
 
 impl Target {
-    fn new(device: &wgpu::Device, layout: OutputLayout, format: wgpu::TextureFormat) -> Self {
+    fn new(device: &wgpu::Device, atlas: Atlas, format: wgpu::TextureFormat) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("sim-render batch target"),
-            size: wgpu::Extent3d {
-                width: layout.width,
-                height: layout.height,
-                depth_or_array_layers: layout.cameras,
-            },
+            label: Some("sim-render camera atlas"),
+            size: wgpu::Extent3d { width: atlas.width(), height: atlas.height(), depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -88,19 +85,31 @@ impl Target {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let array = texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            ..Default::default()
-        });
-        let layers = (0..layout.cameras).map(|layer| {
-            texture.create_view(&wgpu::TextureViewDescriptor {
-                dimension: Some(wgpu::TextureViewDimension::D2),
-                base_array_layer: layer,
-                array_layer_count: Some(1),
-                ..Default::default()
-            })
-        }).collect();
-        Self { array, layers }
+        Self { view: texture.create_view(&wgpu::TextureViewDescriptor::default()) }
+    }
+}
+
+/// Camera tiling of the attachments; mirrored by pack.wgsl's `Grid`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Atlas {
+    tile_width: u32,
+    tile_height: u32,
+    columns: u32,
+    cameras: u32,
+}
+
+impl Atlas {
+    fn new(tile_width: u32, tile_height: u32, cameras: u32, max_dimension: u32) -> Result<Self> {
+        let columns = (max_dimension / tile_width).min(cameras);
+        ensure!(columns > 0 && cameras.div_ceil(columns) * tile_height <= max_dimension,
+            "{cameras} cameras of {tile_width}x{tile_height} do not fit a {max_dimension}px atlas");
+        Ok(Self { tile_width, tile_height, columns, cameras })
+    }
+    fn width(&self) -> u32 { self.columns * self.tile_width }
+    fn height(&self) -> u32 { self.cameras.div_ceil(self.columns) * self.tile_height }
+    fn origin(&self, camera: u32) -> (u32, u32) {
+        ((camera % self.columns) * self.tile_width, (camera / self.columns) * self.tile_height)
     }
 }
 
@@ -134,6 +143,8 @@ pub struct Renderer {
     cameras: wgpu::Buffer,
     globals: Vec<wgpu::Buffer>,
     body_binding_bytes: u64,
+    tiles: Atlas,
+    atlas_grid: wgpu::Buffer,
     color: Target,
     optical_depth: Target,
     object_id: Target,
@@ -158,8 +169,8 @@ impl Renderer {
         ensure!(config.width <= limits.max_texture_dimension_2d && config.height <= limits.max_texture_dimension_2d,
             "render dimensions exceed device texture limits");
         let camera_count = u32::try_from(cameras.len())?;
-        ensure!(camera_count > 0 && camera_count <= limits.max_texture_array_layers,
-            "camera count must fit device texture array limits");
+        ensure!(camera_count > 0, "renderer needs at least one camera");
+        let tiles = Atlas::new(config.width, config.height, camera_count, limits.max_texture_dimension_2d)?;
         ensure!(config.width.div_ceil(8) <= limits.max_compute_workgroups_per_dimension
             && config.height.div_ceil(8) <= limits.max_compute_workgroups_per_dimension
             && camera_count <= limits.max_compute_workgroups_per_dimension,
@@ -369,6 +380,15 @@ impl Renderer {
                 texture_entry(1, wgpu::TextureSampleType::Float { filterable: false }),
                 texture_entry(2, wgpu::TextureSampleType::Uint),
                 wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(size_of::<Atlas>() as u64),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -401,10 +421,12 @@ impl Renderer {
             config, output, render_pipeline, render_layout, pack_pipeline, pack_layout,
             vertices, indices, draws, draw_count, indirect, cull_pipeline, cull_layout,
             texture_pixels, texture_info, instances, cameras, globals, body_binding_bytes,
-            color: Target::new(device, output, wgpu::TextureFormat::Rgba8Unorm),
-            optical_depth: Target::new(device, output, wgpu::TextureFormat::R32Float),
-            object_id: Target::new(device, output, wgpu::TextureFormat::R32Uint),
-            raster_depth: Target::new(device, output, wgpu::TextureFormat::Depth32Float),
+            tiles,
+            atlas_grid: upload(device, "camera atlas grid", &[tiles], wgpu::BufferUsages::UNIFORM),
+            color: Target::new(device, tiles, wgpu::TextureFormat::Rgba8Unorm),
+            optical_depth: Target::new(device, tiles, wgpu::TextureFormat::R32Float),
+            object_id: Target::new(device, tiles, wgpu::TextureFormat::R32Uint),
+            raster_depth: Target::new(device, tiles, wgpu::TextureFormat::Depth32Float),
         })
     }
 
@@ -459,10 +481,11 @@ impl Renderer {
             label: Some("sim-render output bindings"),
             layout: &self.pack_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.color.array) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.optical_depth.array) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.object_id.array) },
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.color.view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.optical_depth.view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.object_id.view) },
                 buffer_entry(3, output, self.output.total_bytes),
+                wgpu::BindGroupEntry { binding: 4, resource: self.atlas_grid.as_entire_binding() },
             ],
         });
         let cull = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -486,8 +509,7 @@ impl Renderer {
     }
 
     /// `render` with pass timestamps written into `timestamps` (TIMESTAMP_QUERY, at least
-    /// RENDER_TIMESTAMPS entries): cull begin/end, first camera pass begin, last camera pass end,
-    /// pack begin/end.
+    /// RENDER_TIMESTAMPS entries): cull begin/end, camera pass begin/end, pack begin/end.
     pub fn render_timed(&self, encoder: &mut wgpu::CommandEncoder, bindings: &RenderBindings,
         timestamps: Option<&wgpu::QuerySet>) {
         let compute_writes = |begin, end| timestamps.map(|query_set| wgpu::ComputePassTimestampWrites {
@@ -501,38 +523,41 @@ impl Renderer {
             pass.set_bind_group(0, &bindings.cull, &[]);
             pass.dispatch_workgroups(self.draw_count.div_ceil(64), self.output.cameras, 1);
         }
-        let last = bindings.cameras.len() - 1;
         let background = self.config.background;
-        for (camera_index, camera) in bindings.cameras.iter().enumerate() {
-            let attachments = [
-                Some(color_attachment(&self.color.layers[camera_index], wgpu::Color {
-                    r: background[0], g: background[1], b: background[2], a: background[3],
-                })),
-                Some(color_attachment(&self.optical_depth.layers[camera_index], wgpu::Color::TRANSPARENT)),
-                Some(color_attachment(&self.object_id.layers[camera_index], wgpu::Color::TRANSPARENT)),
-            ];
+        let attachments = [
+            Some(color_attachment(&self.color.view, wgpu::Color {
+                r: background[0], g: background[1], b: background[2], a: background[3],
+            })),
+            Some(color_attachment(&self.optical_depth.view, wgpu::Color::TRANSPARENT)),
+            Some(color_attachment(&self.object_id.view, wgpu::Color::TRANSPARENT)),
+        ];
+        {
+            // Every camera draws into its own atlas tile (viewport + scissor) of one render pass.
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("sim-render camera"),
+                label: Some("sim-render cameras"),
                 color_attachments: &attachments,
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.raster_depth.layers[camera_index],
+                    view: &self.raster_depth.view,
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: timestamps.filter(|_| camera_index == 0 || camera_index == last)
-                    .map(|query_set| wgpu::RenderPassTimestampWrites {
-                        query_set,
-                        beginning_of_pass_write_index: (camera_index == 0).then_some(2),
-                        end_of_pass_write_index: (camera_index == last).then_some(3),
-                    }),
+                timestamp_writes: timestamps.map(|query_set| wgpu::RenderPassTimestampWrites {
+                    query_set, beginning_of_pass_write_index: Some(2), end_of_pass_write_index: Some(3),
+                }),
                 ..Default::default()
             });
             pass.set_pipeline(&self.render_pipeline);
-            pass.set_bind_group(0, camera, &[]);
             pass.set_vertex_buffer(0, self.vertices.slice(..));
             pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.multi_draw_indexed_indirect(&self.indirect,
-                camera_index as u64 * u64::from(self.draw_count) * 20, self.draw_count);
+            let (width, height) = (self.tiles.tile_width, self.tiles.tile_height);
+            for (camera_index, camera) in bindings.cameras.iter().enumerate() {
+                let (x, y) = self.tiles.origin(camera_index as u32);
+                pass.set_bind_group(0, camera, &[]);
+                pass.set_viewport(x as f32, y as f32, width as f32, height as f32, 0.0, 1.0);
+                pass.set_scissor_rect(x, y, width, height);
+                pass.multi_draw_indexed_indirect(&self.indirect,
+                    camera_index as u64 * u64::from(self.draw_count) * 20, self.draw_count);
+            }
         }
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("sim-render contiguous output"),
@@ -562,7 +587,7 @@ fn buffer_entry(binding: u32, buffer: &wgpu::Buffer, bytes: u64) -> wgpu::BindGr
 fn texture_entry(binding: u32, sample_type: wgpu::TextureSampleType) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding, visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Texture { sample_type, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false },
+        ty: wgpu::BindingType::Texture { sample_type, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
         count: None,
     }
 }

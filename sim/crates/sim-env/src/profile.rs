@@ -34,7 +34,7 @@ pub const STAGES: [&str; 17] = [
     "labels_ms",             // E5 -> E6: per-patch depth / object labels
     "coverage_ms",           // E6 -> E7: observed surface tiles (search reward)
     "vk_cull_ms",            // cull compute pass
-    "vk_camera_passes_ms",   // first camera pass begin -> last camera pass end
+    "vk_camera_passes_ms",   // the camera render pass (all cameras, one atlas)
     "vk_pack_ms",            // texture-to-buffer pack
     "vk_total_ms",           // cull begin -> pack end
     "vk_gaps_ms",            // vk_total minus the three passes (pass transitions, barriers)
