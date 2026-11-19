@@ -499,7 +499,7 @@ def eval_hard_command(args, started):
         start = tuple(metadata.get("start_distance") or ())
     else:
         saved, metadata = None, {"control_mode": "velocity"}
-        features = FrozenFeatures("state", torch.device("cuda:0"))
+        features = FrozenFeatures("state", torch.device("cuda:0"), "fp16")
         start = tuple(labels["start_distance"])
         env = CudaEnv(args.library, args.eval_envs, TEST_SEED, args.width, args.height, TEST_STYLE, "velocity",
                       args.city, start_distance=start)
