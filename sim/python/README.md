@@ -301,6 +301,22 @@ Fixed samples of 256 verified-solvable test episodes per cohort (`--verifier run
 | look-alike | a same-class object within 15 m | none |
 | category | all, buckets in thirds; goal starts as another same-type object's reference | none |
 
+**`drone13` (v5 base, `runs/drone13-v5-seed0`):** fresh seed 0, memory, depth view, explore 30%, look-alike masking, hints (50% none; of hinted: 30% coarse, 10% wrong). 64 envs (the GPU was shared), 16384-entry validation catalogue. `best.pt` = 3M steps; the run was killed at 7M with three validations stale. Test (precise hint / none): 9.0% / 7.8%. Hard set:
+
+| Cohort | Success | Collision | Out of bounds | Timeout |
+|---|---|---|---|---|
+| standard, no hint | 10.9% | 31% | 15% | 43% |
+| standard, precise hint | 6.3% | 38% | 12% | 44% |
+| coarse hint | 9.0% | 36% | 16% | 39% |
+| wrong hint | 8.2% | 36% | 13% | 43% |
+| hidden | 2.0% | 27% | 22% | 49% |
+| far (≥ 40 m) | 0.4% | 27% | 30% | 42% |
+| hidden + far | 0% | 27% | 18% | 54% |
+| look-alike within 15 m | 3.1% | 34% | 20% | 44% |
+| category reference | 8.2% | 34% | 15% | 43% |
+
+Hint quality makes no measurable difference: on the test, precise 9.0% vs none 7.8%; on the hard set, 6.3% vs 10.9%. At 256 episodes the 95% interval is about ±3.5 points. The policy does not use the hint, matching v4, where GPS and no-GPS were also within a point. Search does not emerge either: hidden 2%, far 0.4%.
+
 ### Category goals (`--category-goal-fraction`, `sim_rl/category.py`, `references.py`)
 
 The commander can name an object the drone has never seen. Success is still only the actual instance.
