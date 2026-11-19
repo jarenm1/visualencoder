@@ -76,7 +76,7 @@ def cohort_entries(labels, layout, count, seed):
     return chosen, {kind: int(mask.sum()) for kind, mask in filters.items()}
 
 
-def evaluate_hard(env, features, policy, labels, seed, goal_refresh_steps=0):
+def evaluate_hard(env, features, policy, labels, seed, goal_refresh_steps=0, heuristic=None):
     layout = json.loads((env.city_path / "layout.json").read_text())["objects"]
     chosen, sizes = cohort_entries(labels, layout, env.n, seed)
     references = CategoryReferences(labels["meta"][:, 0].numpy().astype(np.int64), layout, env.device)
@@ -85,6 +85,6 @@ def evaluate_hard(env, features, policy, labels, seed, goal_refresh_steps=0):
         entries = torch.as_tensor(chosen[name], device=env.device)
         hints = dict(hints)
         category = references if hints.pop("category", False) else None
-        results[name] = evaluate(env, features, policy=policy, seed=seed, goal_refresh_steps=goal_refresh_steps,
-                                 entries=entries, category=category, **hints)
+        results[name] = evaluate(env, features, policy=policy, heuristic=heuristic, seed=seed,
+                                 goal_refresh_steps=goal_refresh_steps, entries=entries, category=category, **hints)
     return results
