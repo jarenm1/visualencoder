@@ -485,28 +485,43 @@ def eval_command(args, started):
 
 
 def eval_hard_command(args, started):
-    """Held-out hard set (hardset.py) on verified-solvable test episodes."""
+    """Held-out hard set (hardset.py) on verified-solvable test episodes, for a checkpoint or a blind
+    heuristic (``gps``: fly straight at the hint, no vision)."""
     from .hardset import evaluate_hard  # noqa: PLC0415
-    saved = load_checkpoint(args.checkpoint)
-    metadata = saved["metadata"]
-    features = checkpoint_features(metadata, torch.device("cuda:0"))
+    if (args.checkpoint is None) == (args.heuristic is None):
+        raise SystemExit("eval-hard needs exactly one of --checkpoint and --heuristic")
     labels = torch.load(args.verifier, map_location="cpu", weights_only=False)
-    with open_env_checkpoint(args, metadata, TEST_SEED, TEST_STYLE) as env, env.execution():
+    if args.checkpoint is not None:
+        saved = load_checkpoint(args.checkpoint)
+        metadata = saved["metadata"]
+        features = checkpoint_features(metadata, torch.device("cuda:0"))
+        env = open_env_checkpoint(args, metadata, TEST_SEED, TEST_STYLE)
+        start = tuple(metadata.get("start_distance") or ())
+    else:
+        saved, metadata = None, {"control_mode": "velocity"}
+        features = FrozenFeatures("state", torch.device("cuda:0"))
+        start = tuple(labels["start_distance"])
+        env = CudaEnv(args.library, args.eval_envs, TEST_SEED, args.width, args.height, TEST_STYLE, "velocity",
+                      args.city, start_distance=start)
+    with env, env.execution():
         expected = {"city_fingerprint": env.metadata["city_fingerprint"], "seed": TEST_SEED, "style": TEST_STYLE,
                     "catalog_size": env.catalog_size}
-        if {key: labels[key] for key in expected} != expected or tuple(labels["start_distance"]) != \
-                tuple(metadata.get("start_distance") or ()):
+        if {key: labels[key] for key in expected} != expected or tuple(labels["start_distance"]) != start:
             raise SystemExit(f"{args.verifier} labels another test catalogue than this checkpoint's")
-        validate_checkpoint(saved, env, features)
-        policy = build_policy(env, features, saved)
-        policy.eval()
+        policy = None
+        if saved is not None:
+            validate_checkpoint(saved, env, features)
+            policy = build_policy(env, features, saved)
+            policy.eval()
         refresh = metadata.get("goal_refresh_steps", 0) if args.goal_refresh_steps is None else args.goal_refresh_steps
-        results = evaluate_hard(env, features, policy, labels, TEST_SEED, refresh)
+        results = evaluate_hard(env, features, policy, labels, TEST_SEED, refresh, args.heuristic)
     summary = {name: {key: result[key] for key in ("success", "collision", "out_of_bounds", "timeout")}
                for name, result in results.items() if name != "cohort_sizes"}
     print(json.dumps(summary), flush=True)
-    emit({"checkpoint": str(args.checkpoint), "checkpoint_sha256": sha256(args.checkpoint), "goal_refresh_steps": refresh,
-          "seconds": round(time.monotonic() - started, 1), "summary": summary, **results}, args.out)
+    source = ({"checkpoint": str(args.checkpoint), "checkpoint_sha256": sha256(args.checkpoint)}
+              if args.checkpoint is not None else {"heuristic": args.heuristic})
+    emit({**source, "goal_refresh_steps": refresh, "seconds": round(time.monotonic() - started, 1),
+          "summary": summary, **results}, args.out)
 
 
 def cohorts_command(args, started):
@@ -784,7 +799,9 @@ def parser():
 
     hard = commands.add_parser("eval-hard", help="held-out hard set on verified-solvable test episodes")
     add_native(hard)
-    hard.add_argument("--checkpoint", type=Path, required=True)
+    hard.add_argument("--checkpoint", type=Path)
+    hard.add_argument("--heuristic", choices=("gps", "hover", "random"),
+                      help="a blind baseline instead of a checkpoint (gps flies straight at the hint)")
     hard.add_argument("--verifier", type=Path, required=True, help="train.py verify --split test output")
     hard.add_argument("--eval-envs", type=int, default=256, help="episodes per cohort")
     hard.add_argument("--goal-refresh-steps", type=int, help="default: the checkpoint's")
