@@ -107,17 +107,24 @@ def main():
     mine, rest = own.parse_known_args()
     args = parser().parse_args(["train", *rest, "--out", "/tmp/train-profile-unused"])
     rows = []
+    mine.out.parent.mkdir(parents=True, exist_ok=True)
     for n in mine.envs:
         torch.cuda.reset_peak_memory_stats()
-        row = profile(args, n, mine.iterations)
+        try:
+            row = profile(args, n, mine.iterations)
+        except torch.OutOfMemoryError:
+            rows.append({"envs": n, "out_of_memory": True})
+            print(f"n={n}: out of memory", flush=True)
+            break
         rows.append(row)
         stages = ", ".join(f"{name} {value:.0f}" for name, value in
                            sorted(row["stage_ms_per_iteration"].items(), key=lambda item: -item[1]))
         print(f"n={n}: {row['plain_steps_per_second']:.0f} steps/s ({row['plain_iteration_ms']:.0f} ms per "
               f"{row['steps_per_iteration']} steps, {row['optimizer_steps_per_iteration']} optimizer steps, peak "
               f"{row['peak_memory_gib']:.1f} GiB) | ms: {stages}", flush=True)
+        mine.out.write_text(json.dumps({"device": torch.cuda.get_device_name(0), "flags": rest, "rows": rows},
+                                       indent=1))
         torch.cuda.empty_cache()
-    mine.out.parent.mkdir(parents=True, exist_ok=True)
     mine.out.write_text(json.dumps({"device": torch.cuda.get_device_name(0), "flags": rest, "rows": rows}, indent=1))
 
 
