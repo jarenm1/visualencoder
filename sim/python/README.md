@@ -317,6 +317,29 @@ Fixed samples of 256 verified-solvable test episodes per cohort (`--verifier run
 
 Hint quality makes no measurable difference: on the test, precise 9.0% vs none 7.8%; on the hard set, 6.3% vs 10.9%. At 256 episodes the 95% interval is about ±3.5 points. The policy does not use the hint, matching v4, where GPS and no-GPS were also within a point. Search does not emerge either: hidden 2%, far 0.4%.
 
+**Post-training and diagnostics (hard set).** Cells are success, crash rate in brackets. Columns:
+- `drone14`: drone13 + hard-episode replay 50% + category goals 30%, stopped by patience at 4M.
+- GPS pursuit: fly straight at the hint, no vision.
+- Privileged state (`runs/state-v5-seed0`): actor sees the true target offset, no camera and no obstacle sensing; 8M steps, test 55% / 57%.
+
+| Cohort | `drone13` | `drone14` | GPS pursuit | Privileged state |
+|---|---|---|---|---|
+| standard, no hint | 10.9% (31%) | 7.0% (55%) | 0% (0%) | 54.7% (40%) |
+| standard, precise | 6.3% (38%) | 7.0% (55%) | 10.2% (75%) | 48.0% (47%) |
+| coarse hint | 9.0% (36%) | 10.2% (53%) | 3.1% (67%) | 35.2% (52%) |
+| wrong hint | 8.2% (36%) | 5.5% (54%) | 0% (87%) | 10.9% (65%) |
+| hidden | 2.0% (27%) | 0.4% (52%) | 0% (0%) | 20.3% (68%) |
+| far | 0.4% (27%) | 0% (44%) | 0% (0%) | 10.5% (67%) |
+| hidden + far | 0% (27%) | 0.4% (44%) | 0% (0%) | 8.6% (71%) |
+| look-alike | 3.1% (34%) | 2.7% (49%) | 0% (0%) | 34.4% (57%) |
+| category | 8.2% (34%) | 7.8% (52%) | 0% (0%) | 62.5% (33%) |
+
+Hard-episode replay made the pilot crash more (31% → 55%) without more successes, because replaying failures mostly replays crashes.
+
+Even the privileged-state pilot, which knows where the target is, crashes in 40–71% of episodes, and most on far and hidden targets (67–71%): the routes there cross clutter. Straight-line pursuit of a precise hint crashes 75%.
+
+The binding constraint is obstacle avoidance on long routes, not target recognition or search policy. Its success drops on wrong (11%) and coarse (35%) hints because it learned to follow the hint lane, which never lies in its training.
+
 ### Category goals (`--category-goal-fraction`, `sim_rl/category.py`, `references.py`)
 
 The commander can name an object the drone has never seen. Success is still only the actual instance.
