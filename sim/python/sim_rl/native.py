@@ -40,6 +40,12 @@ REQUIRED_METADATA = ("abi_version", "task", "action_dim", "control_hz", "physics
 # multi-city training and held-out-city evaluation depend on that.
 SPLIT_SPECIFIC_METADATA = ("city_path", "city", "city_fingerprint", "landable", "style", "split", "district",
                            "catalog", "catalog_size", "fields")
+# Native step profiler (sim_env_profile / sim_env_render_stats), in the native order.
+PROFILE_STAGES = ("steps", "host_enqueue_ms", "wall_ms", "gpu_step_ms", "control_ms", "finish_ms", "observe_ms",
+                  "render_handoff_ms", "appearance_ms", "labels_ms", "coverage_ms", "vk_cull_ms",
+                  "vk_camera_passes_ms", "vk_pack_ms", "vk_total_ms", "vk_gaps_ms", "handoff_ms")
+RENDER_STATS = ("draws_per_camera", "scene_triangles", "cameras", "visible_draws_per_camera",
+                "visible_triangles_per_camera", "max_visible_triangles", "indirect_commands_per_frame")
 
 
 class _CudaAllocation:
@@ -87,6 +93,9 @@ class CudaEnv:
             "sim_env_occupancy": ([ct.c_void_p, ct.c_float, ct.c_float, ct.c_float, ct.c_float, ct.c_uint32,
                                    ct.c_uint32, ct.c_uint32, ct.c_float, ct.c_void_p], ct.c_int32),
             "sim_env_set_free_flight": ([ct.c_void_p, ct.c_uint32], ct.c_int32),
+            "sim_env_set_profiling": ([ct.c_void_p, ct.c_uint32], ct.c_int32),
+            "sim_env_profile": ([ct.c_void_p, ct.POINTER(ct.c_double), ct.c_uint32], ct.c_int32),
+            "sim_env_render_stats": ([ct.c_void_p, ct.POINTER(ct.c_double), ct.c_uint32], ct.c_int32),
             "sim_env_create_with_options": ([ct.c_uint32, ct.c_uint64, ct.c_uint32, ct.c_uint32,
                 ct.c_uint32, ct.c_uint32, ct.c_char_p, ct.c_float, ct.c_float, ct.c_uint32], ct.c_void_p),
             "sim_env_destroy": ([ct.c_void_p], None),
@@ -251,6 +260,25 @@ class CudaEnv:
         flight, success is reported once without ending the episode, and there is no timeout."""
         if self.lib.sim_env_set_free_flight(self.handle, int(bool(enabled))) != 0:
             raise RuntimeError(self.error())
+
+    def set_profiling(self, enabled):
+        """Native step profiler (diagnostics only): while on, every step waits for its GPU work."""
+        if self.lib.sim_env_set_profiling(self.handle, int(bool(enabled))) != 0:
+            raise RuntimeError(self.error())
+
+    def profile(self):
+        """Per-step mean stage times since the last call (PROFILE_STAGES -> value); new window."""
+        out = (ct.c_double * len(PROFILE_STAGES))()
+        if self.lib.sim_env_profile(self.handle, out, len(out)) != 0:
+            raise RuntimeError(self.error())
+        return dict(zip(PROFILE_STAGES, out))
+
+    def render_stats(self):
+        """Scene and culling statistics of the last render (RENDER_STATS -> value). Blocks."""
+        out = (ct.c_double * len(RENDER_STATS))()
+        if self.lib.sim_env_render_stats(self.handle, out, len(out)) != 0:
+            raise RuntimeError(self.error())
+        return dict(zip(RENDER_STATS, out))
 
     def write_curriculum(self, lanes):
         """Enqueue an in-place device copy of the CURRICULUM_WIDTH lanes (curriculum.py)."""

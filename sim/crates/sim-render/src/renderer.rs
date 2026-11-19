@@ -7,6 +7,10 @@ use wgpu::util::DeviceExt;
 
 use crate::{BaseColorImage, Camera, CameraGpu, Instance, MeshData, MeshVertex, OutputLayout, RenderConfig, WrapMode};
 
+/// Timestamps written by `Renderer::render_timed`: cull begin/end, first camera pass begin,
+/// last camera pass end, pack begin/end.
+pub const RENDER_TIMESTAMPS: u32 = 6;
+
 /// GPU instance ABI, shared with cull.wgsl and render.wgsl. `metadata`: body index
 /// (u32::MAX = static), object ID, camera filter (0 = all cameras, else camera + 1),
 /// base-color texture index. `pbr`: metallic, roughness, imported flag, double-sided flag.
@@ -271,7 +275,9 @@ impl Renderer {
         let draws = upload(device, "scene draw bounds", &draws, wgpu::BufferUsages::STORAGE);
         let indirect = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("persistent culled draw commands"), size: indirect_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT, mapped_at_creation: false,
+            // COPY_SRC: the profiler reads the culled commands back on request.
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
         });
         ensure!(atlas_width <= limits.max_texture_dimension_2d && atlas_height <= limits.max_texture_dimension_2d,
             "base-color image atlas exceeds texture dimensions");
@@ -404,6 +410,13 @@ impl Renderer {
 
     pub fn output_layout(&self) -> OutputLayout { self.output }
 
+    /// Number of chunk draws per camera (each camera has its own indirect command per draw).
+    pub fn draw_count(&self) -> u32 { self.draw_count }
+
+    /// Culled indexed-indirect commands of the last render: `cameras x draw_count` records of five
+    /// u32 (index count, instance count 0/1, first index, base vertex, first instance).
+    pub fn indirect(&self) -> &wgpu::Buffer { &self.indirect }
+
     /// Bind persistent resources once. Buffers must belong to this device and
     /// have STORAGE usage. `states` uses the documented BodyState64 ABI (at least
     /// one element even for an all-static scene). Output may additionally have
@@ -469,14 +482,26 @@ impl Renderer {
     /// `bindings` must have been created by this renderer. There are no per-frame
     /// host vectors, resource creations, queue writes, submissions, or readbacks.
     pub fn render(&self, encoder: &mut wgpu::CommandEncoder, bindings: &RenderBindings) {
+        self.render_timed(encoder, bindings, None);
+    }
+
+    /// `render` with pass timestamps written into `timestamps` (TIMESTAMP_QUERY, at least
+    /// RENDER_TIMESTAMPS entries): cull begin/end, first camera pass begin, last camera pass end,
+    /// pack begin/end.
+    pub fn render_timed(&self, encoder: &mut wgpu::CommandEncoder, bindings: &RenderBindings,
+        timestamps: Option<&wgpu::QuerySet>) {
+        let compute_writes = |begin, end| timestamps.map(|query_set| wgpu::ComputePassTimestampWrites {
+            query_set, beginning_of_pass_write_index: Some(begin), end_of_pass_write_index: Some(end),
+        });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("sim-render spatial culling"), timestamp_writes: None,
+                label: Some("sim-render spatial culling"), timestamp_writes: compute_writes(0, 1),
             });
             pass.set_pipeline(&self.cull_pipeline);
             pass.set_bind_group(0, &bindings.cull, &[]);
             pass.dispatch_workgroups(self.draw_count.div_ceil(64), self.output.cameras, 1);
         }
+        let last = bindings.cameras.len() - 1;
         let background = self.config.background;
         for (camera_index, camera) in bindings.cameras.iter().enumerate() {
             let attachments = [
@@ -494,6 +519,12 @@ impl Renderer {
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
                     stencil_ops: None,
                 }),
+                timestamp_writes: timestamps.filter(|_| camera_index == 0 || camera_index == last)
+                    .map(|query_set| wgpu::RenderPassTimestampWrites {
+                        query_set,
+                        beginning_of_pass_write_index: (camera_index == 0).then_some(2),
+                        end_of_pass_write_index: (camera_index == last).then_some(3),
+                    }),
                 ..Default::default()
             });
             pass.set_pipeline(&self.render_pipeline);
@@ -505,7 +536,7 @@ impl Renderer {
         }
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("sim-render contiguous output"),
-            timestamp_writes: None,
+            timestamp_writes: compute_writes(4, 5),
         });
         pass.set_pipeline(&self.pack_pipeline);
         pass.set_bind_group(0, &bindings.pack, &[]);

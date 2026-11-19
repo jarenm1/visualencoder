@@ -67,8 +67,10 @@ impl Gpu {
         })?;
         let limits = adapter.limits();
         // GPU-generated indexed draws address persistent instance ranges directly.
-        let features = wgpu::Features::INDIRECT_FIRST_INSTANCE;
-        ensure!(adapter.features().contains(features), "matched Vulkan adapter lacks indirect first-instance draws");
+        let required = wgpu::Features::INDIRECT_FIRST_INSTANCE;
+        ensure!(adapter.features().contains(required), "matched Vulkan adapter lacks indirect first-instance draws");
+        // Pass timestamps are optional: they only serve the native step profiler.
+        let features = required | (adapter.features() & wgpu::Features::TIMESTAMP_QUERY);
         ensure!(
             adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION),
             "matched Vulkan adapter lacks indirect draw execution",

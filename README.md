@@ -124,6 +124,13 @@ nix develop path:sim --command .venv/bin/python sim/python/train.py profile \
 
 Actual collection and PPO-update traces pass the zero-host-staging/wait gate. Initialization, checkpoint export and post-rollout logging are explicit boundaries outside that claim. Learning success and wall-clock training time are separate measurements; an engineering oracle or profiler pass is not an RL result.
 
+Simulator step profile (native per-stage GPU timing: CUDA events around physics, task and image kernels; Vulkan timestamps around cull, camera passes and pack; culling statistics from the indirect commands). Profiling blocks after every step, so plain throughput is measured separately in the same run:
+
+```sh
+PYTHONPATH=sim/python nix develop path:sim --command .venv/bin/python sim/python/sim_profile.py \
+  --envs 64 256 1024 --sizes 320x240 128x96 --out reports/sim-profile.json
+```
+
 The earlier fixed-altitude gap and city-block tasks (`report/navigation.typ`, `report/city-navigation.typ`, `sim/verification.json`) are historical results of superseded task versions; their checkpoints are rejected by the current ABI.
 
 

@@ -112,6 +112,20 @@ int sim_env_retarget(void *env, const float *targets);
  * timeout. Takes effect on the next step. */
 int sim_env_set_free_flight(void *env, uint32_t enabled);
 
+/* Step profiler (diagnostics only). enabled != 0 starts a fresh measurement window; while on,
+ * every step blocks until its own GPU work completes. */
+int sim_env_set_profiling(void *env, uint32_t enabled);
+
+/* Writes 17 float64 values and starts a new window: [steps, host_enqueue_ms, wall_ms,
+ * gpu_step_ms, control_ms, finish_ms, observe_ms, render_handoff_ms, appearance_ms, labels_ms,
+ * coverage_ms, vk_cull_ms, vk_camera_passes_ms, vk_pack_ms, vk_total_ms, vk_gaps_ms, handoff_ms]
+ * (per-step means). Vulkan stages are 0 without timestamp query support. */
+int sim_env_profile(void *env, double *out, uint32_t len);
+
+/* Writes 7 float64 statistics of the last render: [draws per camera, scene triangles, cameras,
+ * mean visible draws per camera, mean visible triangles per camera, max visible triangles in one
+ * camera, indirect commands issued per frame]. Blocks. */
+int sim_env_render_stats(void *env, double *out, uint32_t len);
 
 /* Device pointer to field storage (see enum), or 0 on error. */
 uint64_t sim_env_buffer(void *env, int32_t field);

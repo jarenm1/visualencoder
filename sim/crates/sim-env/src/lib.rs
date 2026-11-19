@@ -7,6 +7,7 @@
 //! learner can encode the whole catalog once.
 mod ffi;
 mod kernels;
+mod profile;
 mod task;
 
 use std::{ffi::{CString, c_char, c_void}, path::Path, sync::Arc};
@@ -21,6 +22,8 @@ use sim_state::collision::{BvhNode, Triangle};
 use sim_state::drone as dynamics;
 use sim_state::drone::EpisodeSpec;
 use kernels::{Buffers, Config, EnvState, ImageArgs, LabelArgs, OccupancyArgs};
+use profile::Profiler;
+pub use profile::{RENDER_STATS, STAGES};
 use task::*;
 
 /// Fixed visibility and projection aspect (width / height).
@@ -154,6 +157,8 @@ pub struct Env {
     mesh_count: u32,
     frame: u32,
     metadata: CString,
+    /// Per-stage step profiler; `None` (the default) adds no work to the step.
+    profiler: Option<Profiler>,
     gpu: Arc<Gpu>,
 }
 
@@ -328,6 +333,7 @@ impl Env {
             mesh_count,
             frame: 0,
             metadata,
+            profiler: None,
             gpu,
         };
         env.reset(seed)?;
@@ -383,7 +389,7 @@ impl Env {
         self.cycle("city reset ownership", |kernels, stream, buffers, config| unsafe {
             kernels.launch(&kernels.reset, stream, buffers, config, None)
         })?;
-        self.render_into(0, true)
+        self.render_into(0, true, None)
     }
 
     /// Steps all environments with `actions` (n * 4 float32 on stream()).
@@ -394,13 +400,69 @@ impl Env {
     /// callers must order any producer before the environment's CUDA stream.
     pub unsafe fn step(&mut self, actions: *const f32) -> Result<()> {
         ensure!(!actions.is_null(), "actions pointer must not be null");
+        let mut profiler = self.profiler.take();
+        if let Some(profiler) = profiler.as_mut() { profiler.begin(); }
+        let result = unsafe { self.step_marked(actions, profiler.as_ref()) };
+        let result = match (result, profiler.as_mut()) {
+            (Ok(()), Some(profiler)) => profiler.end(self.gpu.device()),
+            (result, _) => result,
+        };
+        self.profiler = profiler;
+        result
+    }
+
+    /// Control, finish and observe kernels, then the render, with profiler marks E0..E7.
+    unsafe fn step_marked(&mut self, actions: *const f32, profiler: Option<&Profiler>) -> Result<()> {
         let mut actions = actions;
         self.cycle("city control ownership", |kernels, stream, buffers, config| unsafe {
+            mark(profiler, 0, stream)?;
             kernels.launch(&kernels.control, stream, buffers, config, Some((&raw mut actions).cast()))?;
+            mark(profiler, 1, stream)?;
             kernels.launch(&kernels.finish, stream, buffers, config, None)?;
-            kernels.launch(&kernels.observe, stream, buffers, config, None)
+            mark(profiler, 2, stream)?;
+            kernels.launch(&kernels.observe, stream, buffers, config, None)?;
+            mark(profiler, 3, stream)
         })?;
-        self.render_into(0, true)
+        self.render_into(0, true, profiler)
+    }
+
+    /// Turns the step profiler on (a fresh measurement window) or off. While on, each step
+    /// waits for its own GPU work.
+    pub fn set_profiling(&mut self, enabled: bool) -> Result<()> {
+        self.profiler = if enabled {
+            // SAFETY: a read-only property query; nothing is retained or submitted.
+            let period = unsafe { self.gpu.with_queue(|queue| queue.get_timestamp_period()) };
+            Some(Profiler::new(self.gpu.device(), self.gpu.cuda_context(), period)?)
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    /// Mean stage times since the last report (STAGES order); starts a new window.
+    pub fn profile(&mut self, out: &mut [f64]) -> Result<()> {
+        self.profiler.as_mut().ok_or_else(|| anyhow::anyhow!("profiling is off"))?.report(out)
+    }
+
+    /// Scene and culling statistics of the last render (profile::render_stats). Blocks.
+    pub fn render_stats(&mut self) -> Result<[f64; RENDER_STATS]> {
+        let device = self.gpu.device();
+        let source = self.renderer.indirect();
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("render stats readback"), size: source.size(),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("render stats") });
+        encoder.copy_buffer_to_buffer(source, 0, &readback, 0, source.size());
+        self.gpu.submit([encoder.finish()]);
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely())?;
+        let bytes = slice.get_mapped_range().map_err(|error| anyhow::anyhow!("mapping draw commands: {error:?}"))?;
+        let stats = profile::render_stats(bytemuck::cast_slice(&bytes[..]), self.renderer.draw_count(), self.config.n);
+        drop(bytes);
+        readback.unmap();
+        Ok(stats)
     }
 
     /// Renders the goal reference views of catalog entries `first .. first + n` (clamped to the
@@ -412,11 +474,11 @@ impl Env {
         self.cycle("city goal views", |kernels, stream, buffers, config| unsafe {
             kernels.launch(&kernels.goal_view, stream, buffers, config, Some((&raw mut first).cast()))
         })?;
-        self.render_into(10, false)?;
+        self.render_into(10, false, None)?;
         self.cycle("city observation restore", |kernels, stream, buffers, config| unsafe {
             kernels.launch(&kernels.observe, stream, buffers, config, None)
         })?;
-        self.render_into(0, false)
+        self.render_into(0, false, None)
     }
 
     /// Replaces current-episode targets: `targets` is a device pointer to n x 8 float32 rows
@@ -431,7 +493,7 @@ impl Env {
         self.cycle("city retarget", |kernels, stream, buffers, config| unsafe {
             kernels.launch(&kernels.retarget, stream, buffers, config, Some((&raw mut targets).cast()))
         })?;
-        self.render_into(0, true)
+        self.render_into(0, true, None)
     }
 
     /// Enqueues collision occupancy of a voxel grid into `out` (u8 per voxel, x fastest, then y, then
@@ -457,11 +519,13 @@ impl Env {
 
     /// Renders every camera slot, then applies the randomized appearance into `field`
     /// (0: observation, 10: goal views). Observation renders also write the per-patch labels.
-    fn render_into(&mut self, field: usize, track_coverage: bool) -> Result<()> {
+    /// `profiler` adds pass timestamps and the E4..E7 marks.
+    fn render_into(&mut self, field: usize, track_coverage: bool, profiler: Option<&Profiler>) -> Result<()> {
         let mut encoder = self.gpu.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("city rendered observation"),
         });
-        self.renderer.render(&mut encoder, &self.bindings);
+        self.renderer.render_timed(&mut encoder, &self.bindings, profiler.and_then(Profiler::queries));
+        if let Some(profiler) = profiler { profiler.resolve(&mut encoder); }
         self.frame = self.frame.wrapping_add(1);
         let observation = field == 0;
         let args = ImageArgs {
@@ -492,14 +556,18 @@ impl Env {
         let config = self.config;
         unsafe {
             self.exchange.cycle(encoder, || {
-                self.kernels.launch_appearance(self.gpu.cuda_stream(), args)?;
+                let stream = self.gpu.cuda_stream();
+                mark(profiler, 4, stream)?;
+                self.kernels.launch_appearance(stream, args)?;
+                mark(profiler, 5, stream)?;
                 if observation {
-                    self.kernels.launch_labels(self.gpu.cuda_stream(), buffers, config, args, labels, patches)?;
+                    self.kernels.launch_labels(stream, buffers, config, args, labels, patches)?;
                 }
+                mark(profiler, 6, stream)?;
                 if track_coverage {
-                    self.kernels.launch_coverage(self.gpu.cuda_stream(), buffers, config, args)?;
+                    self.kernels.launch_coverage(stream, buffers, config, args)?;
                 }
-                Ok(())
+                mark(profiler, 7, stream)
             })?;
         }
         Ok(())
@@ -515,6 +583,13 @@ impl Env {
     }
 
     pub fn metadata(&self) -> *const c_char { self.metadata.as_ptr() }
+}
+
+fn mark(profiler: Option<&Profiler>, index: usize, stream: &CudaStream) -> Result<()> {
+    match profiler {
+        Some(profiler) => profiler.mark(index, stream),
+        None => Ok(()),
+    }
 }
 
 impl Drop for Env {

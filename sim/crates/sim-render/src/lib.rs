@@ -17,7 +17,7 @@ mod renderer;
 
 pub use camera::{Camera, CameraGpu};
 pub use mesh::{BaseColorImage, BaseColorTexture, MeshData, MeshMaterial, MeshVertex, WrapMode};
-pub use renderer::{RenderBindings, Renderer};
+pub use renderer::{RENDER_TIMESTAMPS, RenderBindings, Renderer};
 
 /// Surface parameters in linear RGB; the packed output is sRGB-encoded RGBA8.
 #[derive(Clone, Copy, Debug)]

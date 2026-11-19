@@ -109,6 +109,40 @@ pub unsafe extern "C" fn sim_env_set_free_flight(handle: *mut c_void, enabled: u
     })
 }
 
+/// Step profiler on/off (enabled != 0 starts a fresh window). While on, every step blocks
+/// until its GPU work completes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sim_env_set_profiling(handle: *mut c_void, enabled: u32) -> i32 {
+    boundary(-1, || {
+        unsafe { environment(handle)? }.set_profiling(enabled != 0)?;
+        Ok(0)
+    })
+}
+
+/// Writes `len` (>= stage count) float64 stage means, `crate::STAGES` order, and starts a new window.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sim_env_profile(handle: *mut c_void, out: *mut f64, len: u32) -> i32 {
+    boundary(-1, || {
+        anyhow::ensure!(!out.is_null(), "profile output pointer must not be null");
+        // SAFETY: the caller provides `len` writable float64 values.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, len as usize) };
+        unsafe { environment(handle)? }.profile(out)?;
+        Ok(0)
+    })
+}
+
+/// Writes `crate::RENDER_STATS` float64 scene/culling statistics of the last render. Blocks.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sim_env_render_stats(handle: *mut c_void, out: *mut f64, len: u32) -> i32 {
+    boundary(-1, || {
+        anyhow::ensure!(!out.is_null() && len as usize >= crate::RENDER_STATS,
+            "render stats need {} float64 values", crate::RENDER_STATS);
+        let stats = unsafe { environment(handle)? }.render_stats()?;
+        // SAFETY: the caller provides at least RENDER_STATS writable float64 values.
+        unsafe { std::ptr::copy_nonoverlapping(stats.as_ptr(), out, stats.len()) };
+        Ok(0)
+    })
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sim_env_buffer(handle: *mut c_void, field: i32) -> u64 {
