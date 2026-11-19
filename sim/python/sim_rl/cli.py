@@ -67,18 +67,20 @@ def mode_of(features):
     return "visual" if features.visual else features.spec
 
 
-def build_policy(env, features, saved=None, memory_heads=None, commands=1, depth_view=False):
+def build_policy(env, features, saved=None, memory_heads=None, commands=1, depth_view=False, teacher_target=False):
     """Visual arms attend over the frozen patch grid; the grid is height//16 x width//16.
-    ``saved`` loads a checkpoint (its recorded spatial memory, depth view and commands included);
-    ``memory_heads`` starts a new spatial-memory policy from frozen perception heads trained on this
-    exact encoder; ``commands`` > 1 makes a new policy command-conditioned (goal, explore);
-    ``depth_view`` gives a new memory policy the heads' coarse obstacle view."""
+    ``saved`` loads a checkpoint (its recorded spatial memory, depth view, commands and teacher
+    target included); ``memory_heads`` starts a new spatial-memory policy from frozen perception
+    heads trained on this exact encoder; ``commands`` > 1 makes a new policy command-conditioned
+    (goal, explore); ``depth_view`` gives a new memory policy the heads' coarse obstacle view;
+    ``teacher_target`` makes it a privileged teacher that also reads the true target position."""
     recorded = saved["metadata"].get("memory") if saved is not None else None
     memory = memory_heads is not None or bool(recorded)
     commands = saved["metadata"].get("commands", 1) if saved is not None else commands
     depth_view = bool(recorded.get("depth_view")) if recorded else depth_view
+    teacher_target = bool(saved["metadata"].get("teacher_target")) if saved is not None else teacher_target
     policy = ActorCritic(mode_of(features), features.dim, features.goal_dim, env.height // 16, env.width // 16,
-                         env.action_dim, features.goal, memory, commands, depth_view).to(env.device)
+                         env.action_dim, features.goal, memory, commands, depth_view, teacher_target).to(env.device)
     if memory_heads is not None:
         policy.perception.load_state_dict(load_heads(memory_heads, features, env.device).state_dict())
     if saved is not None:
@@ -122,6 +124,7 @@ def training_settings(args):
                 "paths": [str(path) for path in (args.city, *args.train_cities)],
                 "catalog_size_per_city": args.city_catalog_size},
             "explore_fraction": args.explore_fraction, "commands": commands_of(args),
+            "teacher_target": args.teacher_target,
             "mask_confusion": args.mask_confusion,
             "category_goal_fraction": args.category_goal_fraction,
             "replay": None if not args.replay_fraction else {"fraction": args.replay_fraction,
@@ -340,7 +343,7 @@ def train_command(args, started):
             open_env(args, args.eval_envs, VALIDATION_SEED, VALIDATION_STYLE) as validation_env:
         with env.execution():
             policy = build_policy(env, features, memory_heads=args.memory_heads, commands=commands_of(args),
-                                  depth_view=args.depth_view)
+                                  depth_view=args.depth_view, teacher_target=args.teacher_target)
             if args.init_from is not None:
                 warm_start(policy, load_checkpoint(args.init_from)["model"])
             trainer = Trainer(env, features, policy, config, solvable_labels(args, env))
@@ -713,6 +716,9 @@ def add_learner(parser):
     parser.add_argument("--depth-view", action="store_true",
                         help="with --memory-heads: the actor also reads the heads' nearest predicted depth "
                              "over a 3x5 image grid (obstacle view)")
+    parser.add_argument("--teacher-target", action="store_true",
+                        help="privileged teacher: the visual actor also reads the true target offset and box "
+                             "distance (it still flies by camera; for distillation and diagnosis)")
     parser.add_argument("--mask-confusion", action="store_true",
                         help="give goal steps whose saliency peak is a same-class look-alike zero weight in "
                              "the policy and value losses (an encoder error, not a flight error)")

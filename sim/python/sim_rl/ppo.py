@@ -148,6 +148,7 @@ class Trainer:
         self.values, self.advantages, self.returns = allocate(t + 1, n), allocate(t, n), allocate(t, n)
         self.completed_returns = allocate(t, n)
         self.commands = torch.zeros((t, n), dtype=torch.long, device=env.device)
+        self.entries = torch.zeros((t, n), dtype=torch.long, device=env.device)   # catalog entry per step (replay scores)
         self.command = torch.zeros(n, dtype=torch.long, device=env.device)
         self.explore_tiles = allocate(t, n)
         self.tiles = torch.zeros(n, device=env.device)
@@ -278,6 +279,8 @@ class Trainer:
                 self._sample_commands()
                 self.commands[t].copy_(self.command)
                 explore = self.command == EXPLORE_COMMAND
+                if self.levels is not None:
+                    self.entries[t].copy_(self.levels.episode)
                 self.proprio[t].copy_(self.env.proprio)
                 self.privileged[t].copy_(self.env.privileged)
                 self.starts[t].copy_(self.next_start)
@@ -341,6 +344,10 @@ class Trainer:
                                          self.done[:length], cfg.gamma, cfg.gae_lambda,
                                          self.advantages[:length])
                 self.returns[:length].copy_(advantage + self.values[:length])
+                if self.levels is not None:
+                    # Before normalization: the replay score is the raw positive value loss.
+                    self.levels.update_scores(advantage, self.entries[:length],
+                                              self.commands[:length] == GOAL_COMMAND)
                 advantage.sub_(advantage.mean()).div_(advantage.std(unbiased=False) + 1e-8)
             sequences = length // cfg.sequence_length * n
             losses = torch.zeros(LOSS_WIDTH, device=self.env.device)

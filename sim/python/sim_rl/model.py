@@ -23,6 +23,7 @@ INITIAL_LOG_STD = -0.5
 # expected NDC (2), peak patch logit (1), P(in view) (1), pooled value, global projection
 VISUAL_WIDTH = 2 + 1 + 1 + VALUE + GLOBAL   # 196
 MEMORY_FEATURES = 64            # encoded spatial-memory crop (plus the candidate lanes)
+TEACHER_TARGET_WIDTH = 4        # privileged lanes 0-3: true target offset (body frame) / 32, box distance / 32
 # Policy commands: fly to the goal crop and hold, or explore (see memory.py / ppo.py).
 COMMANDS = ("goal", "explore")
 GOAL_COMMAND, EXPLORE_COMMAND = 0, 1
@@ -197,7 +198,9 @@ class ActorCritic(nn.Module):
             with ``memory``, also the spatial-memory crop (memory.py), built from frozen per-patch
             depth heads (``perception``) and the saliency, with an auxiliary loss that decodes the
             target's body-frame offset from the memory features. ``depth_view`` adds the heads'
-            nearest predicted depth over a 3x5 grid of the image (an obstacle view).
+            nearest predicted depth over a 3x5 grid of the image (an obstacle view). ``teacher_target``
+            adds the true target offset and box distance: a privileged teacher that still flies by
+            camera (obstacles) but always knows where to go.
     state:  privileged + proprioception (no vision).
     hint:   proprioception only.
     ``commands`` > 1 adds a one-hot command (COMMANDS) to the actor and critic inputs: one policy
@@ -206,7 +209,7 @@ class ActorCritic(nn.Module):
     """
 
     def __init__(self, mode, token_dim, goal_dim, grid_h, grid_w, action_dim=4, goal="global", memory=False,
-                 commands=1, depth_view=False):
+                 commands=1, depth_view=False, teacher_target=False):
         super().__init__()
         if mode not in MODES:
             raise ValueError(f"unknown policy mode {mode}")
@@ -223,6 +226,9 @@ class ActorCritic(nn.Module):
             self.attention = TargetSaliency(token_dim, goal_dim, grid_h, grid_w)
         self.memory_width = 0
         self.depth_view = depth_view
+        if teacher_target and mode != "visual":
+            raise ValueError("teacher_target adds the true target to a visual actor")
+        self.teacher_target = teacher_target
         if depth_view and not memory:
             raise ValueError("the depth view comes from the spatial memory's perception heads")
         if memory:
@@ -231,11 +237,12 @@ class ActorCritic(nn.Module):
             self.memory_vector_width = CANDIDATE_WIDTH + (VIEW_WIDTH if depth_view else 0)
             self.memory_width = MEMORY_FEATURES + CANDIDATE_WIDTH
             self.memory_probe = nn.Linear(self.memory_width, 3)
-        # The depth view goes last (after the command), so warm starts from policies without it
-        # only gain zero-initialized trailing input columns.
+        # The depth view and the teacher's target lanes go last (after the command), so warm starts
+        # from policies without them only gain zero-initialized trailing input columns.
         width = {"visual": VISUAL_WIDTH + self.memory_width + PROPRIO_WIDTH,
                  "state": PRIVILEGED_WIDTH + PROPRIO_WIDTH, "hint": PROPRIO_WIDTH}[mode] \
-            + (commands if commands > 1 else 0) + (VIEW_WIDTH if depth_view else 0)
+            + (commands if commands > 1 else 0) + (VIEW_WIDTH if depth_view else 0) \
+            + (TEACHER_TARGET_WIDTH if teacher_target else 0)
         self.trunk = nn.Sequential(_orthogonal(nn.Linear(width, HIDDEN), math.sqrt(2)),
                                    nn.LayerNorm(HIDDEN), nn.Tanh())
         self.recurrent = nn.GRUCell(HIDDEN, HIDDEN)
@@ -271,6 +278,9 @@ class ActorCritic(nn.Module):
         inputs = self.with_command(inputs, command)
         if self.depth_view:
             inputs = torch.cat((inputs, memory[1][:, CANDIDATE_WIDTH:]), dim=-1)
+        if self.teacher_target:
+            # Privileged teacher: the true target offset in the body frame and its box distance.
+            inputs = torch.cat((inputs, privileged[:, :TEACHER_TARGET_WIDTH]), dim=-1)
         return inputs, logits
 
     def with_command(self, inputs, command):
