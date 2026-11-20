@@ -1,0 +1,248 @@
+{
+ "accepted": false,
+ "failed": [
+  "failures/patch_head_score",
+  "failures/global_head_score"
+ ],
+ "checks": {
+  "failures/patch_head_score": {
+   "baseline": 0.6913991836981106,
+   "candidate": 0.7076842554641127,
+   "difference": 0.016285071766002135,
+   "ci95": [
+    -0.004711041763384138,
+    0.03831273684951805
+   ],
+   "role": "target",
+   "margin": null,
+   "improvement_ci95": [
+    -0.004711041763384138,
+    0.03831273684951805
+   ],
+   "pass": false
+  },
+  "failures/global_head_score": {
+   "baseline": 0.6689158450104463,
+   "candidate": 0.652405729637192,
+   "difference": -0.016510115373254308,
+   "ci95": [
+    -0.04593328206625918,
+    0.004589050820397354
+   ],
+   "role": "guard",
+   "margin": 0.01,
+   "improvement_ci95": [
+    -0.04593328206625918,
+    0.004589050820397354
+   ],
+   "pass": false
+  },
+  "sim/pose_r2_shifted": {
+   "baseline": 0.5908583700656891,
+   "candidate": 0.58842933177948,
+   "difference": -0.0024290382862091064,
+   "ci95": [
+    -0.00610564686357975,
+    0.0012836817651987068
+   ],
+   "role": "guard",
+   "margin": 0.02,
+   "improvement_ci95": [
+    -0.00610564686357975,
+    0.0012836817651987068
+   ],
+   "pass": true
+  },
+  "sim/depth_absrel_shifted": {
+   "baseline": 0.18784165071579353,
+   "candidate": 0.19103344880577172,
+   "difference": 0.0031917980899781873,
+   "ci95": [
+    0.0015420015635422661,
+    0.00527286346507872
+   ],
+   "role": "guard",
+   "margin": 0.01,
+   "improvement_ci95": [
+    -0.00527286346507872,
+    -0.0015420015635422661
+   ],
+   "pass": true
+  },
+  "sim/semantic_miou_shifted": {
+   "baseline": 0.829000581223821,
+   "candidate": 0.8274183397735339,
+   "difference": -0.0015822414502871807,
+   "ci95": [
+    -0.002899372866991448,
+    -0.00021789024957175618
+   ],
+   "role": "guard",
+   "margin": 0.01,
+   "improvement_ci95": [
+    -0.002899372866991448,
+    -0.00021789024957175618
+   ],
+   "pass": true
+  },
+  "sim/pose_r2_region": {
+   "baseline": -0.7950688004493713,
+   "candidate": -0.8035420924425125,
+   "difference": -0.008473291993141174,
+   "ci95": [
+    -0.01960788406431675,
+    0.0026571717113256423
+   ],
+   "role": "guard",
+   "margin": 0.02,
+   "improvement_ci95": [
+    -0.01960788406431675,
+    0.0026571717113256423
+   ],
+   "pass": true
+  },
+  "sim/depth_absrel_region": {
+   "baseline": 0.1894040098168513,
+   "candidate": 0.19260038448135244,
+   "difference": 0.0031963746645011504,
+   "ci95": [
+    0.0017329189737757135,
+    0.00480182289044493
+   ],
+   "role": "guard",
+   "margin": 0.01,
+   "improvement_ci95": [
+    -0.00480182289044493,
+    -0.0017329189737757135
+   ],
+   "pass": true
+  },
+  "sim/semantic_miou_region": {
+   "baseline": 0.8226881220986781,
+   "candidate": 0.8207400262158532,
+   "difference": -0.0019480958828249628,
+   "ci95": [
+    -0.0031804681354786505,
+    -0.0007684058483850176
+   ],
+   "role": "guard",
+   "margin": 0.01,
+   "improvement_ci95": [
+    -0.0031804681354786505,
+    -0.0007684058483850176
+   ],
+   "pass": true
+  },
+  "sim/retrieval_at_1": {
+   "baseline": 0.9700226244343891,
+   "candidate": 0.9677601809954751,
+   "difference": -0.002262443438914019,
+   "ci95": [
+    -0.0062217194570135526,
+    0.002262443438914019
+   ],
+   "role": "guard",
+   "margin": 0.02,
+   "improvement_ci95": [
+    -0.0062217194570135526,
+    0.002262443438914019
+   ],
+   "pass": true
+  },
+  "sim/patch_cosine": {
+   "baseline": 0.9698136448860168,
+   "candidate": 0.9667818546295166,
+   "difference": -0.003031790256500244,
+   "ci95": [
+    -0.0031735315918922425,
+    -0.0028779730200767517
+   ],
+   "role": "guard",
+   "margin": 0.01,
+   "improvement_ci95": [
+    -0.0031735315918922425,
+    -0.0028779730200767517
+   ],
+   "pass": true
+  },
+  "real/sim_to_real_miou": {
+   "baseline": 0.515748256311428,
+   "candidate": 0.5366198729829461,
+   "difference": 0.020871616671518156,
+   "ci95": [
+    -0.004964906002117853,
+    0.03378342422563907
+   ],
+   "role": "guard",
+   "margin": 0.01,
+   "improvement_ci95": [
+    -0.004964906002117853,
+    0.03378342422563907
+   ],
+   "pass": true
+  },
+  "real/sim_to_real_vehicle_auroc": {
+   "baseline": 0.9026368081379514,
+   "candidate": 0.9444081756177268,
+   "difference": 0.04177136747977539,
+   "ci95": [
+    0.025339004144043997,
+    0.05182641881148214
+   ],
+   "role": "guard",
+   "margin": 0.01,
+   "improvement_ci95": [
+    0.025339004144043997,
+    0.05182641881148214
+   ],
+   "pass": true
+  },
+  "real/sim_to_real_vehicle_ap": {
+   "baseline": 0.603866611558439,
+   "candidate": 0.749268063265517,
+   "difference": 0.14540145170707797,
+   "ci95": [
+    0.09494281722995068,
+    0.17991508254941768
+   ],
+   "role": "guard",
+   "margin": 0.02,
+   "improvement_ci95": [
+    0.09494281722995068,
+    0.17991508254941768
+   ],
+   "pass": true
+  },
+  "real/real_to_real_miou": {
+   "baseline": 0.613163531361619,
+   "candidate": 0.6485563890793037,
+   "difference": 0.035392857717684634,
+   "ci95": [
+    0.007997467651186307,
+    0.04509587169277156
+   ],
+   "role": "guard",
+   "margin": 0.01,
+   "improvement_ci95": [
+    0.007997467651186307,
+    0.04509587169277156
+   ],
+   "pass": true
+  }
+ },
+ "baseline": "run:runs/mean",
+ "candidate": "run:runs/refine-anchors-mv",
+ "resamples": 1000,
+ "data": {
+  "sim": "data/eval-v2",
+  "heldout_region": [
+   0,
+   0,
+   245,
+   245
+  ],
+  "mined": "runs/mined-drone13",
+  "failures": "runs/mined-drone13",
+  "real": "data/uavid"
+ }
+}

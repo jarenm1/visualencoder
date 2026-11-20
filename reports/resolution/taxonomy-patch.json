@@ -1,0 +1,110 @@
+{
+ "context_radius_m": 10.0,
+ "head": "patch",
+ "encoders": {
+  "run:runs/mean": {
+   "visible_frames": 1652,
+   "absent_frames": 4492,
+   "visible": {
+    "correct": 906,
+    "look_alike_appearance": 162,
+    "background": 60,
+    "other_class": 466,
+    "look_alike_context": 58
+   },
+   "absent": {
+    "false_look_alike_context": 35,
+    "false_other_class": 271,
+    "correct": 3748,
+    "false_look_alike_appearance": 374,
+    "false_background": 64
+   },
+   "visible_correct_by_size": {
+    "1-4 patches": {
+     "frames": 229,
+     "correct": 0.22707423580786026
+    },
+    "5-12 patches": {
+     "frames": 333,
+     "correct": 0.4264264264264264
+    },
+    "13-30 patches": {
+     "frames": 296,
+     "correct": 0.5675675675675675
+    },
+    "31-300 patches": {
+     "frames": 794,
+     "correct": 0.6851385390428212
+    }
+   }
+  },
+  "up2:run:runs/mean": {
+   "visible_frames": 1652,
+   "absent_frames": 4492,
+   "visible": {
+    "look_alike_context": 40,
+    "other_class": 497,
+    "correct": 854,
+    "look_alike_appearance": 245,
+    "background": 16
+   },
+   "absent": {
+    "correct": 3738,
+    "false_other_class": 295,
+    "false_look_alike_appearance": 332,
+    "false_background": 106,
+    "false_look_alike_context": 21
+   },
+   "visible_correct_by_size": {
+    "1-4 patches": {
+     "frames": 229,
+     "correct": 0.19213973799126638
+    },
+    "5-12 patches": {
+     "frames": 333,
+     "correct": 0.4114114114114114
+    },
+    "13-30 patches": {
+     "frames": 296,
+     "correct": 0.625
+    },
+    "31-300 patches": {
+     "frames": 794,
+     "correct": 0.6146095717884131
+    }
+   }
+  }
+ },
+ "joint": {
+  "student_fails_teacher_correct": {
+   "false_look_alike_context": 14,
+   "other_class": 142,
+   "false_look_alike_appearance": 177,
+   "false_other_class": 101,
+   "look_alike_appearance": 49,
+   "background": 8,
+   "false_background": 19,
+   "look_alike_context": 25
+  },
+  "both_fail": {
+   "false_other_class": 170,
+   "look_alike_appearance": 113,
+   "background": 52,
+   "false_look_alike_appearance": 197,
+   "false_background": 45,
+   "other_class": 324,
+   "look_alike_context": 33,
+   "false_look_alike_context": 21
+  },
+  "teacher_fails_student_correct": {
+   "look_alike_context": 8,
+   "false_look_alike_appearance": 167,
+   "false_background": 40,
+   "other_class": 162,
+   "look_alike_appearance": 98,
+   "background": 8,
+   "false_other_class": 107,
+   "false_look_alike_context": 7
+  }
+ }
+}

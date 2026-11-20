@@ -1,0 +1,66 @@
+{
+  "batch_size": 128,
+  "encoders": {
+    "run:runs/mean": {
+      "dim": 384,
+      "global": {
+        "absent_correct": 0.8239091718610864,
+        "absent_correct_failed": 0.8245315161839863,
+        "absent_failed_frames": 1761,
+        "absent_frames": 4492,
+        "score": 0.6689158450104463,
+        "visible_failed_frames": 416,
+        "visible_frames": 1652,
+        "visible_on_target": 0.5139225181598063,
+        "visible_on_target_failed": 0.25721153846153844
+      },
+      "patch": {
+        "absent_correct": 0.8343722172751559,
+        "absent_correct_failed": 0.8057921635434412,
+        "absent_failed_frames": 1761,
+        "absent_frames": 4492,
+        "score": 0.6913991836981106,
+        "visible_failed_frames": 416,
+        "visible_frames": 1652,
+        "visible_on_target": 0.5484261501210653,
+        "visible_on_target_failed": 0.3004807692307692
+      }
+    },
+    "up2:run:runs/mean": {
+      "dim": 384,
+      "global": {
+        "absent_correct": 0.757346393588602,
+        "absent_correct_failed": 0.7586598523566156,
+        "absent_failed_frames": 1761,
+        "absent_frames": 4492,
+        "score": 0.5805497101114923,
+        "visible_failed_frames": 416,
+        "visible_frames": 1652,
+        "visible_on_target": 0.40375302663438256,
+        "visible_on_target_failed": 0.17307692307692307
+      },
+      "patch": {
+        "absent_correct": 0.832146037399822,
+        "absent_correct_failed": 0.8023850085178875,
+        "absent_failed_frames": 1761,
+        "absent_frames": 4492,
+        "score": 0.6745475949710974,
+        "visible_failed_frames": 416,
+        "visible_frames": 1652,
+        "visible_on_target": 0.5169491525423728,
+        "visible_on_target_failed": 0.4519230769230769
+      }
+    }
+  },
+  "epochs": 20,
+  "goal_pool": [
+    6,
+    8
+  ],
+  "held_out": "runs/mined-drone13",
+  "learning_rate": 0.001,
+  "mined": "runs/mined-drone13",
+  "seed": 0,
+  "test_frames": 6144,
+  "train_frames": 6144
+}
