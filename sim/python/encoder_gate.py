@@ -219,8 +219,11 @@ def main():
     parser.add_argument("--heldout-region", type=float, nargs=4, default=[0, 0, 245, 245],
                         help="world rectangle excluded from distillation (reported as the region suite)")
     parser.add_argument("--fit-view", default="canonical")
-    parser.add_argument("--mined", type=Path, default=Path("runs/mined-drone6/train-set"))
-    parser.add_argument("--failures", type=Path, default=Path("runs/mined-drone6/eval-set"))
+    # Encoder-centric mined flights (drone13): probes fit on train/, scored on the held-out test/ district.
+    parser.add_argument("--mined", type=Path, default=Path("runs/mined-drone13"),
+                        help="mine output holding train/ (probe fitting)")
+    parser.add_argument("--failures", type=Path, default=Path("runs/mined-drone13"),
+                        help="mine output holding test/ (held-out failure frames)")
     parser.add_argument("--real", type=Path, default=Path("data/uavid"))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=Path, required=True)

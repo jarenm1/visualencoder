@@ -542,6 +542,11 @@ def post_train_command(args, started):
     post_train(args)
 
 
+def refine_command(args, started):
+    from .refine import refine
+    refine(args)
+
+
 def confusion_probe_command(args, started):
     from .posttrain import confusion_probe
     confusion_probe(args)
@@ -852,6 +857,28 @@ def parser():
     post.add_argument("--seed", type=int, default=0)
     post.add_argument("--out", type=Path, required=True)
     post.set_defaults(func=post_train_command)
+
+    refine = commands.add_parser("refine", help="feature-level encoder post-training on mined drone frames "
+                                 "(hard-example distillation + instance contrast, real/sim anchors; no task head)")
+    refine.add_argument("--base", type=Path, default=ROOT / "runs/mean", help="`visenc distill` run directory")
+    refine.add_argument("--mined", type=Path, required=True, help="mined split directory with patch_object.npy")
+    refine.add_argument("--teacher", default="lingbot:large")
+    refine.add_argument("--real", type=Path, default=ROOT / "data/uavid/train_rgb.npy")
+    refine.add_argument("--sim", type=Path, default=ROOT / "data/train-v2/rgb_random1.npy")
+    refine.add_argument("--train-blocks", type=int, default=4)
+    refine.add_argument("--steps", type=int, default=3000)
+    refine.add_argument("--pairs", type=int, default=16, help="same-flight frame pairs per step (2x frames)")
+    refine.add_argument("--real-batch", type=int, default=16)
+    refine.add_argument("--sim-batch", type=int, default=8)
+    refine.add_argument("--real-weight", type=float, default=2.0, help="weight of the real-frame anchor")
+    refine.add_argument("--contrast-weight", type=float, default=0.5)
+    refine.add_argument("--temperature", type=float, default=0.1)
+    refine.add_argument("--lr", type=float, default=2e-5)
+    refine.add_argument("--head-lr", type=float, default=3e-4)
+    refine.add_argument("--warmup", type=int, default=200)
+    refine.add_argument("--seed", type=int, default=0)
+    refine.add_argument("--out", type=Path, required=True)
+    refine.set_defaults(func=refine_command)
 
     confusion = commands.add_parser("confusion-probe", help="fresh saliency head per frozen encoder on mined frames")
     confusion.add_argument("--encoders", nargs="+", required=True, help="visenc encoder specs, e.g. run:runs/mean")
