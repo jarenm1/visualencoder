@@ -168,7 +168,7 @@ def refine(args):
                        + patch_gap[m + r:].mean() + cls_gap[m + r:].mean())
         rows, cols, objects = sample_patches(labels, rng)
         loss_contrast = supcon(projector(tokens[rows, cols].float()), objects, args.temperature)
-        loss = loss_anchor + loss_hard + args.contrast_weight * loss_contrast
+        loss = loss_anchor + args.hard_weight * loss_hard + args.contrast_weight * loss_contrast
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(backbone_params + list(projector.parameters()), 1.0)

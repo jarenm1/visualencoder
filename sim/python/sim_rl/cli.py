@@ -871,6 +871,7 @@ def parser():
     refine.add_argument("--real-batch", type=int, default=16)
     refine.add_argument("--sim-batch", type=int, default=8)
     refine.add_argument("--real-weight", type=float, default=2.0, help="weight of the real-frame anchor")
+    refine.add_argument("--hard-weight", type=float, default=1.0, help="weight of hard distillation on drone frames")
     refine.add_argument("--contrast-weight", type=float, default=0.5)
     refine.add_argument("--temperature", type=float, default=0.1)
     refine.add_argument("--lr", type=float, default=2e-5)
