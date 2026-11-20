@@ -346,6 +346,10 @@ def train_command(args, started):
                                   depth_view=args.depth_view, teacher_target=args.teacher_target)
             if args.init_from is not None:
                 warm_start(policy, load_checkpoint(args.init_from)["model"])
+                if args.memory_heads is not None:
+                    # Perception heads belong to an encoder: a warm start from a policy on another
+                    # encoder must keep the heads trained for this one.
+                    policy.perception.load_state_dict(load_heads(args.memory_heads, features, env.device).state_dict())
             trainer = Trainer(env, features, policy, config, solvable_labels(args, env))
             trainer.warmup(args.seed)
             metadata = provenance(env, features, training_settings(args))
