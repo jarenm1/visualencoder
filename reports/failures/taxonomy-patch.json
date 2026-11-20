@@ -1,0 +1,74 @@
+{
+ "context_radius_m": 10.0,
+ "head": "patch",
+ "encoders": {
+  "run:runs/mean": {
+   "visible_frames": 1652,
+   "absent_frames": 4492,
+   "visible": {
+    "correct": 906,
+    "look_alike_appearance": 162,
+    "background": 60,
+    "other_class": 466,
+    "look_alike_context": 58
+   },
+   "absent": {
+    "false_look_alike_context": 35,
+    "false_other_class": 271,
+    "correct": 3748,
+    "false_look_alike_appearance": 374,
+    "false_background": 64
+   }
+  },
+  "lingbot:large": {
+   "visible_frames": 1652,
+   "absent_frames": 4492,
+   "visible": {
+    "look_alike_context": 59,
+    "correct": 877,
+    "look_alike_appearance": 189,
+    "background": 36,
+    "other_class": 491
+   },
+   "absent": {
+    "correct": 3687,
+    "false_other_class": 284,
+    "false_look_alike_appearance": 309,
+    "false_background": 168,
+    "false_look_alike_context": 44
+   }
+  }
+ },
+ "joint": {
+  "student_fails_teacher_correct": {
+   "false_look_alike_context": 16,
+   "look_alike_appearance": 67,
+   "background": 44,
+   "false_look_alike_appearance": 150,
+   "false_other_class": 143,
+   "other_class": 136,
+   "false_background": 9,
+   "look_alike_context": 10
+  },
+  "both_fail": {
+   "false_other_class": 128,
+   "false_look_alike_appearance": 224,
+   "background": 16,
+   "false_background": 55,
+   "other_class": 330,
+   "look_alike_appearance": 95,
+   "look_alike_context": 48,
+   "false_look_alike_context": 19
+  },
+  "teacher_fails_student_correct": {
+   "look_alike_context": 8,
+   "look_alike_appearance": 114,
+   "background": 13,
+   "other_class": 151,
+   "false_look_alike_appearance": 142,
+   "false_other_class": 123,
+   "false_look_alike_context": 31,
+   "false_background": 83
+  }
+ }
+}

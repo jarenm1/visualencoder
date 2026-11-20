@@ -1,0 +1,46 @@
+{
+  "appearance": 1.0,
+  "checkpoint": "runs/drone13-v5-seed0/best.pt",
+  "checkpoint_sha256": "875bdd233ed0c0c0a0fe5c2bfa015548a3416be45b5f69d08f1c3dbccf1d5ffc",
+  "checkpoint_task": "city-drone-goal-v5",
+  "encoder": "run:runs/mean",
+  "goal_source": "fixed catalog goal crop (no refresh)",
+  "horizons": 2,
+  "kinds": [
+    "normal",
+    "wrong_peak",
+    "false_view"
+  ],
+  "normal_rate": 1.0,
+  "num_envs": 64,
+  "rounds": 1,
+  "splits": [
+    {
+      "counts": {
+        "false_view": 1866,
+        "normal": 3939,
+        "wrong_peak": 339
+      },
+      "kept": 6144,
+      "sampled_observations": 6144,
+      "seed": 40001,
+      "split": "train",
+      "style": 0,
+      "unique_goals": 215
+    },
+    {
+      "counts": {
+        "false_view": 1761,
+        "normal": 3967,
+        "wrong_peak": 416
+      },
+      "kept": 6144,
+      "sampled_observations": 6144,
+      "seed": 20009,
+      "split": "test",
+      "style": 2,
+      "unique_goals": 224
+    }
+  ],
+  "stride": 25
+}
