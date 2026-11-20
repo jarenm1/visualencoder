@@ -37,9 +37,9 @@ frozen encoder gets a fresh head trained on 8,192 frames from training districts
 by 0.08–0.13 and improves both localization and absence. With a single goal vector the distilled students appear
 to beat their teacher (0.730 vs 0.685); with patch matching that gap closes (teacher 0.819, students 0.810–0.819)
 and the teacher localizes best. The students' advantage was in what survives averaging into one vector, not finer
-discrimination. Fine-tuning the student's last four blocks on the mined frames, anchored to the teacher on real
-and simulated images, gave no gain over retraining the head alone and lowered real car AP (0.604 → 0.533), so the
-encoder stays frozen.
+discrimination. Fine-tuning the student's last four blocks on the mined frames through this head, anchored to the
+teacher on real and simulated images, lowered real car AP (0.604 → 0.533). The encoder therefore stays frozen during
+policy training; @sec-refine refines it separately, under a gate.
 
 *Closed loop.* Two policies trained identically (frozen paired student, 2.0M transitions, final-3-second hold
 success) differ only in the goal head. On 256 paired held-out episodes per cell, success with GPS rises from

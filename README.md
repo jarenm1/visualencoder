@@ -85,6 +85,29 @@ UAVid train/validation videos must be disjoint. A simulator-fit segmentation pro
 
 Confidence intervals resample whole video sequences (1,000 draws, shared across models and probe directions), not individual patches. Paired differences use those same draws. Only seven validation sequences are available; these intervals exclude training-seed and probe-fitting uncertainty. Cached per-frame predictions, protocol and fit indices accompany every report. The real→real minus sim→real gap must be read alongside both absolute scores: losing general real-image quality can also shrink that gap.
 
+### Encoder refinement and the encoder gate
+
+A policy flies the simulator to produce drone viewpoints; a fresh probe on frozen features (not the policy) defines the encoder's failures; the encoder is refined; and `encoder_gate.py` decides. It scores candidate and baseline on held-out simulator probes (shifted looks, the held-out quadrant, retrieval), fresh goal-matching heads on held-out flight frames, and UAVid, with paired bootstrap intervals (poses, goals, whole videos). It accepts only if the failure score improves (interval above 0) and every other metric is non-inferior (interval above a fixed margin). Training runs never select checkpoints on a score they optimize.
+
+```sh
+P="nix develop path:sim --command env PYTHONPATH=sim/python:src .venv/bin/python"
+# Flight frames with per-patch object labels (the policy is only the camera operator)
+$P sim/python/train.py mine --checkpoint runs/drone13-v5-seed0/best.pt --splits train test \
+  --num-envs 64 --rounds 1 --horizons 2 --stride 25 --normal-rate 1 --out runs/mined-drone13
+# Failure taxonomy (fresh probes on frozen student and teacher; accuracy by target size)
+$P sim/python/train.py confusion-probe --encoders run:runs/mean lingbot:large --mined runs/mined-drone13 \
+  --held-out runs/mined-drone13 --out reports/failures/probe.json --samples reports/failures/samples
+$P -m sim_rl.failures --split runs/mined-drone13/test --samples reports/failures/samples \
+  --encoders run:runs/mean lingbot:large --out reports/failures/taxonomy-patch.json
+# Refinement: real (2x) and paired-view simulator anchors; optional flight-frame losses
+$P sim/python/train.py refine --mined runs/mined-drone13-train4/train --hard-weight 0 --contrast-weight 0 \
+  --out runs/refine-anchors-mv
+$P sim/python/encoder_gate.py --baseline run:runs/mean --candidate run:runs/refine-anchors-mv \
+  --out reports/gate/refine-anchors-mv-vs-mean
+```
+
+`runs/refine-anchors-mv` is the base encoder: against `runs/mean` it raises UAVid car AP 0.604 → 0.749 and real→real mIoU 0.613 → 0.649 with every simulator readout within its margin; its flight-failure gain (+0.016, interval −0.005 to +0.038) is not established. Report section "Refining the encoder from flight failures".
+
 ## Independent experiments
 
 ### Geometry × consistency

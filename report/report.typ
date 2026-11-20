@@ -25,6 +25,9 @@
   80% success; neither convergence nor an encoder-ranking advantage is established. INT8 preserves measured probe scores, but embedded-device latency is unmeasured.
   For goal-object search, how the goal is matched against frame patches matters more than the encoder: patch-level
   matching lifts every frozen encoder and closes the apparent student-over-teacher advantage.
+  An encoder gate with paired intervals rejects fine-tuning on mined flight failures that lowers real car precision;
+  refining instead with real and paired-view anchors raises UAVid car AP from 0.604 to 0.749 with no simulator loss,
+  while the small-object failures it was mined for remain.
 ]
 
 = Introduction
@@ -39,6 +42,8 @@ needed to get there. Our contributions:
 + Unlabelled-real adaptation evaluated with car AP and whole-video uncertainty, not AUROC alone.
 + A GPU-owned control pipeline with timed PPO, blind/privileged controls and a separate INT8 probe check.
 + A mined-confusion goal-matching benchmark comparing single-vector and patch-level goal matching across encoders.
++ An encoder gate (paired bootstrap over simulator, flight-failure and real suites) and encoder-centric failure
+  mining from policy flights, used to refine the student.
 
 = Methodology
 
@@ -148,11 +153,13 @@ DINOv3-L on segmentation.
     table.hline(stroke: 0.5pt),
     [Standard distillation (ours)], [0.539], [*0.909*], [0.649], [0.632], [0.093],
     [Paired-view consistency (ours)], [0.525], [0.905], [0.622], [0.615], [0.090],
+    [+ refinement (ours, @sec-refine)], [0.537], [*0.944*], [*0.749*], [0.649], [0.112],
     table.hline(),
   ),
   caption: [UAVid validation. Sim→real uses a simulator-fit probe; real→real uses a UAVid-train probe.
   Car AUROC/AP detect patches with ≥10% car versus car-free patches. Gap = real→real − sim→real.
-  Student rows average two seeds. DINOv3 point estimates are original; new AP/CI results are unavailable (gated weights).],
+  Student rows average two seeds, except the refinement row (one seed; its seed-0 parent scores 0.516, 0.903, 0.604,
+  0.613). DINOv3 point estimates are original; new AP/CI results are unavailable (gated weights).],
 ) <tab-real>
 
 @tab-real tests transfer with a simulator-fit probe; supplementary figures show qualitative predictions.
@@ -161,7 +168,8 @@ DINOv3-L on segmentation.
   gap shrinks, but this is not sufficient evidence by itself: lower real→real quality also reduces that gap.
 - *Specialization has a cost.* Fit directly on real images, the students (0.62–0.63) fall slightly below the model they
   started from (0.650): training only on one stylised city trades away some general real-world quality. The large
-  models remain best overall on real frames.
+  models remain best overall on real frames. Refinement with real anchors (@sec-refine) recovers real→real quality
+  (0.649) and lifts car AP to 0.749, above the teacher's 0.727 (one seed).
 - *Simulation-only consistency does not add a real-image gain.* Its large gains under unseen simulated lighting and materials do
   not appear on real frames (about 0.53 vs 0.54, within seed variation). Geometry and content mismatch are plausible
   explanations; the original fixed-city experiment does not isolate their contribution.
@@ -199,6 +207,8 @@ This separate pilot uses goal-facing, altitude-stabilized kinematic control, not
 
 #include "goal-matching.typ"
 
+#include "refine.typ"
+
 #include "perception.typ"
 
 #include "memory.typ"
@@ -215,12 +225,16 @@ Extra training layouts within the shared assets add little at the same budget an
 in these two seeds; this does not establish that richer geometry is irrelevant.
 INT8 preserves the original student's probe scores closely, but Jetson latency is unmeasured.
 Simulation-only consistency gives no clear real-image gain; adding unlabelled real RGB improves readout quality
-and car AP without increasing AUROC. GPU control trains within an hour, but actual city navigation remains
+and car AP without increasing AUROC. A gate that judges every refinement on held-out simulator, flight-failure and real
+suites rejected fine-tuning through the task head (it lowered real car precision) and showed that refinement with real
+and paired-view anchors improves real car detection and segmentation without simulator loss; the flight failures,
+mostly small objects and same-class look-alikes that the teacher also misses, remain open.
+GPU control trains within an hour, but actual city navigation remains
 challenging; these results do not establish an encoder-ranking advantage. The objectives must be evaluated independently.
 
 *Limitations.* Three training cities and two held-out layouts share one stylised asset library, with a fixed
 compute budget. City navigation uses a goal-facing camera and stabilized kinematic velocity, not full flight.
-Distillation uses two training seeds, PPO one. Real-image uncertainty rests on only seven videos; embedded latency is unmeasured.
+Distillation uses two training seeds, PPO and refinement one. Real-image uncertainty rests on only seven videos; embedded latency is unmeasured.
 
 
 #v(6pt)
