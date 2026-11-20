@@ -28,6 +28,7 @@ import torch
 import torch.nn.functional as F
 
 from visenc.distill import cosine_loss
+from visenc.evaluate import sample_name
 from visenc.models import Student, load_encoder, load_lingbot, save_backbone
 
 from .cli import emit, load_checkpoint, sha256
@@ -69,6 +70,14 @@ def goal_embedding(backbone, goals):
     return torch.cat((cls, patches.mean(1)), dim=-1)
 
 
+def frame_outcomes(logits, privileged):
+    """Per frame: target visible, peak patch on the target, P(in view) < 0.5 (bool [N] each)."""
+    _, visible, on_target = saliency_targets(privileged, *GRID)
+    hit = on_target.gather(1, logits[:, :-1].argmax(-1, keepdim=True)).squeeze(-1)
+    absent_ok = logits.softmax(-1)[:, -1] > 0.5
+    return visible, hit, absent_ok
+
+
 class Tally:
     """Running counts for the saliency metrics; one host read at the end."""
 
@@ -77,9 +86,7 @@ class Tally:
 
     @torch.no_grad()
     def add(self, logits, privileged, failed):
-        _, visible, on_target = saliency_targets(privileged, *GRID)
-        hit = on_target.gather(1, logits[:, :-1].argmax(-1, keepdim=True)).squeeze(-1)
-        absent_ok = logits.softmax(-1)[:, -1] > 0.5
+        visible, hit, absent_ok = frame_outcomes(logits, privileged)
         rows = torch.stack((visible, visible & hit, ~visible, ~visible & absent_ok,
                             visible & failed, visible & failed & hit, ~visible & failed,
                             ~visible & failed & absent_ok)).float().sum(-1)
@@ -307,13 +314,25 @@ def confusion_probe(args):
         del encoder
         for head, saliency in heads.items():
             tally = Tally(device)
+            frames, peaks, in_view = [], [], []
             with torch.no_grad():
                 for begin in range(0, len(test), 256):
                     ids = torch.arange(begin, min(begin + 256, len(test)), device=device)
                     goal = vectors[test_goal[ids]] if head == "global" else matches[test_goal[ids]]
                     _, logits = saliency(goal, cls[ids], tokens[ids])
-                    tally.add(logits, test.privileged[ids.cpu()].to(device), test.kind[ids.cpu()].to(device) > 0)
+                    privileged = test.privileged[ids.cpu()].to(device)
+                    tally.add(logits, privileged, test.kind[ids.cpu()].to(device) > 0)
+                    frames.append(torch.stack(frame_outcomes(logits, privileged), -1).cpu())
+                    peaks.append(logits[:, :-1].argmax(-1).cpu())
+                    in_view.append((1 - logits.softmax(-1)[:, -1]).cpu())
             results.setdefault(spec, {"dim": int(dim)})[head] = tally.result()
+            if args.samples is not None:
+                # Per held-out frame: [visible, peak on target, absent correct], the peak patch and
+                # P(in view). The goal index is the bootstrap cluster (one goal's frames correlate).
+                args.samples.mkdir(parents=True, exist_ok=True)
+                np.savez(args.samples / f"{sample_name(spec)}-{head}.npz", outcomes=torch.cat(frames).numpy(),
+                         peak=torch.cat(peaks).numpy(), in_view=torch.cat(in_view).numpy(),
+                         goal_index=test.goal_index.numpy(), kind=test.kind.numpy())
             print(json.dumps({spec: {head: results[spec][head]}}), flush=True)
         del cls, tokens, vectors, matches, heads
         torch.cuda.empty_cache()

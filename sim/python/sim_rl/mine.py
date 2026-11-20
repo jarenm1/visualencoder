@@ -1,17 +1,22 @@
-"""Mine perception failures of a frozen visual policy for encoder post-training.
+"""Mine flight frames for encoder evaluation and post-training.
 
-The policy flies fixed catalog goals (no oracle refresh). Every ``stride`` control steps each
-environment's observation is labelled from simulator ground truth:
+A frozen visual policy flies fixed catalog goals (no oracle refresh); it is only the camera
+operator that produces realistic drone viewpoints. Every ``stride`` control steps each
+environment's observation is stored with simulator ground truth: target box and visibility
+(privileged), per-patch object and depth labels, diagnostics and the catalog entry. Encoder
+failures are defined later by fresh probes on frozen features (``confusion-probe --samples``,
+``failures.py``), not by this policy. ``kind`` records the policy's own saliency outcome as
+metadata only:
 
-  normal       the policy's saliency agrees with ground truth (kept at ``normal_rate``)
+  normal       the policy's saliency agrees with ground truth
   wrong_peak   target visible, policy confident it is in view (P > 0.5), peak patch off the target
   false_view   target not visible, policy confident it is in view (it locked onto something else)
 
-Each split directory holds uint8 frames, privileged labels (box, visibility), diagnostics, the
-frame's catalog index, its kind and the policy's saliency summary, plus the goal-crop image of
-every catalog entry used (``goal_images`` indexed by ``goal_index``). Goals are stored as images,
-not embeddings, so an updated encoder re-encodes them. Mining is an offline boundary: host
-copies happen once per sampled step.
+``normal_rate`` < 1 keeps only that fraction of normal samples (the old policy-failure mining);
+encoder-centric mining keeps every sample (``--normal-rate 1``). Each split directory holds uint8
+frames, the labels above, the policy saliency summary, and the goal-crop image of every catalog
+entry used (``goal_images`` indexed by ``goal_index``), stored as images so an updated encoder
+re-encodes them. Mining is an offline boundary: host copies happen once per sampled step.
 """
 from __future__ import annotations
 
@@ -24,7 +29,8 @@ from .cli import (TEST_SEED, TEST_STYLE, TRAIN_STYLE, VALIDATION_SEED, VALIDATIO
                   emit, load_checkpoint, sha256, validate_checkpoint)
 from .curriculum import fixed_lanes
 from .features import checkpoint_features, crop_goals
-from .model import deterministic_action, saliency_targets
+from .memory import SpatialMemory, observe as observe_memory
+from .model import GOAL_COMMAND, deterministic_action, saliency_targets
 from .native import CudaEnv
 
 KINDS = ("normal", "wrong_peak", "false_view")
@@ -57,7 +63,7 @@ def mine_split(args, saved, features, split):
     out = args.out / split
     out.mkdir(parents=True, exist_ok=False)
     rows = {name: [] for name in ("images", "privileged", "diagnostics", "catalog", "kind", "in_view", "peak",
-                                  "step")}
+                                  "step", "patch_object", "patch_depth")}
     counts = {kind: 0 for kind in KINDS}
     sampled = 0
     with CudaEnv(args.library, args.num_envs, seed, metadata["width"], metadata["height"], style,
@@ -69,6 +75,9 @@ def mine_split(args, saved, features, split):
         env.write_curriculum(fixed_lanes(env.device, appearance=args.appearance))
         table = features.catalog_goals(env, args.appearance)
         generator = torch.Generator(device=env.device).manual_seed(seed)
+        spatial = (SpatialMemory(env.n, grid_h, grid_w, env.metadata["camera"], env.device)
+                   if policy.spatial else None)
+        goal_command = torch.full((env.n,), GOAL_COMMAND, dtype=torch.long, device=env.device)
         for round_index in range(args.rounds):
             env.reset(seed + round_index)
             hidden = torch.zeros((env.n, policy.hidden_size), device=env.device)
@@ -76,7 +85,10 @@ def mine_split(args, saved, features, split):
             for step in range(env.horizon * args.horizons):
                 cls, tokens = features.observe(env)
                 goal = table[env.catalog_index.long()].float()
-                inputs, logits = policy.actor_inputs_and_features(cls, tokens, goal, env.proprio, env.privileged)
+                memory = (observe_memory(policy, spatial, cls, tokens, goal, env.proprio, starts)
+                          if spatial is not None else None)
+                inputs, logits = policy.actor_inputs_and_features(cls, tokens, goal, env.proprio, env.privileged,
+                                                                  memory, goal_command)
                 if step % args.stride == args.stride - 1:
                     probs = logits.softmax(-1)
                     in_view = 1 - probs[:, -1]
@@ -99,6 +111,8 @@ def mine_split(args, saved, features, split):
                         rows["in_view"].append(in_view[ids].cpu())
                         rows["peak"].append(peak[ids].cpu())
                         rows["step"].append(torch.full((len(ids),), round_index * 10_000 + step))
+                        rows["patch_object"].append(env.patch_object[ids].cpu())
+                        rows["patch_depth"].append(env.patch_depth[ids].to(torch.float16).cpu())
                 mean, hidden = policy.step(inputs, hidden, starts)
                 env.step(deterministic_action(mean).contiguous())
                 starts.copy_(env.done)

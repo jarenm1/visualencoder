@@ -865,6 +865,8 @@ def parser():
     confusion.add_argument("--learning-rate", type=float, default=1e-3)
     confusion.add_argument("--seed", type=int, default=0)
     confusion.add_argument("--out", type=Path, required=True)
+    confusion.add_argument("--samples", type=Path,
+                           help="also save per-frame held-out outcomes per encoder and head (encoder gate)")
     confusion.set_defaults(func=confusion_probe_command)
 
     perception = commands.add_parser("perception", help="per-patch depth and class heads on frozen encoders")

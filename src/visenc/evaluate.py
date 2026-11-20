@@ -157,9 +157,12 @@ def evaluate_encoder(spec: str, split: Split, args, device: torch.device) -> dic
     sem_probe = Ridge(rows, sel(frac).reshape(-1, n_classes), device)
     del rows, p_fit
 
-    def score(view: str, idx: np.ndarray) -> tuple[dict, tuple[torch.Tensor, torch.Tensor]]:
+    samples: dict[str, np.ndarray] = {}
+
+    def score(view: str, idx: np.ndarray, prefix: str = "") -> tuple[dict, tuple[torch.Tensor, torch.Tensor]]:
         g, p = feats.extract(split.rgb[view], idx, {int(i): None for i in idx})
-        r = r2(state_probe(g), torch.from_numpy(state[idx]))
+        state_pred = state_probe(g).cpu()
+        r = r2(state_pred, torch.from_numpy(state[idx]))
         frac_t, logd_t = dense_targets(split, idx, n_classes)
         tok = torch.stack([p[int(i)] for i in idx])  # [n,P,D]
         pred_logd = torch.cat([depth_probe(t) for t in tok]).view(len(idx), -1).cpu()
@@ -174,6 +177,20 @@ def evaluate_encoder(spec: str, split: Split, args, device: torch.device) -> dic
             "depth_rmse_log": ((pred_d - true_d) ** 2).mean().sqrt().item(),
             "semantic_miou": miou(pred_cls, frac_t.argmax(-1), n_classes),
         }
+        if args.samples:
+            # Per-pose sufficient statistics, so paired bootstraps can recompute every metric.
+            gt_cls = frac_t.argmax(-1)
+            absrel = torch.where(valid, (pred_logd.exp() - logd_t.exp()).abs() / logd_t.exp(), 0.0)
+            classes = torch.arange(n_classes)
+            pc, gc = pred_cls[..., None] == classes, gt_cls[..., None] == classes   # [n,P,C]
+            samples.update({
+                f"{prefix}{view}/state_pred": state_pred.numpy(), f"{prefix}{view}/state_true": state[idx],
+                f"{prefix}{view}/depth_absrel_sum": absrel.sum(1).numpy(),
+                f"{prefix}{view}/depth_count": valid.sum(1).numpy(),
+                f"{prefix}{view}/class_intersection": (pc & gc).sum(1).numpy(),
+                f"{prefix}{view}/class_union": (pc | gc).sum(1).numpy(),
+                f"{prefix}{view}/class_support": gc.sum(1).numpy(),
+            })
         return out, (g, tok)
 
     result: dict = {"spec": spec, "probe_lambda": {"state": state_probe.lam, "depth": depth_probe.lam, "semantic": sem_probe.lam}}
@@ -184,7 +201,7 @@ def evaluate_encoder(spec: str, split: Split, args, device: torch.device) -> dic
         views_out[view], cache[view] = score(view, test_idx)
     result["views"] = views_out
     if len(region_idx):
-        result["region"] = {view: score(view, region_idx)[0] for view in split.views}
+        result["region"] = {view: score(view, region_idx, "region/")[0] for view in split.views}
 
     # Pair metrics: same pose, other appearance. Centre with the fit-view mean so the shared
     # mean direction does not inflate cosine.
@@ -202,6 +219,10 @@ def evaluate_encoder(spec: str, split: Split, args, device: torch.device) -> dic
             "global_cosine": sim.diagonal().mean().item(),
             "patch_cosine": F.cosine_similarity(ta.float() - p_mean, tb.float() - p_mean, dim=-1).mean().item(),
         }
+        if args.samples:
+            samples[f"pairs/{view}/retrieval_hit"] = (sim.argmax(1) == torch.arange(len(sim))).cpu().numpy()
+            samples[f"pairs/{view}/patch_cosine"] = F.cosine_similarity(
+                ta.float() - p_mean, tb.float() - p_mean, dim=-1).mean(1).cpu().numpy()
     result["pairs"] = pairs
 
     if args.real:
@@ -216,7 +237,16 @@ def evaluate_encoder(spec: str, split: Split, args, device: torch.device) -> dic
         half = k
         clf = Ridge(x[:half], y[:half], device)
         result["real_domain_accuracy"] = ((clf(x[half:]) > 0.5).float().cpu() == y[half:]).float().mean().item()
+    if args.samples:
+        Path(args.samples).mkdir(parents=True, exist_ok=True)
+        samples["test_index"] = test_idx
+        np.savez(Path(args.samples) / f"{sample_name(spec)}.npz", **samples)
     return result
+
+
+def sample_name(spec: str) -> str:
+    """File-safe name of an encoder spec (run:runs/mean -> run_runs_mean)."""
+    return "".join(c if c.isalnum() or c in "-." else "_" for c in spec)
 
 
 def view_group(view: str) -> str:
@@ -298,3 +328,4 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--real", help="folder of unlabelled real images for the domain-separability metric")
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--out", required=True, help="report directory")
+    p.add_argument("--samples", help="also save per-pose statistics per encoder here (encoder gate bootstraps)")
