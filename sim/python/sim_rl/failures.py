@@ -28,8 +28,11 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from visenc.evaluate import sample_name
+
+from .model import saliency_targets
 
 CONTEXT_RADIUS_M = 10.0
 VISIBLE = ("correct", "background", "other_class", "look_alike_appearance", "look_alike_context",
@@ -37,6 +40,9 @@ VISIBLE = ("correct", "background", "other_class", "look_alike_appearance", "loo
 ABSENT = ("correct", "false_background", "false_other_class", "false_look_alike_appearance",
           "false_look_alike_context", "false_look_alike_identical")
 TARGET_OBJECT = 27   # diagnostics lane: layout index of the episode's target object
+GRID = (15, 20)
+# Visible-target size buckets, in patches the target box covers.
+SIZE_BUCKETS = ((1, 4), (5, 12), (13, 30), (31, GRID[0] * GRID[1]))
 
 
 def neighbourhoods(objects, radius=CONTEXT_RADIUS_M):
@@ -95,14 +101,21 @@ def main():
     objects = json.loads(args.layout.read_text())["objects"]
     context = neighbourhoods(objects)
     report, labels = {"context_radius_m": CONTEXT_RADIUS_M, "head": args.head, "encoders": {}}, {}
+    _, _, on_target = saliency_targets(torch.from_numpy(np.load(args.split / "privileged.npy")).float(), *GRID)
+    size = on_target.sum(1).numpy()
     for spec in args.encoders:
         samples = np.load(args.samples / f"{sample_name(spec)}-{args.head}.npz")
         names, visible = classify(args.split, samples, objects, context)
         labels[spec] = names
+        correct = names == "correct"
         report["encoders"][spec] = {
             "visible_frames": int(visible.sum()), "absent_frames": int((~visible).sum()),
             "visible": {k: int(v) for k, v in Counter(names[visible]).items()},
             "absent": {k: int(v) for k, v in Counter(names[~visible]).items()},
+            "visible_correct_by_size": {
+                f"{low}-{high} patches": {"frames": int(n), "correct": float(correct[rows].mean()) if n else None}
+                for low, high in SIZE_BUCKETS
+                for rows in [visible & (size >= low) & (size <= high)] for n in [rows.sum()]},
         }
     if len(args.encoders) == 2:
         student, teacher = (labels[s] for s in args.encoders)

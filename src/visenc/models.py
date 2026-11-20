@@ -20,6 +20,24 @@ class Encoder(nn.Module):
         raise NotImplementedError
 
 
+class Upsampled(Encoder):
+    """Test-time resolution probe: the inner encoder sees the image upsampled ``factor``x (bilinear)
+    and its patch tokens are average-pooled back to the original 16 px grid, so every probe keeps
+    its grid while each token summarises 1/factor^2 of the original patch's pixels at full detail."""
+
+    def __init__(self, inner: Encoder, factor: int = 2):
+        super().__init__()
+        self.inner, self.factor, self.dim = inner, factor, inner.dim
+        self.autocast = getattr(inner, "autocast", True)
+
+    def forward(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        h, w = images.shape[-2] // PATCH, images.shape[-1] // PATCH
+        cls, patches = self.inner(F.interpolate(images, scale_factor=self.factor, mode="bilinear",
+                                                align_corners=False))
+        grid = patches.transpose(1, 2).reshape(len(patches), -1, h * self.factor, w * self.factor)
+        return cls, F.avg_pool2d(grid, self.factor).flatten(2).transpose(1, 2)
+
+
 class HFViT(Encoder):
     """DINOv3-style HF ViT. Token layout: [CLS, registers..., patches] after the final norm."""
 
@@ -110,6 +128,7 @@ def load_encoder(spec: str) -> Encoder:
     lingbot-random:<variant> same LingBot architecture, random init
     run:<dir>               distilled student saved by `visenc distill`
     fp16:<spec>             any spec above run purely in float16 (FP16 TensorRT stand-in)
+    up2:<spec>              any spec above on 2x upsampled input, tokens pooled back to the 16 px grid
     int8:<deploy dir>       simulated-INT8 model written by `visenc deploy`
     """
     kind, _, arg = spec.partition(":")
@@ -129,6 +148,8 @@ def load_encoder(spec: str) -> Encoder:
         from .deploy import FP16
 
         return FP16(load_encoder(arg))
+    if kind == "up2":
+        return Upsampled(load_encoder(arg), 2)
     if kind == "int8":
         from .deploy import load_int8
 

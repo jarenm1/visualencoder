@@ -864,7 +864,9 @@ def parser():
     refine.add_argument("--mined", type=Path, required=True, help="mined split directory with patch_object.npy")
     refine.add_argument("--teacher", default="lingbot:large")
     refine.add_argument("--real", type=Path, default=ROOT / "data/uavid/train_rgb.npy")
-    refine.add_argument("--sim", type=Path, default=ROOT / "data/train-v2/rgb_random1.npy")
+    refine.add_argument("--sim-views", type=Path, nargs="+",
+                        default=[ROOT / "data/train-v2/rgb_random1.npy", ROOT / "data/train-v2/rgb_random2.npy"],
+                        help="appearance views of the same simulator poses; their teacher-mean is the anchor target")
     refine.add_argument("--train-blocks", type=int, default=4)
     refine.add_argument("--steps", type=int, default=3000)
     refine.add_argument("--pairs", type=int, default=16, help="same-flight frame pairs per step (2x frames)")

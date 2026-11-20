@@ -98,6 +98,17 @@ def sample_patches(labels, rng):
             torch.tensor(objects, device=device))
 
 
+def view_batch(views, count, rng, device):
+    """`count` poses from uint8 [N,H,W,3] view arrays of the same poses, scene-major
+    [p0v0, p0v1, p1v0, ...] float [count*V,3,H,W]; all views of a pose share one flip."""
+    ids = np.sort(rng.choice(len(views[0]), count, replace=False))
+    flip = torch.from_numpy(rng.random(count) < 0.5).to(device)
+    images = torch.stack([torch.from_numpy(np.ascontiguousarray(view[ids])) for view in views], 1)
+    images = images.to(device).permute(0, 1, 4, 2, 3).float().div_(255)
+    images = torch.where(flip[:, None, None, None, None], images.flip(-1), images)
+    return images.flatten(0, 1)
+
+
 def supcon(features, labels, temperature):
     """Supervised contrastive loss (Khosla et al., 2020) over anchors that have a positive."""
     z = F.normalize(features.float(), dim=-1)
@@ -136,7 +147,10 @@ def refine(args):
     teacher = load_encoder(args.teacher).to(device).eval().requires_grad_(False)
 
     flights = Flights(args.mined)
-    real, sim = image_array(args.real), image_array(args.sim)
+    real = image_array(args.real)
+    sim_views = [image_array(path) for path in args.sim_views]
+    if len({len(view) for view in sim_views}) != 1:
+        raise ValueError("--sim-views must be views of the same poses (equal lengths)")
     backbone_params = [p for module in trainable for p in module.parameters()]
     optimizer = torch.optim.AdamW([{"params": backbone_params, "lr": args.lr, "weight_decay": 0.05},
                                    {"params": list(projector.parameters()), "lr": args.head_lr, "weight_decay": 1e-4}])
@@ -150,11 +164,18 @@ def refine(args):
             group["lr"] = lr * warm * (0.1 + 0.9 * decay)
         frames, labels = flights.batch(flights.sample_pairs(args.pairs, rng), device)
         anchors_real = anchor_batch(real, args.real_batch, rng, device)
-        anchors_sim = anchor_batch(sim, args.sim_batch, rng, device)
+        anchors_sim = view_batch(sim_views, args.sim_batch, rng, device)
         images = torch.cat((frames, anchors_real, anchors_sim))
         with torch.autocast("cuda", dtype=torch.bfloat16):
             with torch.no_grad():
                 t_cls, t_patch = teacher(images)
+                # Simulator anchors keep the original distillation's target: the teacher features
+                # averaged over a pose's appearance views (one representation per physical state).
+                t_cls, t_patch = F.normalize(t_cls.float(), dim=-1), F.normalize(t_patch.float(), dim=-1)
+                v, start = len(sim_views), len(frames) + len(anchors_real)
+                t_cls[start:] = t_cls[start:].unflatten(0, (-1, v)).mean(1, keepdim=True).expand(-1, v, -1).flatten(0, 1)
+                t_patch[start:] = (t_patch[start:].unflatten(0, (-1, v)).mean(1, keepdim=True)
+                                   .expand(-1, v, -1, -1).flatten(0, 1))
             cls, tokens = backbone(images)
             s_cls, s_patch = student.cls_head(cls), student.patch_head(tokens)
         cls_gap = 1 - F.cosine_similarity(s_cls.float(), t_cls.float(), dim=-1)            # [B]
