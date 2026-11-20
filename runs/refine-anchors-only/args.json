@@ -1,0 +1,23 @@
+{
+  "command": "refine",
+  "base": "/home/jaren/visualencoder/runs/mean",
+  "mined": "runs/mined-drone13-train4/train",
+  "teacher": "lingbot:large",
+  "real": "/home/jaren/visualencoder/data/uavid/train_rgb.npy",
+  "sim": "/home/jaren/visualencoder/data/train-v2/rgb_random1.npy",
+  "train_blocks": 4,
+  "steps": 3000,
+  "pairs": 16,
+  "real_batch": 16,
+  "sim_batch": 8,
+  "real_weight": 2.0,
+  "hard_weight": 0.0,
+  "contrast_weight": 0.0,
+  "temperature": 0.1,
+  "lr": 2e-05,
+  "head_lr": 0.0003,
+  "warmup": 200,
+  "seed": 0,
+  "out": "runs/refine-anchors-only",
+  "func": "<function refine_command at 0x7ffeb9f21da0>"
+}
