@@ -26,8 +26,8 @@
   For goal-object search, how the goal is matched against frame patches matters more than the encoder: patch-level
   matching lifts every frozen encoder and closes the apparent student-over-teacher advantage.
   An encoder gate with paired intervals rejects fine-tuning on mined flight failures that lowers real car precision;
-  refining instead with real and paired-view anchors raises UAVid car AP from 0.604 to 0.749 with no simulator loss,
-  while the small-object failures it was mined for remain.
+  refining instead with real and paired-view anchors raises UAVid car AP from 0.604 to 0.749 with no simulator readout
+  falling outside its non-inferiority margin, while the small-object failures it was mined for remain.
 ]
 
 = Introduction
@@ -148,10 +148,10 @@ DINOv3-L on segmentation.
     [*Model*], [*Sim→real mIoU* ↑], [*Car AUROC* ↑], [*Car AP* ↑], [*Real→real mIoU*], [*Gap*],
     table.hline(stroke: 0.5pt),
     [LingBot ViT-S (off the shelf)], [0.492], [0.892], [0.640], [0.650], [0.158],
-    [LingBot ViT-L (teacher)], [0.561], [0.891], [*0.727*], [0.712], [0.151],
+    [LingBot ViT-L (teacher)], [0.561], [0.891], [0.727], [0.712], [0.151],
     [DINOv3 ViT-L], [*0.574*], [0.849], [—], [*0.736*], [0.162],
     table.hline(stroke: 0.5pt),
-    [Standard distillation (ours)], [0.539], [*0.909*], [0.649], [0.632], [0.093],
+    [Standard distillation (ours)], [0.539], [0.909], [0.649], [0.632], [0.093],
     [Paired-view consistency (ours)], [0.525], [0.905], [0.622], [0.615], [0.090],
     [+ refinement (ours, @sec-refine)], [0.537], [*0.944*], [*0.749*], [0.649], [0.112],
     table.hline(),
@@ -227,14 +227,16 @@ INT8 preserves the original student's probe scores closely, but Jetson latency i
 Simulation-only consistency gives no clear real-image gain; adding unlabelled real RGB improves readout quality
 and car AP without increasing AUROC. A gate that judges every refinement on held-out simulator, flight-failure and real
 suites rejected fine-tuning through the task head (it lowered real car precision) and showed that refinement with real
-and paired-view anchors improves real car detection and segmentation without simulator loss; the flight failures,
+and paired-view anchors improves real car detection and segmentation within all simulator non-inferiority margins; the flight failures,
 mostly small objects and same-class look-alikes that the teacher also misses, remain open.
 GPU control trains within an hour, but actual city navigation remains
 challenging; these results do not establish an encoder-ranking advantage. The objectives must be evaluated independently.
 
 *Limitations.* Three training cities and two held-out layouts share one stylised asset library, with a fixed
-compute budget. City navigation uses a goal-facing camera and stabilized kinematic velocity, not full flight.
-Distillation uses two training seeds, PPO and refinement one. Real-image uncertainty rests on only seven videos; embedded latency is unmeasured.
+compute budget. The earlier city-waypoint experiment uses a goal-facing camera and stabilized kinematic control;
+the later image-goal pilot uses a different task, so their success rates are not directly comparable. Neither validates
+flight on real hardware. Distillation uses two training seeds, PPO and refinement one. Real-image uncertainty rests
+on only seven videos; embedded latency is unmeasured.
 
 
 #v(6pt)

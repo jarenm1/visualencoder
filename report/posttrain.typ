@@ -1,8 +1,8 @@
 == Pilot post-training
 The commander (Gemma) decides and the pilot (the policy) flies, so the pilot must be reliable at a fixed
 interface: an image goal (an instance crop, or a type reference), an optional location hint, and the
-explore command. Task v5 aligns the task with that interface, and a post-training stage trains on the
-pilot's verified failures.
+explore command. Task v5 aligns the task with that interface and tests whether replaying verified failures
+improves the pilot.
 
 *Search, reach, hold.* Distance progress toward a target the pilot has never seen is unobservable to it,
 so before the first sighting the reward pays newly observed surface instead. After the sighting it pays
@@ -14,7 +14,7 @@ The last replaces the old braking term, which paid for slow flight in the band e
 radius, so it learns to use hints without trusting them over its camera.
 
 *Look-alike steps.* A goal step where the saliency believes the target is in view but its peak patch
-shows another object of the target's class is an encoder error, not a flight error. Such steps are
+shows another object of the target's class is a goal-matcher confusion, not direct evidence of a flight error. Such steps are
 logged per catalog entry and given zero weight in the policy and value losses, while the supervised
 saliency loss keeps training the matcher on them.
 
@@ -26,9 +26,15 @@ the start clearance test, but no flight leaves them, and most were labelled "hid
 evaluation included them. The catalogue now rejects enclosed starts (all of nine probe rays blocked
 within 25 m), leaving 99.7% of test and 99.3% of training episodes solvable.
 
-*Replay and the hard set.* During post-training, half the environments start their next episode from a
-solvable catalog entry drawn in proportion to the pilot's own failure rate there (prioritized level
-replay). The other half keep the curriculum. A held-out hard set fixes 256 solvable test episodes per
-cohort: standard, hidden, far, hidden and far, coarse hint, wrong hint, look-alike nearby, and category
-goals. Category goals start from another same-type object's reference, and success remains the actual
-instance.
+*Replay and the hard set.* In the first post-training run, half the environments start from solvable
+catalogue entries sampled by the pilot's own failure rate; the other half keep the curriculum. The held-out
+hard set fixes 256 solvable test episodes per cohort: standard without a hint, standard with a precise hint,
+hidden, far, hidden and far, coarse hint, wrong hint, look-alike nearby, and category goals. Category goals
+start from another same-type object's reference, and success remains the actual instance.
+
+*Does the refined encoder improve flight?* On the same hard set, the original pilot (`drone13`, paired student)
+and the warm-started refined pilot (`drone15`, @sec-refine) score 28/256 vs 24/256 on standard no-hint goals,
+and 16/256 vs 23/256 with precise hints. No-hint collisions rise from 80/256 to 116/256.
+Hidden-and-far goals score 0/256 for both. This is a single-seed system comparison, not an encoder ablation:
+the refined run also used separately fit perception heads with half as many training frames and a different
+training budget. The encoder's UAVid gains did not translate into a demonstrated navigation gain.
