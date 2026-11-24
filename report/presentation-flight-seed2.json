@@ -1,0 +1,182 @@
+{
+  "mean": {
+    "checkpoint": "runs/presentation-retrain-seed2/policy-mean/best.pt",
+    "checkpoint_sha256": "b8bd40629f9aa6d517e0318adb553dbd5a5d575e29a35e4e8834c2dc0e7246f0",
+    "training_steps": 2000896,
+    "seed": 2,
+    "goal_refresh_steps": 30,
+    "cohorts": {
+      "category": {
+        "episodes": 256,
+        "successes": 7,
+        "collisions": 167,
+        "success_wilson95": [
+          0.013307156355121155,
+          0.05535570792246043
+        ]
+      },
+      "coarse_hint": {
+        "episodes": 256,
+        "successes": 9,
+        "collisions": 159,
+        "success_wilson95": [
+          0.018604096092635542,
+          0.0654527704282918
+        ]
+      },
+      "far": {
+        "episodes": 256,
+        "successes": 0,
+        "collisions": 122,
+        "success_wilson95": [
+          0,
+          0.01478385642587143
+        ]
+      },
+      "hidden": {
+        "episodes": 256,
+        "successes": 0,
+        "collisions": 142,
+        "success_wilson95": [
+          0,
+          0.01478385642587143
+        ]
+      },
+      "hidden_far": {
+        "episodes": 256,
+        "successes": 0,
+        "collisions": 115,
+        "success_wilson95": [
+          0,
+          0.01478385642587143
+        ]
+      },
+      "look_alike": {
+        "episodes": 256,
+        "successes": 2,
+        "collisions": 127,
+        "success_wilson95": [
+          0.002145090367681419,
+          0.028032768301535768
+        ]
+      },
+      "standard_no_hint": {
+        "episodes": 256,
+        "successes": 4,
+        "collisions": 143,
+        "success_wilson95": [
+          0.006092598203366294,
+          0.039479262709196654
+        ]
+      },
+      "standard_precise": {
+        "episodes": 256,
+        "successes": 3,
+        "collisions": 160,
+        "success_wilson95": [
+          0.003993287123007758,
+          0.033881572667882304
+        ]
+      },
+      "wrong_hint": {
+        "episodes": 256,
+        "successes": 9,
+        "collisions": 163,
+        "success_wilson95": [
+          0.018604096092635542,
+          0.0654527704282918
+        ]
+      }
+    }
+  },
+  "refined": {
+    "checkpoint": "runs/presentation-retrain-seed2/policy-refined/best.pt",
+    "checkpoint_sha256": "59b65397a403f4d3638950d13d10ad6bc5a0368d4f2fbbbbac7b428851b9fdfe",
+    "training_steps": 2000896,
+    "seed": 2,
+    "goal_refresh_steps": 30,
+    "cohorts": {
+      "category": {
+        "episodes": 256,
+        "successes": 7,
+        "collisions": 137,
+        "success_wilson95": [
+          0.013307156355121155,
+          0.05535570792246043
+        ]
+      },
+      "coarse_hint": {
+        "episodes": 256,
+        "successes": 9,
+        "collisions": 142,
+        "success_wilson95": [
+          0.018604096092635542,
+          0.0654527704282918
+        ]
+      },
+      "far": {
+        "episodes": 256,
+        "successes": 2,
+        "collisions": 108,
+        "success_wilson95": [
+          0.002145090367681419,
+          0.028032768301535768
+        ]
+      },
+      "hidden": {
+        "episodes": 256,
+        "successes": 0,
+        "collisions": 117,
+        "success_wilson95": [
+          0,
+          0.01478385642587143
+        ]
+      },
+      "hidden_far": {
+        "episodes": 256,
+        "successes": 0,
+        "collisions": 117,
+        "success_wilson95": [
+          0,
+          0.01478385642587143
+        ]
+      },
+      "look_alike": {
+        "episodes": 256,
+        "successes": 4,
+        "collisions": 131,
+        "success_wilson95": [
+          0.006092598203366294,
+          0.039479262709196654
+        ]
+      },
+      "standard_no_hint": {
+        "episodes": 256,
+        "successes": 5,
+        "collisions": 140,
+        "success_wilson95": [
+          0.008370729784579391,
+          0.04489813224965644
+        ]
+      },
+      "standard_precise": {
+        "episodes": 256,
+        "successes": 9,
+        "collisions": 150,
+        "success_wilson95": [
+          0.018604096092635542,
+          0.0654527704282918
+        ]
+      },
+      "wrong_hint": {
+        "episodes": 256,
+        "successes": 9,
+        "collisions": 136,
+        "success_wilson95": [
+          0.018604096092635542,
+          0.0654527704282918
+        ]
+      }
+    }
+  }
+}

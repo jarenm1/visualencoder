@@ -283,12 +283,26 @@ on a real drone’s camera?]
 )
 
 #pagebreak()
-#title([03 · IMPLEMENTATION · FLIGHT EVAL], [Test on flights the pilot hasn’t seen])
-#strip("figures/city-cameras.png", 149pt, 1280 / 530)
-#v(10pt)
-#secondary[Held-out starts: hidden goals, look-alikes, and misleading or missing hints.]
-#v(14pt)
-#card([EARLIER PILOTS · SIMULATOR ONLY], [No hint: 28/256 reached the goal with the original encoder, 24/256 with the refined encoder. Different policy runs; not an encoder-only comparison.])
+#title([03 · IMPLEMENTATION · FLIGHT EVAL], [Better visual transfer did not fix flight])
+#strip("figures/city-cameras.png", 104pt, 1280 / 530)
+#v(13pt)
+#let flight = json("presentation-flight-seed2.json")
+#let count(arm, cohort, metric) = {
+  let row = flight.at(arm).cohorts.at(cohort)
+  str(row.at(metric)) + " / " + str(row.episodes)
+}
+#table(
+  columns: (2fr, 1fr, 1fr),
+  align: (left, right, right),
+  inset: (x: 11pt, y: 7pt),
+  stroke: (top: none, right: none, bottom: 0.65pt + rule, left: none),
+  table.header([*Held-out simulator flights*], [*Original encoder*], [*Refined encoder*]),
+  [No hint · success], count("mean", "standard_no_hint", "successes"), count("refined", "standard_no_hint", "successes"),
+  [No hint · collision], count("mean", "standard_no_hint", "collisions"), count("refined", "standard_no_hint", "collisions"),
+  [Hidden and far · success], count("mean", "hidden_far", "successes"), count("refined", "hidden_far", "successes"),
+)
+#v(12pt)
+#secondary(size: 16pt)[Same PPO budget and warm start. One seed. Simulator-assisted goal-crop refresh still enabled.]
 
 #pagebreak()
 #title([04 · IMPLICATIONS], [Flight gives us harder camera views])

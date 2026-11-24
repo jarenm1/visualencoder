@@ -48,7 +48,7 @@
 
 ### Implications · 5:35–6:30
 
-- **20 · 5:35.** Held-out flight changes starting difficulty and hint accuracy. In the earlier runs, both pilots went 0/256 on hidden-and-far goals; neither was reliable. These runs differed in more than the encoder. “No hint” removes the location hint, not the simulator-assisted crop refresh.
+- **20 · 5:35.** “Better real-image scores didn’t fix the pilot. With matched training budgets, the two policies reached the goal in only four and five of 256 no-hint episodes. Both collided in over half, and neither solved a hidden-and-far episode.” No hint removes the location hint, not the simulator-assisted crop refresh.
 - **21 · 5:51.** Play roughly 20 seconds of the reel. These are selected successes with location hints, not a random sample. Left is a re-render of saved camera poses; right is the original external view.
 - **22 · 6:14.** Trace the three uses. “One encoder gives geometry in simulation, useful car scores on real video, and a visual input to a simulated pilot. Transfer of a readout doesn’t imply transfer of a controller.” Close with better temporal association and hardware latency as next tests.
 
@@ -63,11 +63,11 @@ The patch PCA, saliency, memory and rollout stills come from `replay-drone11-tra
 - **Why AP rather than only AUROC?** Car patches are sparse (8.6% of eligible patches). AP makes false positives near the top of the ranking more visible. The interval reflects the seven available validation videos, not training-seed uncertainty. Both seeds were evaluated on those same videos.
 - **Did refinement pass the full gate?** No. Both seeds improved real-image readouts without a clear gain in the patch goal-matching score. The fresh seed also missed the guardrails for held-out-region depth and global goal matching. This is a transfer result for specific readouts, not a claim that every feature improved.
 - **Why not just use the teacher?** The student is about 14× smaller by parameter count. The result is about feature quality at that size; latency on the embedded target was not measured.
-- **Is the demo representative?** No. It shows selected successes from earlier policies. On the later no-hint hard set, collisions rose from 80/256 to 116/256; both policies went 0/256 on hidden-and-far goals. The two runs also differed in perception-head data and training setup, so this does not isolate the encoder’s effect on flight.
+- **Is the demo representative?** No. It shows selected successes from earlier policies. In the matched retrain, the no-hint collision counts were 143/256 and 140/256. The real-image AP result and the simulated flight outcomes measure different things.
 
 ## Retraining comparison (not in the timed talk)
 
 Run `nix develop --command bash scripts/retrain_presentation.sh` from the repo root. The seed-2 run writes to `runs/presentation-retrain-seed2/`; use a new output path as the script’s first argument for a rerun. To start PPO after both sets of heads are ready and before either policy has saved a best checkpoint, pass `--policy-only` before the output path.
 
 - See the [seed-2 gate verdict](presentation-retrain-seed2.json) for all sim, real-image, and offline goal-matching checks. These are new checkpoints on the same held-out data, not a new test split.
-- Compare `policy-mean/hard-set.json` and `policy-refined/hard-set.json` for no-hint success and collisions. Both start from the same policy checkpoint, train for 2M additional steps with fresh heads fit on the same frames, and use the same held-out episode cohorts. This compares the frozen encoders with their own perception heads under one PPO recipe; it is not evidence of real-world flight.
+- See the [matched seed-2 flight outcomes](presentation-flight-seed2.json) for all nine 256-episode cohorts. The policies start from the same checkpoint, train for 2,000,896 additional steps with fresh heads fit on the same frames, and face the same held-out episode cohorts. This compares frozen encoders with their own perception heads under one PPO recipe. The one-success difference on the no-hint hard set is not evidence that refinement improved flight.
