@@ -336,3 +336,20 @@ on a real drone’s camera?]
 )
 #v(26pt)
 #secondary[Next: test whether memory helps across frames and measure latency on real hardware.]
+
+#pagebreak()
+#title([APPENDIX · WAYPOINT EXPERIMENT], [Give the pilot a waypoint, not an image])
+#align(center, box(inset: 13pt, radius: 6pt, fill: tint,
+  text(20pt, weight: "bold")[Location command + estimated obstacle depth → PPO pilot]))
+#v(18pt)
+#table(
+  columns: (2fr, 1fr, 1fr),
+  align: (left, right, right),
+  inset: (x: 11pt, y: 9pt),
+  stroke: (top: none, right: none, bottom: 0.65pt + rule, left: none),
+  table.header([*Held-out simulator flights*], [*Straight-line pursuit*], [*Waypoint PPO*]),
+  [Reach and hold], [22 / 256], [*151 / 256*],
+  [Collision], [204 / 256], [*74 / 256*],
+)
+#v(15pt)
+#secondary[Same location hints and 8–30 m starts. One seed; not a test of object search or real flight.]

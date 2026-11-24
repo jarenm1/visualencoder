@@ -1,6 +1,6 @@
 # Presentation guide — Visual encoders for sim-to-real transfer
 
-**22 visual slides.** The full recording runs about 6:30. If the cap is five minutes, use the short cut below and keep the rest for questions. The encoder is the main result; use the policy to show where those features help and where they fail.
+**22 main slides plus a waypoint-results appendix.** The full recording runs about 6:30. If the cap is five minutes, use the short cut below and keep the rest for questions. The encoder is the main result; use the policy to show where those features help and where they fail.
 
 | Rubric question | Slides | One answer to land |
 |---|---|---|
@@ -71,3 +71,9 @@ Run `nix develop --command bash scripts/retrain_presentation.sh` from the repo r
 
 - See the [seed-2 gate verdict](presentation-retrain-seed2.json) for all sim, real-image, and offline goal-matching checks. These are new checkpoints on the same held-out data, not a new test split.
 - See the [matched seed-2 flight outcomes](presentation-flight-seed2.json) for all nine 256-episode cohorts. The policies start from the same checkpoint, train for 2,000,896 additional steps with fresh heads fit on the same frames, and face the same held-out episode cohorts. This compares frozen encoders with their own perception heads under one PPO recipe. The one-success difference on the no-hint hard set is not evidence that refinement improved flight.
+
+## Optional slide 23 · Waypoint experiment
+
+Use this instead of the reel if you want to end the policy section with the new experiment. “We took object recognition out of the pilot’s goal. With the same noisy location command, waypoint PPO with estimated depth succeeded on 151/256 simulator episodes, versus 22/256 for straight-line pursuit.”
+
+The [test output](../runs/waypoint-depth-seed2/final-test.json) covers 8–30 m starts and simulator-supplied hints with 1–5 m uncertainty; no goal image or crop refresh. Validation selected the checkpoint at 253,952 steps from a 1,003,520-step run. This is a single-seed comparison of two controllers, not an encoder ablation or a head-to-head comparison with slide 20’s no-hint image-goal task.
