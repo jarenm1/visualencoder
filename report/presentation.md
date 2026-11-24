@@ -1,48 +1,60 @@
 # Presentation guide — Visual encoders for sim-to-real transfer
 
-**Five-minute recording, 12 slides.** Tell the story in four parts. Use the cues below to practice; don’t read them into the mic.
+**22 visual slides.** The full recording runs about 6:30. If the cap is five minutes, use the short cut below and keep the rest for questions. The encoder is the main result; use the policy to show where those features help and where they fail.
 
 | Rubric question | Slides | One answer to land |
 |---|---|---|
 | What was the problem? | 1–2 | Vision learned in simulation may not transfer to real cameras. Appearance is one part of that gap we can isolate and measure. |
-| What’s the solution? | 3–4 | Transfer the visual representation: a 22M-parameter encoder produces global and spatial features that perception heads and a pilot can use. |
-| How did you solve it? | 5–10 | Average teacher features across aligned simulator looks, test against standard distillation, then add unlabeled real images and measure transfer separately. |
-| What are the implications? | 11–12 | A compact encoder can supply visual information for physical AI. We measured transfer on real images, not autonomous flight on real hardware. |
+| What’s the solution? | 3–5 | A 22M-parameter encoder gives a global summary and spatial tokens. Frozen patch features support different readouts without retraining the encoder for every task. |
+| How did you solve it? | 6–19 | Pair teacher targets across aligned looks, refine on unlabeled UAVid RGB, then use frozen features in PPO. Flown frames with simulator labels become new evaluation examples. |
+| What are the implications? | 20–22 | The real-image readout transferred. Simulated navigation is a separate, harder test; it does not establish autonomy on hardware. |
 
 ## Before you start
 
-- Open the [slides](../runs/presentation/slides.pdf) full-screen. Cue the silent [flight reel](../runs/presentation/pilot-demo-textured.mp4) for slide 11. Capture the whole display or splice in the MP4; a capture limited to the PDF window won’t show the player.
+- Open the [slides](../runs/presentation/slides.pdf) full-screen. Cue the silent [flight reel](../runs/presentation/pilot-demo-textured.mp4) for slide 21. Capture the whole display or splice in the MP4.
 - Make a 15-second audio test in the same recorder. Play it back with headphones: listen for clipping, fan noise, and dropped words. Then do one timed take and trim the reel before speeding up the method or the results.
-- For a three-minute cut, use slides 1, 3, 5–6, 8, 10 and 12. Skip the reel or splice in a short excerpt. No live server or model needs to run.
+- **Five-minute cut:** Show slides 1–5, 7, 9–10, 12–13, 15, 17–20, and 22. Aim to reach slide 12 by 2:25 and slide 18 by 4:00. Skip the reel or run 8 seconds over the closing narration. The full deck also works offline.
 - Keep the [report](report.pdf) and [supplement](supplement.pdf) available for questions. To rebuild from the repo root: `nix develop --command typst compile --root . report/slides.typ runs/presentation/slides.pdf` (create the output directory first if needed).
 
 ## On-camera cues
 
-### Problem · 0:00–0:38
+### Problem and solution · 0:00–1:18
 
-- **1 · 0:00.** Open with sim-to-real: “Simulation gives us data we can label and control. The problem is that what a drone learns to see there may not carry over to a real camera. Can we transfer the visual features instead?”
-- **2 · 0:18.** Point to the same roof across the renders. We isolate one piece of the gap: change appearance, keep geometry and pose fixed. We test on real imagery separately.
+- **1 · 0:00.** “Simulation gives us data we can control and label. The trouble is that what a drone learns to see there doesn’t necessarily carry over to a real camera.”
+- **2 · 0:15.** Point to the same roof across the renders: appearance changes; geometry and camera pose don’t. This isolates one part of the gap.
+- **3 · 0:30.** Follow 320×240 RGB → 16×16 patches → twelve transformer blocks. The contribution is the training recipe, not a new ViT.
+- **4 · 0:48.** Point at one cell. The grid is 15×20, and each cell stores a 384-dimensional vector. Attention mixes whole-image context; it’s not a bag of isolated tiles. The right panel shows a three-component PCA projection, not segmentation. The CLS token is the global summary.
+- **5 · 1:03.** Point out that near and far surfaces, and classes such as building and vegetation, are read from the same frozen vectors. Separate heads turn features into named quantities; individual token channels don’t have fixed names. This is a qualitative probe example, not an accuracy figure.
 
-### Solution · 0:38–1:27
+### Train and evaluate the encoder · 1:18–3:18
 
-- **3 · 0:38.** Focus on the encoder, not the flight policy. Follow the arrows: 320×240 RGB → 16×16 patches → twelve transformer blocks → normalized features. The architecture already exists; the contribution is the training recipe.
-- **4 · 1:08.** One 384-dimensional global token summarizes the frame; 300 local tokens retain spatial detail for depth, segmentation, and goal matching. This is the visual information a physical AI system can use; the encoder itself doesn’t choose actions.
+- **6 · 1:18.** The student has two training-only linear heads, one for CLS and one shared across patches. They align 384-dimensional features with the frozen teacher's 1024-dimensional targets by cosine loss.
+- **7 · 1:33.** Trace the separate and converging arrows. Both students see the same rendered looks and crops. Only the teacher target changes: average normalized teacher features at the same position.
+- **8 · 1:54.** Freeze the encoders. Fit simple readouts on canonical views, test other looks. Retrieval uses no fitted probe: return the same pose as the nearest feature match.
+- **9 · 2:08.** Point to standard versus paired-view distillation: retrieval 0.747 → 0.951, depth error 0.242 → 0.201. DINOv3-L still leads on segmentation.
+- **10 · 2:26.** Keep paired simulator anchors. Match the teacher on unlabeled UAVid training frames. Update the last four blocks and final LayerNorm.
+- **11 · 2:41.** Point to a car location in the held-out UAVid example. Both heads were fit on sim; the color scale is identical. The scores rank car patches, not calibrated probabilities or precise boxes.
+- **12 · 2:56.** Point to zero. Fresh-seed UAVid AP rose 0.550 → 0.734, echoing 0.604 → 0.749 on the earlier seed and same videos. Sim retrieval stayed roughly flat. Neither seed showed a clear gain on the patch goal probe.
 
-### Implementation · 1:27–3:50
+### The RL policy and data loop · 3:18–5:35
 
-- **5 · 1:27.** Point to the frozen teacher and the trainable student. The two linear heads match the student’s 384-dimensional CLS and patch features to the teacher’s 1024-dimensional space for cosine loss. None of that runs at inference.
-- **6 · 1:52.** Trace separate arrows, then converging arrows. Same images, different targets: average the teacher’s normalized features from the two aligned looks. Shared cropping keeps patches aligned.
-- **7 · 2:18.** Freeze the encoders. Fit linear probes on canonical renders and test on shifted looks. Retrieval asks whether the same pose is the nearest match under a different look, with no trained probe.
-- **8 · 2:40.** Point to the last two rows: retrieval 0.747 → 0.951; depth error 0.242 → 0.201. Don’t read the table. DINOv3-L still leads on segmentation.
-- **9 · 3:04.** Transition: “But robustness in simulation didn’t guarantee transfer.” Keep the paired simulator target, add unlabeled UAVid RGB, and update the last four blocks and final LayerNorm.
-- **10 · 3:25.** Point to the zero line. In the fresh seed, simulator retrieval stayed near 0.96 and held-out UAVid car-patch AP rose from 0.550 to 0.734. The earlier seed also improved (0.604 to 0.749). Neither seed showed a clear gain in goal matching. The last row tests frozen features, not whether the drone reached the goal.
+- **13 · 3:18.** Follow the reference crop to the live frame to the heatmap. A shared 64-dimensional learned projection supports soft-max cosine matching against goal patches. Localization has 300 patch scores plus a not-in-view option. The example is a recorded policy frame, not a post-hoc attention map.
+- **14 · 3:36.** Predicted depth projects matched patches into top-down memory. A separate channel tracks where the camera looked. The crop is centered on the drone, forward up, and aligned using dead-reckoned motion. Unlike the GRU’s hidden state, this memory has spatial coordinates.
+- **15 · 3:55.** The visual actor combines pooled features and goal evidence, spatial memory, a coarse obstacle-depth grid, onboard state and optional location hint, plus goal/explore command. The 256-unit GRU outputs four velocity/yaw commands. The critic sees privileged simulator state only during training.
+- **16 · 4:14.** Explain reward shaping: search for new surfaces, then make distance progress, then face and hold near the target. The goal is not to touch the object. Explore mode rewards coverage instead of reaching an object.
+- **17 · 4:31.** Roll out concurrently, use generalized advantage estimation, and fit a clipped PPO actor plus value loss. An auxiliary box/visibility loss trains the matcher; when the look-alike mask is enabled, same-class mismatches skip policy and value loss but still train the matcher. The visual encoder stays frozen.
+- **18 · 4:51.** Distinguish controlled pairs for distillation, labeled exploratory sim frames for perception heads, and policy-flown episodes for mining. The fixed-crop replay saved 6,144 labeled frames each from training and test districts, sampling every 25 steps and keeping normal cases too. Those data fed fresh probes; the showcased encoder refinement used sim plus real anchors, not the mined failures.
+- **19 · 5:14.** Show the wrong peak and false-view example. A fresh probe on frozen features tests whether the visual representation supports the right answer, separately from whether a pilot can execute a maneuver.
 
-### Implications · 3:50–5:00
+### Implications · 5:35–6:30
 
-- **11 · 3:50.** Explain what the reel shows, then play it (~27 seconds). These are selected successes with location hints. Left: Poly Haven re-render of the saved camera poses. Right: original external view. The first clip is held out; the second is from a training district. Flight frames also provide harder views for a fresh probe on frozen features.
-- **12 · 4:36.** Trace the branches: “The same frozen patch features let us read out depth and semantics, transfer a sim-trained car readout to real video, and feed a goal-conditioned pilot in simulation. The real-video result is for the car readout, not the pilot. Next I’d test whether memory helps across frames and measure latency on hardware.” Stop by 5:00.
+- **20 · 5:35.** Held-out flight changes starting difficulty and hint accuracy. In the earlier runs, both pilots went 0/256 on hidden-and-far goals; neither was reliable. These runs differed in more than the encoder. “No hint” removes the location hint, not the simulator-assisted crop refresh.
+- **21 · 5:51.** Play roughly 20 seconds of the reel. These are selected successes with location hints, not a random sample. Left is a re-render of saved camera poses; right is the original external view.
+- **22 · 6:14.** Trace the three uses. “One encoder gives geometry in simulation, useful car scores on real video, and a visual input to a simulated pilot. Transfer of a readout doesn’t imply transfer of a controller.” Close with better temporal association and hardware latency as next tests.
 
 The [original reel](../runs/presentation/pilot-demo.mp4) shows the policy’s actual input. To regenerate the textured visuals without changing benchmark renders: `nix develop --command .venv/bin/python scripts/render_presentation.py --figure report/figures/textured-flight.png --video --ffmpeg /path/to/ffmpeg` (requires `drawtext` and `libx264`).
+
+The patch PCA, saliency, memory and rollout stills come from `replay-drone11-train101`, episode 15, a selected v4 success in a training district. The saliency overlay is relative within the frame; the separate in-view estimate at 8 s was 0.824. The reward description is the newer v5 recipe, not a label on each v4 screenshot.
 
 ## Likely questions
 

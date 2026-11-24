@@ -29,6 +29,14 @@
   #body
 ]
 
+#let panels(path, labels, width: slide-width) = {
+  image(path, width: width)
+  v(6pt)
+  grid(columns: labels.map(_ => width / labels.len()), ..labels.map(label => secondary(label, size: 15pt)))
+}
+
+#let three(..items) = grid(columns: (1fr, 1fr, 1fr), gutter: 14pt, ..items.pos())
+
 #let refinement-plot() = {
   let checks = json("presentation-retrain-seed2.json").checks
   let rows = (
@@ -91,28 +99,32 @@ on a real drone’s camera?]
 #secondary[22M parameters. Downstream tasks use the student’s features, not the teacher.]
 
 #pagebreak()
-#title([02 · SOLUTION], [Features a drone can use])
-#v(28pt)
-#grid(columns: (1fr, 1fr), gutter: 16pt,
-  card([1 CLS TOKEN], [A whole-frame feature for pose and retrieval.], highlighted: true),
-  card([300 PATCH TOKENS], [Local features for depth, segmentation, and goal matching.]),
-)
-#v(25pt)
-#secondary[The encoder supplies visual features. Task heads and the pilot decide how to use them.]
+#title([02 · SOLUTION], [A patch token knows more than its pixels])
+#panels("figures/patch-pca.png", ([Onboard RGB · 16 × 16 pixel cells], [Same frame · token PCA, not class colors]), width: 740pt)
+#v(12pt)
+#secondary[Each grid cell has 384 features that can use context from the entire image. The CLS token summarizes the frame.]
+
+#pagebreak()
+#title([02 · SOLUTION], [Read geometry and semantics from patches])
+#panels("figures/patch-readouts.png", ([Held-out simulator RGB], [Predicted depth · warm is near], [Predicted classes]))
+#v(16pt)
+#secondary[The encoder stays frozen. Separate linear heads predict distance and class from each patch token.]
 
 #pagebreak()
 #title([03 · IMPLEMENTATION], [Learn features from a frozen teacher])
-#v(22pt)
-#grid(columns: (1fr, 1fr), gutter: 16pt,
-  card([FROZEN TEACHER], [LingBot ViT-L/16 produces 1024-dimensional target features.]),
-  card([TRAINABLE STUDENT], [Two linear heads project 384 → 1024: one for CLS, one shared across patches.], highlighted: true),
+#image("figures/paired-training-views.png", width: 370pt)
+#v(10pt)
+#grid(columns: (1fr, 1fr), gutter: 14pt,
+  card([FROZEN LINGBOT-L], [1,024-dimensional teacher features.]),
+  card([TRAINABLE LINGBOT-S], [384-dimensional features + a projection for each token type.], highlighted: true),
 )
-#v(25pt)
+#v(12pt)
 #text(23pt, weight: "bold")[Cosine loss on the global token and corresponding patches.]
 
 #pagebreak()
 #title([03 · IMPLEMENTATION], [What changes: the teacher target])
-#v(18pt)
+#image("figures/paired-training-views.png", width: 400pt)
+#v(10pt)
 #grid(columns: (1fr, 1fr), gutter: 16pt,
   card([STANDARD DISTILLATION], [
     #grid(columns: (1fr, auto, 1fr), column-gutter: 9pt, row-gutter: 14pt,
@@ -133,10 +145,14 @@ on a real drone’s camera?]
 
 #pagebreak()
 #title([03 · IMPLEMENTATION], [What do the frozen features retain?])
-#v(28pt)
-#card([LINEAR PROBES], [Fit on canonical renders. Read out pose, depth, and segmentation under shifted looks.])
-#v(18pt)
-#card([RETRIEVAL], [Given one view, find the same pose under a different look. No fitted probe.], highlighted: true)
+#strip("figures/geometry.png", 129pt, 1600 / 530)
+#v(9pt)
+#secondary[Canonical views across city layouts. Probe fitting and testing use separate poses.]
+#v(16pt)
+#grid(columns: (1fr, 1fr), gutter: 16pt,
+  card([LINEAR PROBES], [Fit on canonical renders. Test pose, depth, and labels under shifted looks.]),
+  card([RETRIEVAL], [Find the same pose under a different look. No fitted probe.], highlighted: true),
+)
 
 #pagebreak()
 #title([03 · IMPLEMENTATION · SIMULATOR RESULTS], [Paired targets improve robustness])
@@ -159,13 +175,18 @@ on a real drone’s camera?]
 
 #pagebreak()
 #title([03 · IMPLEMENTATION], [Add unlabeled real training images])
-#v(26pt)
-#grid(columns: (1fr, 1fr), gutter: 16pt,
-  card([SIMULATOR], [Keep the paired teacher target.]),
-  card([UAVID TRAINING RGB], [Match the teacher on each unlabeled real frame.], highlighted: true),
+#grid(columns: (2fr, 1fr), gutter: 0pt,
+  panels("figures/paired-training-views.png", ([Sim look A], [Sim look B]), width: 544pt),
+  panels("figures/uavid-training-view.png", ([Unlabeled UAVid RGB],), width: 272pt),
 )
-#v(25pt)
-#secondary[Update the last four blocks and final LayerNorm. Test on separate videos.]
+#v(17pt)
+#secondary[Keep the paired simulator target. On each real frame, match the frozen teacher. Update only the last four blocks and final normalization.]
+
+#pagebreak()
+#title([03 · IMPLEMENTATION], [A simulator-trained readout sees real cars])
+#panels("figures/real-car-readout.png", ([Held-out UAVid RGB], [Car scores · original], [Car scores · refined]))
+#v(14pt)
+#secondary[Same color scale. Brighter patches rank higher for cars. Scores are not probabilities.]
 
 #pagebreak()
 #title([03 · IMPLEMENTATION · EVALUATION], [Refinement helped most on real images])
@@ -174,6 +195,100 @@ on a real drone’s camera?]
 #refinement-plot()
 #v(12pt)
 #secondary(size: 15pt)[Bars: paired 95% bootstrap intervals within this seed. Goal matching is a probe, not flight success.]
+
+#pagebreak()
+#title([03 · IMPLEMENTATION · PILOT], [Find the goal in the current view])
+#panels("figures/pilot-match.png", ([Reference crop], [Policy camera], [Match scores if in view]))
+#v(16pt)
+#secondary[Orange marks stronger relative matches. A separate output estimates whether the target is in view at all.]
+
+#pagebreak()
+#title([03 · IMPLEMENTATION · PILOT], [Remember where the camera looked])
+#panels("figures/pilot-memory.png", ([0 s], [4 s], [8 s]), width: 745pt)
+#v(16pt)
+#secondary[Teal: looked-at space. Amber: goal evidence. The arrow is the drone, pointing forward.]
+
+#pagebreak()
+#title([03 · IMPLEMENTATION · PILOT], [The actor does not get the answer])
+#grid(columns: (1fr, auto, 1fr, auto, 1fr), gutter: 10pt, align: horizon,
+  card([OBSERVE], [Patch matches, depth, map, sensors, optional hint and command.]),
+  text(24pt, fill: accent)[→],
+  card([ACTOR], [256-unit GRU carries state from frame to frame.], highlighted: true),
+  text(24pt, fill: accent)[→],
+  card([ACT], [Forward, right and up velocity. Yaw rate.]),
+)
+#v(16pt)
+#card([TRAINING ONLY], [A separate critic estimates returns from privileged simulator state. The actor runs without it.])
+#v(13pt)
+#secondary[The image encoder stays frozen. At 30 Hz, a low-level controller executes the actor’s commands.]
+
+#pagebreak()
+#title([03 · IMPLEMENTATION · PILOT], [Search, approach, then hold])
+#panels("figures/pilot-rollout.png", ([0 s], [4 s], [11.5 s · successful hold]), width: 745pt)
+#v(10pt)
+#three(
+  card([SEARCH], [Reward new visible surface before finding the target.]),
+  card([APPROACH], [Reward distance progress once the target is found.]),
+  card([HOLD], [Face the target from nearby. Avoid crashes and leaving bounds.]),
+)
+#v(8pt)
+#secondary(size: 15pt)[Selected earlier visual-policy flight, not reward phase boundaries.]
+
+#pagebreak()
+#title([03 · IMPLEMENTATION · PILOT], [PPO learns from its own flights])
+#three(
+  card([1 · COLLECT], [32 parallel sim environments × 64 steps. Save actions, rewards and outcomes.]),
+  card([2 · COMPARE], [Estimate whether actions did better or worse than the critic expected.]),
+  card([3 · UPDATE], [Four PPO epochs. Clip the action-probability ratio in the objective; fit the critic and matcher.], highlighted: true),
+)
+#v(15pt)
+#grid(columns: (190pt, 1fr), gutter: 18pt, align: horizon,
+  image("figures/pilot-transition.png", width: 190pt),
+  [
+    #kicker[ONE TRANSITION · RECORDED EARLIER PILOT]
+    #v(6pt)
+    Camera at 5.5 s → action (+0.96, +0.08, −0.63, −0.21)
+    #v(5pt)
+    #secondary[Normalized forward, right, up, yaw rate. Reward +0.115. Episode continues.]
+  ],
+)
+#v(22pt)
+#secondary[Then collect fresh flights with the updated policy. The image encoder stays frozen throughout.]
+
+#pagebreak()
+#title([03 · IMPLEMENTATION · DATA LOOP], [Flights produce new vision examples])
+#panels("figures/pilot-data-streams.png", ([Distillation RGB], [Simulator class labels], [Mined flight RGB]), width: 590pt)
+#v(11pt)
+#three(
+  card([1 · RENDER], [Paired looks train the encoder. Simulator depth and classes train separate readouts.]),
+  card([2 · FLY], [Freeze the encoder. Fit the pilot in sim, then fly it with fixed goal crops for mining.]),
+  card([3 · LABEL], [Save RGB, goal crop, target box or absence, depth, and object IDs.], highlighted: true),
+)
+#v(11pt)
+#text(20pt, weight: "bold")[Mined frames → fresh probes on held-out districts]
+#v(7pt)
+#secondary(size: 16pt)[Mined frames diagnose errors. The refinement shown here used sim and real anchors.]
+
+#pagebreak()
+#title([03 · IMPLEMENTATION · DATA LOOP], [A confident match can be wrong])
+#grid(columns: (292pt, 1fr), gutter: 26pt,
+  panels("figures/pilot-mined.png", ([Goal crop], [Recorded view]), width: 288pt),
+  [
+    #card([WHERE THE MODEL LOOKED], [Magenta: peak-scoring patch. Yellow: simulator target box, if visible.])
+    #v(14pt)
+    #card([WHAT THE LABELS REVEAL], [Top: wrong patch. Middle: false alarm when the goal is absent. Bottom: correct match.], highlighted: true)
+    #v(15pt)
+    #secondary[Examples, not error rates.]
+  ],
+)
+
+#pagebreak()
+#title([03 · IMPLEMENTATION · FLIGHT EVAL], [Test on flights the pilot hasn’t seen])
+#strip("figures/city-cameras.png", 149pt, 1280 / 530)
+#v(10pt)
+#secondary[Held-out starts: hidden goals, look-alikes, and misleading or missing hints.]
+#v(14pt)
+#card([EARLIER PILOTS · SIMULATOR ONLY], [No hint: 28/256 reached the goal with the original encoder, 24/256 with the refined encoder. Different policy runs; not an encoder-only comparison.])
 
 #pagebreak()
 #title([04 · IMPLICATIONS], [Flight gives us harder camera views])
