@@ -30,7 +30,7 @@
 ]
 
 #let refinement-plot() = {
-  let checks = json("../reports/gate/presentation-retrain-seed2.json").checks
+  let checks = json("presentation-retrain-seed2.json").checks
   let rows = (
     ([Simulation], [Shifted-look retrieval\@1], checks.at("sim/retrieval_at_1")),
     ([Real imagery · UAVid], [Car-patch average precision], checks.at("real/sim_to_real_vehicle_ap")),

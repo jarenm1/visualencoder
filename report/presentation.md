@@ -57,5 +57,5 @@ The [original reel](../runs/presentation/pilot-demo.mp4) shows the policy’s ac
 
 Run `nix develop --command bash scripts/retrain_presentation.sh` from the repo root. The seed-2 run writes to `runs/presentation-retrain-seed2/`; use a new output path as the script’s first argument for a rerun. To start PPO after both sets of heads are ready and before either policy has saved a best checkpoint, pass `--policy-only` before the output path.
 
-- See the [seed-2 gate verdict](../reports/gate/presentation-retrain-seed2.json) for all sim, real-image, and offline goal-matching checks. These are new checkpoints on the same held-out data, not a new test split.
+- See the [seed-2 gate verdict](presentation-retrain-seed2.json) for all sim, real-image, and offline goal-matching checks. These are new checkpoints on the same held-out data, not a new test split.
 - Compare `policy-mean/hard-set.json` and `policy-refined/hard-set.json` for no-hint success and collisions. Both start from the same policy checkpoint, train for 2M additional steps with fresh heads fit on the same frames, and use the same held-out episode cohorts. This compares the frozen encoders with their own perception heads under one PPO recipe; it is not evidence of real-world flight.
