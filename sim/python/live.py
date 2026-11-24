@@ -6,6 +6,9 @@ the scored target (the city object it frames; boxes framing none are rejected). 
 edge and a 100 m ceiling end a flight), success is reported without ending the flight and there
 is no timeout; a crash restarts in a fresh held-out episode with its catalog goal.
 
+With a waypoint checkpoint, a grounded box instead selects a simulator object for a numeric
+location command. The PPO actor receives that command and estimated obstacle depth, not a crop.
+
     nix develop path:sim --command .venv/bin/python sim/python/live.py \
         --checkpoint runs/drone5-mean-seed0/best.pt [--gemma]
     open http://127.0.0.1:8790/
@@ -41,7 +44,7 @@ from sim_rl.features import checkpoint_features, crop_goals, square_goal_box  # 
 from sim_rl.memory import CELL, GRID, SpatialMemory, observe as observe_memory  # noqa: E402
 from sim_rl.model import EXPLORE_COMMAND, GOAL_COMMAND, deterministic_action  # noqa: E402
 from sim_rl.native import CudaEnv  # noqa: E402
-from sim_rl.perception import CLASSES  # noqa: E402
+from sim_rl.perception import CLASSES, patch_rays  # noqa: E402
 from sim_rl.tracks import CLASS_THRESHOLD, ObjectTracks  # noqa: E402
 
 PAGE = ROOT / "sim/live"
@@ -66,10 +69,14 @@ class Pilot:
     def __init__(self, args):
         saved = load_checkpoint(args.checkpoint)
         meta = saved["metadata"]
-        self.checkpoint = {"path": str(args.checkpoint), "steps": meta["steps"], "live_goal_refresh": False}
+        self.waypoint = meta["policy_mode"] == "waypoint"
+        self.checkpoint = {"path": str(args.checkpoint), "steps": meta["steps"], "live_goal_refresh": False,
+                           "waypoint": self.waypoint}
         self.device = torch.device("cuda:0")
         self.features = checkpoint_features(meta, self.device)
-        self.env = CudaEnv(DEFAULT_LIBRARY, 1, args.seed, meta["width"], meta["height"], TEST_STYLE, meta["control_mode"])
+        start = tuple(meta["start_distance"]) if self.waypoint else None
+        self.env = CudaEnv(DEFAULT_LIBRARY, 1, args.seed, meta["width"], meta["height"], TEST_STYLE,
+                           meta["control_mode"], start_distance=start)
         self.hz, self.appearance = args.hz, args.appearance
         layout = json.loads((self.env.city_path / "layout.json").read_text())
         targets = [i for i, o in enumerate(layout["objects"]) if o["class"] in TARGET_CLASSES]
@@ -109,6 +116,9 @@ class Pilot:
         with self.env.execution():
             validate_checkpoint(saved, self.env, self.features)
             self.policy = build_policy(self.env, self.features, saved)
+            if self.waypoint:
+                self.grid = (self.env.height // 16, self.env.width // 16)
+                self.rays = patch_rays(*self.grid, self.env.metadata["camera"], self.device)
             self.policy.eval()
             self.hidden = torch.zeros((1, self.policy.hidden_size), device=self.device)
             self.starts = torch.ones(1, device=self.device)
@@ -121,18 +131,32 @@ class Pilot:
             self.lanes = fixed_lanes(self.device, appearance=args.appearance)
             self.env.write_curriculum(self.lanes)
             self.env.set_free_flight(True)
-            self.new_episode(int.from_bytes(os.urandom(7), "little"))
+            self.new_episode(args.seed if self.waypoint else int.from_bytes(os.urandom(7), "little"))
 
     # --- episode and goal management (simulator thread only) -------------------------------
     def new_episode(self, seed):
         self.env.reset(seed)
         self.starts.fill_(1)   # fresh recurrent state, memory map and car tracks
         self.agent = None
+        if self.waypoint:
+            self.clear_waypoint()
+            self.last_outcome = None
+            return
         self.command.fill_(GOAL_COMMAND)
         self.catalog_goal()
 
+    def clear_waypoint(self):
+        self.hidden.zero_()
+        self.goal_revision += 1
+        self.goal_started = time.monotonic()
+        self.goal_info = {"source": "waiting for an instruction", "box": None,
+                          "revision": self.goal_revision, "distance_at_selection_m": None}
+
     def catalog_goal(self):
         """Goal = the current episode's catalog goal crop (what the drone was asked to find)."""
+        if self.waypoint:
+            self.clear_waypoint()
+            return
         self.env.render_goals(int(self.env.catalog_index[0]))
         crop = crop_goals(self.env.goal_views[:1], self.env.goal_crops[:1])
         self.set_goal(crop, "catalog goal")
@@ -159,8 +183,6 @@ class Pilot:
         """Crop the current frame at a normalized box and retarget to the city object it frames.
         A box that frames no city object is rejected: keeping the old target would give the policy
         GPS to one object and an image of another."""
-        square = square_goal_box(torch.tensor([box], device=self.device))
-        crop = crop_goals(self.env.obs.clone(), square)
         diagnostics = self.env.diagnostics.cpu().numpy().astype(float)
         eye, forward, up = start_camera(diagnostics, self.env.metadata)
         camera = self.env.metadata["camera"]
@@ -171,10 +193,27 @@ class Pilot:
             raise RuntimeError(f"{source}: box frames no city object (best IoU {overlap[best]:.2f} < {MATCH_IOU})")
         same = (int(self.command[0]) == GOAL_COMMAND and self.goal_info.get("source") != "explore"
                 and int(diagnostics[0, 27]) == int(self.objects["index"][best]))
+        if not self.waypoint:
+            square = square_goal_box(torch.tensor([box], device=self.device))
+            crop = crop_goals(self.env.obs.clone(), square)
         row = [*self.objects["center"][best], float(self.objects["index"][best]), *self.objects["half"][best],
                float(self.env.layout_classes.index(self.objects["class"][best]))]
         self.retarget = torch.tensor([row], device=self.device, dtype=torch.float32)
         self.env.retarget(self.retarget)
+        if self.waypoint:
+            self.hidden.zero_()
+            self.starts.fill_(1)
+            self.last_outcome = None
+            self.goal_revision += 1
+            self.waypoint_steps = 0
+            self.goal_started = time.monotonic()
+            diagnostics = self.env.diagnostics[0].cpu().numpy()
+            distance = float(np.linalg.norm(np.maximum(np.abs(diagnostics[:3] - diagnostics[3:6])
+                                                       - diagnostics[24:27], 0)))
+            self.goal_info = {"source": f"{source}: {self.objects['asset'][best]}", "box": box,
+                              "revision": self.goal_revision, "match_iou": round(float(overlap[best]), 3),
+                              "distance_at_selection_m": round(distance, 2)}
+            return
         self.set_goal(crop, f"{source}: {self.objects['asset'][best]}", box=box, match_iou=round(float(overlap[best]), 3),
                       fresh=not same)
 
@@ -183,6 +222,9 @@ class Pilot:
         over the memory; otherwise Gemma boxes the instructed object in the current frame once."""
         if self.gemma is None:
             raise RuntimeError("start live.py with --gemma to use text instructions")
+        if self.waypoint:
+            self.clear_waypoint()
+            self.last_outcome = None
         if self.spatial is not None:
             self.agent = Agent(text, self.gemma, self.policy.commands > 1)
             return
@@ -260,6 +302,9 @@ class Pilot:
     # --- control loop -------------------------------------------------------------------------
     @torch.no_grad()
     def tick(self):
+        if self.waypoint:
+            self.tick_waypoint()
+            return
         cls, tokens = self.features.observe(self.env)
         if self.paused:
             # The memory integrates motion, so it only advances while flying.
@@ -296,6 +341,34 @@ class Pilot:
         elif self.agent is not None and self.agent.due(self.steps, outcome == "success"):
             self.think(outcome == "success")
 
+    @torch.no_grad()
+    def tick_waypoint(self):
+        frame = jpeg(self.env.obs[0])
+        privileged = self.env.privileged[0].cpu().numpy()
+        diagnostics = self.env.diagnostics[0].cpu().numpy()
+        action, outcome = None, None
+        active = self.goal_info["box"] is not None and self.last_outcome is None
+        if active and not self.paused:
+            _, tokens = self.features.observe(self.env)
+            obstacles = self.policy.waypoint_obstacles(tokens, self.env.proprio, self.rays, self.grid)
+            inputs = self.policy.actor_inputs(None, None, None, self.env.proprio, None, obstacles=obstacles)
+            mean, self.hidden = self.policy.step(inputs, self.hidden, self.starts)
+            command = deterministic_action(mean).contiguous()
+            self.env.step(command)
+            self.steps += 1
+            self.waypoint_steps += 1
+            self.starts.copy_(self.env.done)
+            action = command[0].tolist()
+            if bool(self.env.success[0]):
+                outcome = "success"
+            elif bool(self.env.done[0]):
+                outcome = "collision" if bool(self.env.collision[0]) else "left the city"
+            elif self.waypoint_steps >= self.env.horizon:
+                outcome = "timeout"
+        self.publish(frame, privileged, diagnostics, None, None, outcome, action)
+        if outcome in ("collision", "left the city"):
+            self.clear_waypoint()
+
     def remember(self, cls, tokens):
         """Spatial-memory tick; the map image for the viewer is refreshed every MEMORY_IMAGE_EVERY ticks.
         Its placement on the overhead map uses the simulator pose at the memory's reset (display only)."""
@@ -331,10 +404,10 @@ class Pilot:
         forward = np.array([2 * (q[0] * q[2] + q[3] * q[1]), 0.0, 1 - 2 * (q[0] ** 2 + q[1] ** 2)]) * -1
         visible = bool(privileged[14] > 0.5)
         rows, columns = self.env.height // 16, self.env.width // 16
-        px = 2 * (peak % columns + 0.5) / columns - 1
-        py = 1 - 2 * (peak // columns + 0.5) / rows
+        px = 2 * (peak % columns + 0.5) / columns - 1 if peak is not None else 0
+        py = 1 - 2 * (peak // columns + 0.5) / rows if peak is not None else 0
         x0, y0, x1, y1 = privileged[25:29]
-        on_target = bool(x0 <= px <= x1 and y0 <= py <= y1) if visible and in_view > 0.5 else None
+        on_target = bool(x0 <= px <= x1 and y0 <= py <= y1) if visible and in_view is not None and in_view > 0.5 else None
         with self.lock:
             self.frame, self.frame_id = frame, self.frame_id + 1
             if outcome is not None:
@@ -350,8 +423,8 @@ class Pilot:
                 "distance_m": round(distance, 2), "speed_mps": round(float(np.linalg.norm(diagnostics[10:13])), 2),
                 "altitude_m": round(float(p[1]), 2), "hold": round(float(privileged[24]), 2),
                 "clock_s": round(float(diagnostics[17]) / self.env.control_hz, 1),
-                "saliency": {"peak": peak, "in_view": round(in_view, 3),
-                             "grid": [rows, columns], "on_target": on_target},
+                "saliency": None if peak is None else {"peak": peak, "in_view": round(in_view, 3),
+                                                        "grid": [rows, columns], "on_target": on_target},
                 "action": None if action is None else [round(a, 2) for a in action],
                 "goal": {**self.goal_info, "age_s": round(time.monotonic() - self.goal_started, 1)},
                 "checkpoint": self.checkpoint, "last_outcome": self.last_outcome,

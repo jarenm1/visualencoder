@@ -42,8 +42,8 @@ function drawOverlay() {
   const w = overlay.width, h = overlay.height;
   ctx.clearRect(0, 0, w, h);
   if (state) {
-    const [rows, columns] = state.saliency.grid;
-    if (state.saliency.in_view > 0.5) {
+    if (state.saliency?.in_view > 0.5) {
+      const [rows, columns] = state.saliency.grid;
       const peak = state.saliency.peak;
       ctx.strokeStyle = "rgba(255,70,70,0.95)";
       ctx.lineWidth = 2;
@@ -53,7 +53,7 @@ function drawOverlay() {
       ctx.fillText("policy", Math.min(w - 42, (peak % columns) * w / columns),
                    Math.max(12, Math.floor(peak / columns) * h / rows - 4));
     }
-    if (state.target.visible) {
+    if (state.target.visible && (!state.checkpoint.waypoint || state.goal.box)) {
       const [bx0, by0, bx1, by1] = state.target.box;
       ctx.strokeStyle = "rgba(255,255,255,0.9)";
       ctx.lineWidth = 1.5;
@@ -116,13 +116,15 @@ function drawMap() {
   }
   drawMemory(px, pz, s);
   const t = state.target;
-  mapCtx.strokeStyle = "#e6e6e6";
-  mapCtx.lineWidth = 1.5;
-  mapCtx.strokeRect(px(t.center[0] - t.half[0]), pz(t.center[2] - t.half[2]), 2 * t.half[0] * s, 2 * t.half[2] * s);
-  mapCtx.strokeStyle = "rgba(230,230,230,0.25)";
-  mapCtx.beginPath();
-  mapCtx.arc(px(t.center[0]), pz(t.center[2]), (Math.max(t.half[0], t.half[2]) + 6) * s, 0, 2 * Math.PI);
-  mapCtx.stroke();
+  if (!state.checkpoint.waypoint || state.goal.box) {
+    mapCtx.strokeStyle = "#e6e6e6";
+    mapCtx.lineWidth = 1.5;
+    mapCtx.strokeRect(px(t.center[0] - t.half[0]), pz(t.center[2] - t.half[2]), 2 * t.half[0] * s, 2 * t.half[2] * s);
+    mapCtx.strokeStyle = "rgba(230,230,230,0.25)";
+    mapCtx.beginPath();
+    mapCtx.arc(px(t.center[0]), pz(t.center[2]), (Math.max(t.half[0], t.half[2]) + 6) * s, 0, 2 * Math.PI);
+    mapCtx.stroke();
+  }
   // Trail: only the flight since the last teleport (crash restart).
   trail.push([x, z]);
   if (trail.length > 900) trail.shift();
@@ -154,7 +156,14 @@ async function poll() {
     $("pause-icon").setAttribute("d", state.paused ? "M4 2.5v11L13 8z" : "M4 2.5h3v11H4zM9 2.5h3v11H9z");
     $("instruct").hidden = !state.gemma;
     const goal = state.goal || {};
-    if (goal.revision !== goalRevision) {
+    const waypoint = state.checkpoint.waypoint;
+    const selected = goal.distance_at_selection_m != null;
+    $("goal").hidden = waypoint;
+    $("catalog").setAttribute("aria-label", waypoint ? "Clear waypoint" : "Back to the episode's own goal");
+    $("legend-crop").hidden = waypoint;
+    $("legend-patch").hidden = waypoint;
+    $("legend-waypoint").hidden = !waypoint;
+    if (!waypoint && goal.revision !== goalRevision) {
       goalRevision = goal.revision;
       $("goal").src = `/goal.jpg?${goalRevision}`;
     }
@@ -165,23 +174,30 @@ async function poll() {
     $("goal").title = goal.source || "";
     const target = state.target, prediction = state.saliency;
     const match = goal.match_iou == null ? "catalog reference" : `box match IoU ${goal.match_iou.toFixed(2)}`;
-    $("goal-detail").textContent = `Goal: ${goal.source} · ${match} · crop age ${goal.age_s.toFixed(1)} s`;
+    $("goal-detail").textContent = waypoint ? `Waypoint: ${goal.source}` :
+      `Goal: ${goal.source} · ${match} · crop age ${goal.age_s.toFixed(1)} s`;
     const dimensions = target.half.map((v) => (2 * v).toFixed(1)).join(" × ");
     const visibility = target.visible ? "anchor visible" : target.in_frustum ? "anchor occluded" : "anchor outside view";
     $("target-detail").textContent = `Simulator GT: ` +
       `${target.asset} #${target.object_index} · ${target.class} · ${dimensions} m · ${visibility}`;
-    const agreement = prediction.on_target == null ? "not comparable" : prediction.on_target ? "on GT box" : "OFF GT box";
-    $("perception-detail").textContent = `Policy: P(target in view) ${Math.round(prediction.in_view * 100)}% · ` +
-      `predicted patch ${agreement} (patch-in-box check, not object identity)`;
-    const distance =
-      `distance to box ${state.distance_m.toFixed(1)} m (selected at ${goal.distance_at_selection_m.toFixed(1)} m)`;
+    $("target-detail").hidden = waypoint && !selected;
+    if (prediction) {
+      const agreement = prediction.on_target == null ? "not comparable" : prediction.on_target ? "on GT box" : "OFF GT box";
+      $("perception-detail").textContent = `Policy: P(target in view) ${Math.round(prediction.in_view * 100)}% · ` +
+        `predicted patch ${agreement} (patch-in-box check, not object identity)`;
+    } else {
+      $("perception-detail").textContent = "Gemma grounds the object; simulator geometry supplies the waypoint.";
+    }
+    const distance = selected ?
+      `distance to box ${state.distance_m.toFixed(1)} m (selected at ${goal.distance_at_selection_m.toFixed(1)} m)` :
+      "No active waypoint";
     $("status").textContent = (state.error ? `${state.error} · ` : "") +
       `${distance} · ${state.speed_mps.toFixed(1)} m/s · alt ${state.altitude_m.toFixed(1)} m` +
       ` · hold ${state.hold >= 1 ? "complete" : `${Math.round(state.hold * 100)}%`}` +
       (state.last_outcome ? ` · last outcome: ${state.last_outcome}` : "");
     const checkpoint = state.checkpoint;
     $("checkpoint-detail").textContent = `${(checkpoint.steps / 1e6).toFixed(2)}M checkpoint · ` +
-      `fixed live goal (no automatic refresh) · ${checkpoint.path}`;
+      `${waypoint ? "waypoint PPO · no goal crop" : "fixed live goal (no automatic refresh)"} · ${checkpoint.path}`;
     $("checkpoint-detail").textContent += " · training success = first 3 s hold within 6 m, ≤1 m/s, facing" +
       (state.memory ? " · map: amber = goal evidence, blue = looked at (spatial memory)" : "");
     const agent = state.agent;

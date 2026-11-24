@@ -12,6 +12,7 @@ from live import Pilot
 class LiveDiagnosticsTest(unittest.TestCase):
     def pilot(self):
         pilot = Pilot.__new__(Pilot)
+        pilot.waypoint = False
         d = torch.zeros(1, 28)
         d[0, 9], d[0, 27] = 1, 7
         d[0, 24:27] = torch.tensor([2., 10., 2.])

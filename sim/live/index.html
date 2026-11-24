@@ -27,8 +27,10 @@
     </div>
     <div class="legend">
       <span class="truth-key">White: simulator ground truth</span>
-      <span class="policy-key">Red: policy's predicted patch</span>
-      <span>Thumbnail: actual goal crop · Blue on map: drone</span>
+      <span id="legend-patch" class="policy-key">Red: policy's predicted patch</span>
+      <span id="legend-crop">Thumbnail: actual goal crop</span>
+      <span id="legend-waypoint" hidden>Waypoint mode: no goal crop</span>
+      <span>Blue on map: drone</span>
     </div>
     <section class="diagnostics" aria-label="Target diagnostics">
       <div id="goal-detail"></div>

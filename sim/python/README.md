@@ -276,6 +276,21 @@ held-out starts and location hints. The latter is a proportional pursuit baselin
 this is not a comparison against an image-goal policy given less information. The GPS-denied
 branch tests missing-command behavior, not autonomous search.
 
+To demo language control with the waypoint checkpoint:
+
+```sh
+nix develop path:sim --command .venv/bin/python sim/python/live.py \
+  --checkpoint runs/waypoint-depth-seed2/best.pt --gemma --gemma-4bit \
+  --adapter runs/gemma-tune/lora-sum --seed 2 --port 8791
+```
+
+Open `http://127.0.0.1:8791/` and type **Fly to the blue car on the right.** The scene waits for
+an instruction. Gemma boxes the named object in the current camera frame; the simulator matches
+the box to a city object and supplies its location hint. The trained pilot uses that numeric
+command and predicted depth, never an image of the selected object. A failed grounding leaves the
+pilot idle. This mode approaches visible objects; it does not search for unseen objects or infer
+their 3D location from the camera alone.
+
 ### Solvability verifier (`train.py verify`, `sim_rl/verifier.py`)
 
 Hard-case post-training samples what the pilot fails, so impossible episodes must be excluded first. A privileged-state policy would not work as the verifier: it sees the target but not the obstacles.
