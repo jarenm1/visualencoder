@@ -40,7 +40,7 @@
 ### Implications · 3:50–5:00
 
 - **11 · 3:50.** Explain what the reel shows, then play it (~27 seconds). These are selected successes with location hints. Left: Poly Haven re-render of the saved camera poses. Right: original external view. The first clip is held out; the second is from a training district. Flight frames also provide harder views for a fresh probe on frozen features.
-- **12 · 4:36.** Close with what transferred: a simulator-fit car-patch readout improved on held-out real videos after unlabeled real-image refinement. That supports using the encoder as a perception component, not a claim that the policy transfers to a physical drone. Stop by 5:00.
+- **12 · 4:36.** Trace the branches: “The same frozen patch features let us read out depth and semantics, transfer a sim-trained car readout to real video, and feed a goal-conditioned pilot in simulation. The real-video result is for the car readout, not the pilot. Next I’d test whether memory helps across frames and measure latency on hardware.” Stop by 5:00.
 
 The [original reel](../runs/presentation/pilot-demo.mp4) shows the policy’s actual input. To regenerate the textured visuals without changing benchmark renders: `nix develop --command .venv/bin/python scripts/render_presentation.py --figure report/figures/textured-flight.png --video --ffmpeg /path/to/ffmpeg` (requires `drawtext` and `libx264`).
 
@@ -52,3 +52,10 @@ The [original reel](../runs/presentation/pilot-demo.mp4) shows the policy’s ac
 - **Why did you adopt a checkpoint the gate rejected?** We adopted it as the base encoder because real-image readouts improved and simulator checks stayed within their margins. It did not pass as a *flight-failure fix*: the goal-matching score rose by 0.016, but its paired interval (−0.005 to +0.038) includes zero.
 - **Why not just use the teacher?** The student is about 14× smaller by parameter count. The result is about feature quality at that size; latency on the embedded target was not measured.
 - **Is the demo representative?** No. It shows selected successes from earlier policies. On the later no-hint hard set, collisions rose from 80/256 to 116/256; both policies went 0/256 on hidden-and-far goals. The two runs also differed in perception-head data and training setup, so this does not isolate the encoder’s effect on flight.
+
+## Retraining comparison (not in the timed talk)
+
+Run `nix develop --command bash scripts/retrain_presentation.sh` from the repo root. The seed-2 run writes to `runs/presentation-retrain-seed2/`; use a new output path as the script’s first argument for a rerun.
+
+- Use `gate/verdict.md` for the paired sim, real-image, and offline goal-matching results. Report these as a new seed on the same held-out data, not a new test split.
+- Compare `policy-mean/hard-set.json` and `policy-refined/hard-set.json` for no-hint success and collisions. Both start from the same policy checkpoint, train for 2M additional steps with fresh heads fit on the same frames, and use the same held-out episode cohorts. This compares the frozen encoders with their own perception heads under one PPO recipe; it is not evidence of real-world flight.

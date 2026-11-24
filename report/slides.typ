@@ -186,10 +186,24 @@ on a real drone’s camera?]
 #text(20pt, weight: "medium")[Recorded flight frames → fresh probe on frozen features]
 
 #pagebreak()
-#title([04 · IMPLICATIONS], [Better visual inputs, not proven autonomy])
-#v(16pt)
-#card([PHYSICAL AI], [One small encoder supplies features to perception heads and a learned pilot.], highlighted: true)
-#v(18pt)
-#card([WHAT WE DIDN’T SHOW], [Reliable navigation, small-object matching, or onboard latency.])
-#v(22pt)
-#secondary[No-hint city hard set: 28/256 vs. 24/256 successful flights (original vs. refined pilot).]
+#title([04 · IMPLICATIONS], [One encoder, three ways to use it])
+#align(center, box(inset: (x: 18pt, y: 11pt), radius: 6pt, fill: tint,
+  text(19pt, weight: "bold")[Camera RGB → Frozen ViT-S patch features]))
+#block(width: slide-width, height: 34pt, {
+  let first = 138pt
+  let middle = slide-width / 2
+  let last = slide-width - first
+  let wire = 1.25pt + muted
+  place(top + left, dx: first, dy: 17pt, line(end: (last - first, 0pt), stroke: wire))
+  for x in (first, middle, last) {
+    place(top + left, dx: x, dy: if x == middle { 0pt } else { 17pt },
+      line(end: (0pt, if x == middle { 34pt } else { 17pt }), stroke: wire))
+  }
+})
+#grid(columns: (1fr, 1fr, 1fr), gutter: 14pt,
+  card([GEOMETRY IN SIM], [Predict depth and semantic masks.]),
+  card([REAL-IMAGE TRANSFER], [Rank car patches with a readout fit in simulation.], highlighted: true),
+  card([CLOSED LOOP IN SIM], [Match a goal crop and feed a learned pilot.]),
+)
+#v(26pt)
+#secondary[Next: test whether memory helps across frames and measure latency on real hardware.]
