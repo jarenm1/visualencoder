@@ -1,42 +1,66 @@
 # Presentation guide — Appearance-robust vision for drones
 
-**Five minutes, six slides.** The encoder is the contribution; the learned pilot is the demo and a way to collect challenging camera views. Do not lead with the pilot’s success rate.
+**Five-minute recording, 12 slides.** Walk through one frame from RGB to features, then show how those features were trained and tested. Keep the narration on the encoder; the flight reel is an example, not the headline result.
 
 ## Before you start
 
-- Open [slides.pdf](../runs/presentation/slides.pdf) in full-screen mode and cue [pilot-demo.mp4](../runs/presentation/pilot-demo.mp4) at 0:00 in a separate player. Switch to the player on slide 5 and back to the deck when it ends. The video is silent, 27 seconds, and plays offline. No server, model loading, or training is needed.
-- On the presentation machine, rehearse that window switch once. If playback fails, stay on slide 5 and explain the two camera views and the flight-to-probe loop. If you only have three minutes, keep the method, the retrieval result, and the UAVid result; play only the first 15 seconds of the reel.
+- Open the [slides](../runs/presentation/slides.pdf) full-screen and cue the silent [flight reel](../runs/presentation/pilot-demo.mp4). Record the whole display or splice the MP4 into the recording at slide 11; a capture limited to the PDF window won’t show the video player. Make a short test recording to check slide legibility, mic level, and the video cut.
+- For a three-minute cut, use slides 1, 3, 5–6, 8, 10 and 12. Skip the reel or splice in a short excerpt. No live server or model needs to run.
 - Keep the [report](report.pdf) and [supplement](supplement.pdf) available for questions. To rebuild the deck from the repo root: `nix develop --command typst compile report/slides.typ runs/presentation/slides.pdf` (create the output directory first if needed).
 
 ## What to say
 
-### 1 · Question (0:00–0:30)
+### 1 · Question (0:00–0:18)
 
-> A drone can fly past the same building at noon and at dusk. The building hasn’t changed, but almost every pixel has. Can a small vision model learn what stays the same, and does that help on real drone imagery? We distilled a 300-million-parameter teacher into a 22-million-parameter student and tested those two questions separately.
+> A building is still the same building at noon and at dusk, but it looks different to the camera. We wanted a small encoder that keeps useful scene information when appearance changes, then tested whether that helped on real drone imagery.
 
-### 2 · Method (0:30–1:30)
+### 2 · Data (0:18–0:38)
 
-Point to the first row of renders: one pose, five looks. Only the two training looks enter the paired loss. The two novel looks illustrate the kind of shift used for evaluation.
+> These five images share one camera pose in our Blender city. We change lighting, materials and fog, not the geometry. The middle two columns show the kinds of looks we pair in training; the last two are held-out looks for evaluation.
 
-> Our Blender city gives us the same camera pose under different lighting, materials and fog. Standard distillation asks the student to copy the frozen teacher separately on each look. Instead, we average the teacher’s features from two aligned looks, then ask the student to match that average from either image. We apply cosine loss to the global feature and the local patches. A shared random crop keeps those patch targets aligned.
+### 3 · Architecture (0:38–1:08)
 
-### 3 · Simulator baselines (1:30–2:20)
+Trace the arrows left to right.
 
-> We freeze each encoder and use the same evaluation: linear probes for pose, depth and segmentation, and nearest-neighbor retrieval without a fitted probe. This table is for held-out looks. Standard distillation helps, but changing the target from per-look to paired raises retrieval from 0.747 to 0.951. Depth error also drops from 0.242 to 0.201. DINOv3-L still leads on segmentation. On the canonical look the distilled models already score similarly, so the big change is robustness to appearance.
+> A 320 by 240 frame gives us a grid of 20 by 15 patches, each 16 pixels square. Patch embedding turns those patches into vectors. Twelve transformer blocks let tokens exchange context across the image. At the output we keep one global token and 300 patch tokens, all 384-dimensional. This is the existing 22-million-parameter LingBot ViT-S backbone; our contribution is how we train it, not a new transformer architecture.
 
-### 4 · Transfer to real drone imagery (2:20–3:10)
+### 4 · Outputs (1:08–1:27)
 
-> The simulator gain didn’t automatically carry over to UAVid. We refined the last four blocks using unlabeled real training images, while keeping the paired simulator objective. A simulator-fit probe ranked car patches in held-out real videos: average precision rose from 0.604 to 0.749 in this matched run. The paired interval resamples videos, not individual patches. This is car-patch ranking, not a bounding-box detector. The simulator readouts stayed within the margins we set in advance.
+> The CLS token is a summary of the frame. For global readouts we also pool the patch features. The full grid keeps the spatial layout, so a small probe can read depth or class at a particular location. The encoder itself doesn’t output boxes or flight controls.
 
-### 5 · Learned flight demo (3:10–4:15, including playback)
+### 5 · Distillation (1:27–1:52)
 
-> A recurrent PPO policy combines frozen camera features, an image goal and onboard motion inputs. The first clip is a selected held-out takeoff and car approach. The second shows the memory-enabled pilot in a training district. Both have location hints. Onboard view is on the left; the external camera on the right is only for the viewer.
+> The 300-million-parameter teacher stays frozen. Its features are 1024-dimensional, so two linear layers map the student’s outputs into the same space: one for the CLS token, one shared by all the patches. Cosine loss compares the direction of the projected features with the target. At inference we keep only the student backbone.
 
-**Play `pilot-demo.mp4`.** After playback: “The flights also give us camera viewpoints for stress-testing the encoder. We fit a fresh matcher on frozen features so we don’t confuse a bad turn by the pilot with a failure of the representation.”
+### 6 · Paired targets (1:52–2:18)
 
-### 6 · Takeaway (4:15–5:00)
+> Standard distillation matches each image to the teacher on that same image. Our variant averages the teacher’s normalized features across the two looks, then makes each student view match that shared target. The crop is shared so we average the same patch locations. Same data, same backbone, different supervision.
 
-> Paired targets improved robustness to unseen simulator appearance. Unlabeled real imagery improved transfer while the paired simulator objective retained that robustness. Mining flight failures was useful for diagnosis, but the losses we tried didn’t establish a fix for small targets or look-alikes. And a better encoder didn’t establish a better pilot: on the standard no-hint hard set, the old policy succeeded 28 times out of 256 and the new one 24. The claim is about the representation, not reliable autonomous flight.
+### 7 · Evaluation (2:18–2:40)
+
+> We freeze the encoders. We fit small linear probes on canonical renders, then test what pose, depth and segmentation information survives under shifted looks. Retrieval asks a separate question: can a view find the same pose in another appearance, without fitting a readout?
+
+### 8 · Simulator baselines (2:40–3:04)
+
+> Follow the last two rows. Standard distillation already helps, but changing to paired targets raises retrieval from 0.747 to 0.951 and drops depth error from 0.242 to 0.201. DINOv3-L still leads on segmentation. The main improvement is robustness under new looks, not a sweep of every benchmark.
+
+### 9 · Real-data refinement (3:04–3:25)
+
+> The simulator gain didn’t automatically carry over to UAVid. We kept the paired simulator target and mixed in unlabeled real training images, matching each real frame to the teacher on that frame. We updated only the student’s last four blocks.
+
+### 10 · UAVid results (3:25–3:50)
+
+> A probe fit in simulation ranked car patches in separate UAVid validation videos. In the matched run, average precision rose from 0.604 to 0.749. The interval resamples videos, not patches, and the simulator checks stayed within the margins we set in advance. This is patch ranking, not bounding-box detection.
+
+### 11 · Flight reel (3:50–4:36, including 27 seconds of video)
+
+> A learned policy flies in simulation and supplies camera viewpoints for testing the encoder. These are selected successes with location hints: onboard view on the left, an external replay camera on the right.
+
+**Cut to `pilot-demo.mp4`.** The first clip is held out; the memory-enabled second clip is from a training district. Then return to the deck.
+
+### 12 · Takeaway (4:36–5:00)
+
+> Paired targets helped with unfamiliar simulator looks. Real RGB improved transfer. The flight frames exposed weaknesses in small-target and look-alike matching that the refinement didn’t fix. It didn’t establish a better pilot either. The result is a stronger visual representation, not reliable autonomous flight.
 
 ## Likely questions
 

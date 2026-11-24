@@ -8,7 +8,7 @@
 #let slide-width = 856pt
 #set page(width: 960pt, height: 540pt, margin: (x: 52pt, top: 42pt, bottom: 38pt),
   fill: rgb("F7F9FC"),
-  footer: context align(right, text(12pt, fill: muted)[#counter(page).display() / 6]))
+  footer: context align(right, text(12pt, fill: muted)[#counter(page).display()]))
 #set text(font: ("Inter", "DejaVu Sans"), size: 20pt, fill: ink)
 #set par(leading: 0.42em, spacing: 3pt)
 
@@ -40,7 +40,7 @@
 #secondary[Jaren McHugh]
 
 #pagebreak()
-#title([01 · METHOD], [Same camera pose, one teacher target])
+#title([01 · DATA], [One pose, different appearances])
 #strip("figures/looks.png", 128pt, 1600 / 960)
 #v(5pt)
 #grid(columns: (1fr, 2fr, 2fr),
@@ -48,16 +48,56 @@
   secondary([Two training looks], size: 15pt),
   secondary([Two held-out looks], size: 15pt),
 )
-#v(23pt)
-#grid(columns: (1fr, 1fr), gutter: 16pt,
-  card([STANDARD DISTILLATION], [Each look matches the teacher’s features from that same look.]),
-  card([PAIRED-VIEW DISTILLATION], [Both looks match the *average* of the teacher’s features across the pair.], highlighted: true),
-)
-#v(16pt)
-#secondary[Same images and frozen teacher. Cosine loss on global and patch features.]
+#v(25pt)
+#text(24pt, weight: "bold")[Change lighting, materials, and fog. Keep the geometry fixed.]
+#v(15pt)
+#secondary[Train on paired renders. Test on unseen poses and appearances.]
 
 #pagebreak()
-#title([02 · SIMULATOR RESULTS], [Paired targets improve robustness])
+#title([02 · ARCHITECTURE], [What runs on each frame])
+#image("figures/encoder-architecture.svg", width: slide-width)
+#v(18pt)
+#secondary[22M parameters. No teacher or distillation heads at inference.]
+
+#pagebreak()
+#title([03 · OUTPUTS], [A scene summary and a spatial grid])
+#v(28pt)
+#grid(columns: (1fr, 1fr), gutter: 16pt,
+  card([ONE GLOBAL TOKEN], [A summary of the frame. Useful for scene retrieval and pose probes.], highlighted: true),
+  card([300 PATCH TOKENS], [One feature vector per patch location. Useful for depth, segmentation, and goal matching.]),
+)
+#v(25pt)
+#secondary[Self-attention lets each token use context from the rest of the image.]
+
+#pagebreak()
+#title([04 · DISTILLATION], [Teach the student to match features])
+#v(22pt)
+#grid(columns: (1fr, 1fr), gutter: 16pt,
+  card([FROZEN TEACHER], [LingBot ViT-L/16 produces 1024-dimensional target features.]),
+  card([TRAINABLE STUDENT], [Two linear heads project 384 → 1024: one for CLS, one shared across patches.], highlighted: true),
+)
+#v(25pt)
+#text(23pt, weight: "bold")[Cosine loss on the global token and corresponding patches.]
+
+#pagebreak()
+#title([05 · PAIRED TARGETS], [Same images. Different teacher target.])
+#v(28pt)
+#grid(columns: (1fr, 1fr), gutter: 16pt,
+  card([STANDARD], [Look A matches teacher A. \ Look B matches teacher B.]),
+  card([PAIRED], [Both looks match the mean of teacher A and teacher B.], highlighted: true),
+)
+#v(25pt)
+#secondary[Same pose and shared crop, so patch locations line up across the pair.]
+
+#pagebreak()
+#title([06 · EVALUATION], [What do the frozen features retain?])
+#v(28pt)
+#card([LINEAR PROBES], [Fit on canonical renders. Read out pose, depth, and segmentation under shifted looks.])
+#v(18pt)
+#card([RETRIEVAL], [Given one view, find the same pose under a different look. No fitted probe.], highlighted: true)
+
+#pagebreak()
+#title([07 · SIMULATOR RESULTS], [Paired targets improve robustness])
 #set text(size: 18pt)
 #table(
   columns: (2.1fr, 1fr, 1fr, 1.1fr, 1.2fr),
@@ -76,8 +116,18 @@
 #secondary[Held-out lighting and textures. Same probe protocol for all encoders; retrieval needs no fitted probe.]
 
 #pagebreak()
-#title([03 · REAL DRONE IMAGERY], [Unlabeled real images improved transfer])
-#secondary(size: 22pt)[Refine with unlabeled UAVid RGB + paired simulator targets.]
+#title([08 · REAL-DATA REFINEMENT], [Add real RGB without dropping simulator pairs])
+#v(26pt)
+#grid(columns: (1fr, 1fr), gutter: 16pt,
+  card([SIMULATOR], [Keep the paired teacher target.]),
+  card([UAVID TRAINING RGB], [Match the teacher on each unlabeled real frame.], highlighted: true),
+)
+#v(25pt)
+#secondary[Update only the last four student blocks. Evaluate on separate UAVid videos.]
+
+#pagebreak()
+#title([09 · REAL-IMAGE RESULTS], [Unlabeled real images improved transfer])
+#secondary(size: 22pt)[Paired student → refined student, matched run]
 #v(36pt)
 #text(76pt, weight: "bold", fill: accent)[0.604 → 0.749]
 #v(7pt)
@@ -88,7 +138,7 @@
 #secondary[Simulator readouts stayed within prespecified margins. This is patch ranking, not box detection.]
 
 #pagebreak()
-#title([04 · LEARNED FLIGHT], [The pilot doubles as a data collector])
+#title([10 · LEARNED FLIGHT], [The pilot supplies harder camera views])
 #strip("figures/city-cameras.png", 176pt, 1280 / 528)
 #v(18pt)
 #text(22pt, weight: "bold")[Play the 27-second replay: `pilot-demo.mp4`]
@@ -100,7 +150,7 @@
 #secondary[Recorded flights supply test frames for a fresh goal-matching probe.]
 
 #pagebreak()
-#title([05 · TAKEAWAY], [A better encoder is not yet a better pilot])
+#title([11 · TAKEAWAY], [What improved, and what didn’t])
 #v(16pt)
 #card([WHAT WORKED], [Paired targets improved simulator robustness. Real RGB improved transfer.], highlighted: true)
 #v(18pt)

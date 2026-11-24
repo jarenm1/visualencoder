@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="856" height="218" viewBox="0 0 856 218" role="img" aria-labelledby="title desc">
+  <title id="title">LingBot ViT-S/16 encoder at inference</title>
+  <desc id="desc">A 320 by 240 RGB image is embedded as a 20 by 15 grid of patch tokens. Twelve transformer blocks produce one global token and 300 spatial tokens. All output vectors have 384 dimensions.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0 10 5 0 10z" fill="#4C5C72"/>
+    </marker>
+  </defs>
+  <g fill="white" stroke="#D6DEE9" stroke-width="1.5">
+    <rect x="1" y="47" width="150" height="124" rx="8"/>
+    <rect x="187" y="47" width="178" height="124" rx="8"/>
+  </g>
+  <rect x="401" y="47" width="188" height="124" rx="8" fill="#E3F3EF" stroke="#8EBEB6" stroke-width="1.5"/>
+  <g fill="white" stroke="#D6DEE9" stroke-width="1.5">
+    <rect x="636" y="13" width="219" height="82" rx="8"/>
+    <rect x="636" y="123" width="219" height="82" rx="8"/>
+  </g>
+  <g fill="none" stroke="#4C5C72" stroke-width="2" marker-end="url(#arrow)">
+    <path d="M153 109h29"/>
+    <path d="M367 109h29"/>
+    <path d="M591 109h16V54h24"/>
+    <path d="M591 109h16v55h24"/>
+  </g>
+  <g font-family="Inter, DejaVu Sans, sans-serif" text-anchor="middle">
+    <g fill="#152138" font-size="19" font-weight="bold">
+      <text x="76" y="99">RGB frame</text>
+      <text x="276" y="99">Patch embedding</text>
+      <text x="495" y="99">LingBot ViT-S/16</text>
+      <text x="745" y="49">Global CLS token</text>
+      <text x="745" y="159">Spatial patch tokens</text>
+    </g>
+    <g fill="#4C5C72" font-size="16">
+      <text x="76" y="127">320 × 240</text>
+      <text x="276" y="127">20 × 15 grid</text>
+      <text x="495" y="127">12 transformer blocks</text>
+      <text x="745" y="72">1 × 384</text>
+      <text x="745" y="182">300 × 384</text>
+    </g>
+  </g>
+</svg>
