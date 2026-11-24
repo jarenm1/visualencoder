@@ -1,13 +1,13 @@
-# Presentation guide — Appearance-robust vision for drones
+# Presentation guide — Visual encoders for sim-to-real transfer
 
 **Five-minute recording, 12 slides.** Tell the story in four parts. Use the cues below to practice; don’t read them into the mic.
 
 | Rubric question | Slides | One answer to land |
 |---|---|---|
-| What was the problem? | 1–2 | Lighting, materials, and fog can change the pixels without changing the scene. We wanted a small encoder whose features stay useful under that shift. |
-| What’s the solution? | 3–4 | Use a 22M-parameter ViT that keeps a scene summary and a grid of local features. Train it with a large teacher; deploy only the student. |
+| What was the problem? | 1–2 | Vision learned in simulation may not transfer to real cameras. Appearance is one part of that gap we can isolate and measure. |
+| What’s the solution? | 3–4 | Transfer the visual representation: a 22M-parameter encoder produces global and spatial features that perception heads and a pilot can use. |
 | How did you solve it? | 5–10 | Average teacher features across aligned simulator looks, test against standard distillation, then add unlabeled real images and measure transfer separately. |
-| What are the implications? | 11–12 | Better features for vision tasks at the same student size; simulated flight exposes failure cases, but doesn’t establish real-world navigation or onboard latency. |
+| What are the implications? | 11–12 | A compact encoder can supply visual information for physical AI. We measured transfer on real images, not autonomous flight on real hardware. |
 
 ## Before you start
 
@@ -20,13 +20,13 @@
 
 ### Problem · 0:00–0:38
 
-- **1 · 0:00.** Open with the technical question: “Can a small encoder tell this is the same scene when the pixels look different?”
-- **2 · 0:18.** Point to the same roof or road marking across the renders. Same pose and geometry; different lighting, materials, and fog. Transition: “That gives us a controlled way to train and test invariance.”
+- **1 · 0:00.** Open with sim-to-real: “Simulation gives us data we can label and control. The problem is that what a drone learns to see there may not carry over to a real camera. Can we transfer the visual features instead?”
+- **2 · 0:18.** Point to the same roof across the renders. We isolate one piece of the gap: change appearance, keep geometry and pose fixed. We test on real imagery separately.
 
 ### Solution · 0:38–1:27
 
-- **3 · 0:38.** Follow the architecture arrows: 320×240 RGB → 16×16 patches → twelve transformer blocks → normalized features. Say that the backbone already exists; the contribution is the training recipe.
-- **4 · 1:08.** Contrast one 384-dimensional CLS token for the whole frame with 300 local tokens for spatial readouts. The encoder does not output boxes or flight controls. Transition: “We want the student to keep that information when appearance changes.”
+- **3 · 0:38.** Focus on the encoder, not the flight policy. Follow the arrows: 320×240 RGB → 16×16 patches → twelve transformer blocks → normalized features. The architecture already exists; the contribution is the training recipe.
+- **4 · 1:08.** One 384-dimensional global token summarizes the frame; 300 local tokens retain spatial detail for depth, segmentation, and goal matching. This is the visual information a physical AI system can use; the encoder itself doesn’t choose actions.
 
 ### Implementation · 1:27–3:50
 
@@ -40,7 +40,7 @@
 ### Implications · 3:50–5:00
 
 - **11 · 3:50.** Explain what the reel shows, then play it (~27 seconds). These are selected successes with location hints. Left: Poly Haven re-render of the saved camera poses. Right: original external view. The first clip is held out; the second is from a training district. Flight frames also provide harder views for a fresh probe on frozen features.
-- **12 · 4:36.** End on the distinction: paired views improved simulator robustness; real RGB improved transfer. The 22M-parameter encoder needs no teacher at runtime, but onboard latency was not measured and the new pilot didn’t reliably improve. Stop by 5:00.
+- **12 · 4:36.** Close with what transferred: a simulator-fit car-patch readout improved on held-out real videos after unlabeled real-image refinement. That supports using the encoder as a perception component, not a claim that the policy transfers to a physical drone. Stop by 5:00.
 
 The [original reel](../runs/presentation/pilot-demo.mp4) shows the policy’s actual input. To regenerate the textured visuals without changing benchmark renders: `nix develop --command .venv/bin/python scripts/render_presentation.py --figure report/figures/textured-flight.png --video --ffmpeg /path/to/ffmpeg` (requires `drawtext` and `libx264`).
 

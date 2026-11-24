@@ -1,5 +1,5 @@
 // Build from the repo root: typst compile report/slides.typ runs/presentation/slides.pdf
-#set document(title: "Appearance-robust vision for drones", author: "Jaren McHugh")
+#set document(title: "Visual encoders for sim-to-real transfer", author: "Jaren McHugh")
 #let ink = rgb("152138")
 #let muted = rgb("4C5C72")
 #let accent = rgb("00665C")
@@ -31,17 +31,17 @@
 
 #kicker[01 · PROBLEM]
 #v(45pt)
-#text(64pt, weight: "bold")[Appearance-robust \ vision for drones]
+#text(64pt, weight: "bold")[Visual encoders for \ sim-to-real transfer]
 #v(23pt)
-#secondary(size: 25pt)[Same scene, different lighting and textures. \
-Can a small encoder keep the features that matter?]
+#secondary(size: 25pt)[Can features learned in simulation stay useful \
+on a real drone’s camera?]
 #v(34pt)
-#text(22pt, weight: "bold", fill: accent)[300M-parameter teacher → 22M-parameter student]
+#text(22pt, weight: "bold", fill: accent)[Physical AI · Drone perception]
 #v(28pt)
 #secondary[Jaren McHugh]
 
 #pagebreak()
-#title([01 · PROBLEM], [Same street, different pixels])
+#title([01 · PROBLEM], [Appearance is one part of the sim-to-real gap])
 #strip("figures/looks.png", 128pt, 1600 / 960)
 #v(5pt)
 #grid(columns: (1fr, 2fr, 2fr),
@@ -52,23 +52,23 @@ Can a small encoder keep the features that matter?]
 #v(25pt)
 #text(24pt, weight: "bold")[Change lighting, materials, and fog. Keep the geometry fixed.]
 #v(15pt)
-#secondary[The test: do features still match when the camera pose stays the same?]
+#secondary[We isolate appearance in simulation, then test transfer on real drone imagery.]
 
 #pagebreak()
-#title([02 · SOLUTION], [Keep only the small encoder at runtime])
+#title([02 · SOLUTION], [Transfer the visual representation])
 #image("figures/encoder-architecture.svg", width: slide-width)
 #v(18pt)
-#secondary[22M parameters. No teacher or distillation heads at inference.]
+#secondary[22M parameters. Downstream tasks use the student’s features, not the teacher.]
 
 #pagebreak()
-#title([02 · SOLUTION], [Keep a scene summary and a spatial grid])
+#title([02 · SOLUTION], [Features a drone can use])
 #v(28pt)
 #grid(columns: (1fr, 1fr), gutter: 16pt,
   card([1 CLS TOKEN], [A whole-frame feature for pose and retrieval.], highlighted: true),
-  card([300 PATCH TOKENS], [A grid of local features for depth and segmentation.]),
+  card([300 PATCH TOKENS], [Local features for depth, segmentation, and goal matching.]),
 )
 #v(25pt)
-#secondary[Self-attention lets each token use context from the rest of the image.]
+#secondary[The encoder supplies visual features. Task heads and the pilot decide how to use them.]
 
 #pagebreak()
 #title([03 · IMPLEMENTATION], [Learn features from a frozen teacher])
@@ -160,9 +160,9 @@ Can a small encoder keep the features that matter?]
 #text(20pt, weight: "medium")[Recorded flight frames → fresh probe on frozen features]
 
 #pagebreak()
-#title([04 · IMPLICATIONS], [Better features, not proven autonomy])
+#title([04 · IMPLICATIONS], [Better visual inputs, not proven autonomy])
 #v(16pt)
-#card([WHAT THIS ENABLES], [A 22M-parameter backbone for vision tasks. No teacher at runtime.], highlighted: true)
+#card([PHYSICAL AI], [One small encoder supplies features to perception heads and a learned pilot.], highlighted: true)
 #v(18pt)
 #card([WHAT WE DIDN’T SHOW], [Reliable navigation, small-object matching, or onboard latency.])
 #v(22pt)
