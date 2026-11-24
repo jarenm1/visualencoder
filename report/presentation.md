@@ -14,7 +14,7 @@
 - Open the [slides](../runs/presentation/slides.pdf) full-screen. Cue the silent [flight reel](../runs/presentation/pilot-demo-textured.mp4) for slide 11. Capture the whole display or splice in the MP4; a capture limited to the PDF window won’t show the player.
 - Make a 15-second audio test in the same recorder. Play it back with headphones: listen for clipping, fan noise, and dropped words. Then do one timed take and trim the reel before speeding up the method or the results.
 - For a three-minute cut, use slides 1, 3, 5–6, 8, 10 and 12. Skip the reel or splice in a short excerpt. No live server or model needs to run.
-- Keep the [report](report.pdf) and [supplement](supplement.pdf) available for questions. To rebuild the deck from the repo root: `nix develop --command typst compile report/slides.typ runs/presentation/slides.pdf` (create the output directory first if needed).
+- Keep the [report](report.pdf) and [supplement](supplement.pdf) available for questions. To rebuild from the repo root: `nix develop --command typst compile --root . report/slides.typ runs/presentation/slides.pdf` (create the output directory first if needed).
 
 ## On-camera cues
 
@@ -35,7 +35,7 @@
 - **7 · 2:18.** Freeze the encoders. Fit linear probes on canonical renders and test on shifted looks. Retrieval asks whether the same pose is the nearest match under a different look, with no trained probe.
 - **8 · 2:40.** Point to the last two rows: retrieval 0.747 → 0.951; depth error 0.242 → 0.201. Don’t read the table. DINOv3-L still leads on segmentation.
 - **9 · 3:04.** Transition: “But robustness in simulation didn’t guarantee transfer.” Keep the paired simulator target, add unlabeled UAVid RGB, and update the last four blocks and final LayerNorm.
-- **10 · 3:25.** A simulator-fit probe ranks car patches on separate UAVid videos: AP 0.604 → 0.749, with a paired interval over videos. Patch ranking, not object detection.
+- **10 · 3:25.** Point to the zero line. Simulator retrieval stayed near 0.97. On held-out UAVid, car-patch AP rose from 0.604 to 0.749. Goal matching on held-out flight frames moved slightly, but its paired interval crosses zero. That row tests frozen features, not whether the drone reached the goal. This compares two checkpoints; slide 8 is a separate distillation comparison.
 
 ### Implications · 3:50–5:00
 

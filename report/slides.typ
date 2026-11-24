@@ -1,4 +1,4 @@
-// Build from the repo root: typst compile report/slides.typ runs/presentation/slides.pdf
+// Build from the repo root: typst compile --root . report/slides.typ runs/presentation/slides.pdf
 #set document(title: "Visual encoders for sim-to-real transfer", author: "Jaren McHugh")
 #let ink = rgb("152138")
 #let muted = rgb("4C5C72")
@@ -28,6 +28,36 @@
   #v(8pt)
   #body
 ]
+
+#let refinement-plot() = {
+  let checks = json("../reports/gate/refine-anchors-mv-vs-mean/verdict.json").checks
+  let rows = (
+    ([Simulation], [Shifted-look retrieval\@1], checks.at("sim/retrieval_at_1")),
+    ([Real imagery · UAVid], [Car-patch average precision], checks.at("real/sim_to_real_vehicle_ap")),
+    ([Task · held-out flight frames], [Goal-matching score], checks.at("failures/patch_head_score")),
+  )
+  let x(v) = 280pt + (v + 0.025) * 1650pt
+  let score(v) = str(calc.round(v, digits: 3))
+  block(width: slide-width, height: 226pt, breakable: false, {
+    place(top + left, dx: 691pt, kicker[BEFORE → AFTER])
+    for (tick, label) in ((0.0, [0]), (0.05, [+0.05]), (0.10, [+0.10]), (0.15, [+0.15]), (0.20, [+0.20])) {
+      let stroke = if tick == 0 { 1.5pt + muted } else { 0.75pt + rule }
+      place(top + left, dx: x(tick), dy: 24pt, line(end: (0pt, 151pt), stroke: stroke))
+      place(top + left, dx: x(tick) - 23pt, dy: 182pt, box(width: 46pt, align(center, secondary(label, size: 13pt))))
+    }
+    for (i, (label, metric, row)) in rows.enumerate() {
+      let y = 48pt + i * 49pt
+      let (lo, hi) = row.ci95
+      let color = if i == 1 { accent } else { muted }
+      place(top + left, dy: y - 18pt, text(17pt, weight: "bold", label))
+      place(top + left, dy: y + 1pt, secondary(metric, size: 14pt))
+      place(top + left, dx: x(lo), dy: y, line(end: (x(hi) - x(lo), 0pt), stroke: 2.5pt + color))
+      place(top + left, dx: x(row.difference) - 4.5pt, dy: y - 4.5pt, circle(radius: 4.5pt, fill: color))
+      place(top + left, dx: 691pt, dy: y - 8pt, text(16pt, weight: "medium")[#score(row.baseline) → #score(row.candidate)])
+    }
+    place(top + left, dx: 280pt, dy: 206pt, box(width: x(0.20) - 280pt, align(center, secondary([Score change (refined − original)], size: 15pt))))
+  })
+}
 
 #kicker[01 · PROBLEM]
 #v(45pt)
@@ -138,16 +168,12 @@ on a real drone’s camera?]
 #secondary[Update the last four blocks and final LayerNorm. Test on separate videos.]
 
 #pagebreak()
-#title([03 · IMPLEMENTATION · REAL-IMAGE RESULTS], [Unlabeled real images improved transfer])
-#secondary(size: 22pt)[Paired student → refined student, matched run]
-#v(36pt)
-#text(76pt, weight: "bold", fill: accent)[0.604 → 0.749]
-#v(7pt)
-#text(26pt, weight: "bold")[Car-patch average precision on held-out UAVid videos]
-#v(17pt)
-#secondary[Paired 95% interval for the gain: +0.095 to +0.180. One refinement seed.]
-#v(38pt)
-#secondary[Simulator readouts stayed within prespecified margins. This is patch ranking, not box detection.]
+#title([03 · IMPLEMENTATION · EVALUATION], [Refinement helped most on real images])
+#secondary[Same encoder backbone, before and after adding unlabeled real images.]
+#v(16pt)
+#refinement-plot()
+#v(12pt)
+#secondary(size: 15pt)[Bars: paired 95% bootstrap intervals. One refinement seed. Goal matching is a probe, not flight success.]
 
 #pagebreak()
 #title([04 · IMPLICATIONS], [Flight gives us harder camera views])
