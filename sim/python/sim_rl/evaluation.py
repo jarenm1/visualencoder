@@ -8,6 +8,7 @@ from .features import RefreshedGoals
 from .memory import SpatialMemory, observe as observe_memory
 from .model import EXPLORE_COMMAND, GOAL_COMMAND, deterministic_action
 from .native import HOVER_ACTIONS
+from .perception import patch_rays
 from .ppo import gpu_range
 from .stats import wilson
 
@@ -69,13 +70,15 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
         raise ValueError("provide exactly one trained policy or blind heuristic")
     if heuristic is not None and heuristic not in heuristics_for(env.control_mode):
         raise ValueError(f"blind heuristic {heuristic} is unavailable in {env.control_mode} mode")
-    if policy is not None and policy.mode != ("visual" if features.visual else features.spec):
+    waypoint = policy is not None and policy.mode == "waypoint"
+    if policy is not None and policy.mode != ("waypoint" if features.goal == "waypoint"
+                                              else "visual" if features.visual else features.spec):
         raise ValueError("policy mode differs from the frozen feature arm")
     n, device = env.n, env.device
     if len(bucket_weights) != 3 or min(bucket_weights) < 0 or sum(bucket_weights) <= 0:
         raise ValueError("bucket_weights must contain three nonnegative weights with positive sum")
     env.write_curriculum(fixed_lanes(device, tuple(bucket_weights), no_gps, appearance, coarse, wrong))
-    goals = features.catalog_goals(env, appearance) if policy is not None and features.visual else None
+    goals = features.catalog_goals(env, appearance) if policy is not None and features.image_goal else None
     if entries is not None:
         env.next_catalog.copy_(entries)
     env.reset(seed)
@@ -107,6 +110,8 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
     hidden = torch.zeros((n, policy.hidden_size), device=device) if policy is not None else None
     spatial = (SpatialMemory(n, env.height // 16, env.width // 16, env.metadata["camera"], device)
                if policy is not None and policy.spatial else None)
+    grid = (env.height // 16, env.width // 16)
+    rays = patch_rays(*grid, env.metadata["camera"], device) if waypoint else None
     hover = torch.tensor(HOVER_ACTIONS[env.control_mode], device=device).expand(n, -1)
     goal_command = torch.full((n,), GOAL_COMMAND, dtype=torch.long, device=device)
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -121,10 +126,14 @@ def evaluate(env, features, policy=None, heuristic=None, seed=0, no_gps=0.0, app
                 goal = goal_source.step(starts) if goal_source is not None else None
                 memory = (observe_memory(policy, spatial, cls, tokens, goal, env.proprio, starts)
                           if spatial is not None else None)
+                obstacles = policy.waypoint_obstacles(tokens, env.proprio, rays, grid) if waypoint else None
                 inputs, _ = policy.actor_inputs_and_features(cls, tokens, goal, env.proprio, env.privileged, memory,
-                                                             goal_command)
+                                                             goal_command, obstacles=obstacles)
                 mean, hidden = policy.step(inputs, hidden, starts)
-                actions.copy_(deterministic_action(mean))
+                command = deterministic_action(mean)
+                if waypoint:
+                    command = torch.where(env.proprio[:, GPS_LANE:GPS_LANE + 1] > 0.5, command, hover)
+                actions.copy_(command)
             elif heuristic == "hover":
                 actions.copy_(hover)
             elif heuristic == "gps":

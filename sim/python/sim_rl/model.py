@@ -8,12 +8,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .memory import CANDIDATE_WIDTH, CHANNELS, VIEW_WIDTH
+from .memory import CANDIDATE_WIDTH, CHANNELS, VIEW_WIDTH, depth_view
 from .native import PRIVILEGED_WIDTH, PROPRIO_WIDTH
-from .perception import PatchHeads
+from .perception import PatchHeads, ground_prior
 
 LOG_TWO_PI = math.log(2 * math.pi)
-MODES = ("visual", "state", "hint")
+MODES = ("visual", "state", "hint", "waypoint")
 SALIENCY_RANK = 64               # low-rank goal x token interaction
 VALUE = 64                       # saliency-pooled token projection
 GLOBAL_POOL = (2, 3)
@@ -203,6 +203,8 @@ class ActorCritic(nn.Module):
             camera (obstacles) but always knows where to go.
     state:  privileged + proprioception (no vision).
     hint:   proprioception only.
+    waypoint: command offset in the onboard hint channels + frozen monocular obstacle view.
+              No goal crop, attention matcher, spatial memory, or privileged actor inputs.
     ``commands`` > 1 adds a one-hot command (COMMANDS) to the actor and critic inputs: one policy
     either flies to the goal crop or explores.
     The critic always sees privileged + proprioception (asymmetric training).
@@ -215,6 +217,8 @@ class ActorCritic(nn.Module):
             raise ValueError(f"unknown policy mode {mode}")
         if memory and mode != "visual":
             raise ValueError("spatial memory needs a visual policy")
+        if mode == "waypoint" and (not depth_view or commands != 1 or token_dim <= 0):
+            raise ValueError("waypoint mode needs an encoder and obstacle depth, with one command")
         if not 1 <= commands <= len(COMMANDS):
             raise ValueError(f"commands must be in 1..{len(COMMANDS)}")
         self.mode, self.action_dim, self.hidden_size, self.commands = mode, action_dim, HIDDEN, commands
@@ -229,10 +233,11 @@ class ActorCritic(nn.Module):
         if teacher_target and mode != "visual":
             raise ValueError("teacher_target adds the true target to a visual actor")
         self.teacher_target = teacher_target
-        if depth_view and not memory:
-            raise ValueError("the depth view comes from the spatial memory's perception heads")
-        if memory:
+        if depth_view and not (memory or mode == "waypoint"):
+            raise ValueError("depth view requires perception heads")
+        if memory or mode == "waypoint":
             self.perception = PatchHeads(token_dim, grid_h, grid_w).requires_grad_(False)
+        if memory:
             self.memory_encoder = MemoryEncoder(CHANNELS)
             self.memory_vector_width = CANDIDATE_WIDTH + (VIEW_WIDTH if depth_view else 0)
             self.memory_width = MEMORY_FEATURES + CANDIDATE_WIDTH
@@ -240,7 +245,8 @@ class ActorCritic(nn.Module):
         # The depth view and the teacher's target lanes go last (after the command), so warm starts
         # from policies without them only gain zero-initialized trailing input columns.
         width = {"visual": VISUAL_WIDTH + self.memory_width + PROPRIO_WIDTH,
-                 "state": PRIVILEGED_WIDTH + PROPRIO_WIDTH, "hint": PROPRIO_WIDTH}[mode] \
+                 "state": PRIVILEGED_WIDTH + PROPRIO_WIDTH, "hint": PROPRIO_WIDTH,
+                 "waypoint": PROPRIO_WIDTH}[mode] \
             + (commands if commands > 1 else 0) + (VIEW_WIDTH if depth_view else 0) \
             + (TEACHER_TARGET_WIDTH if teacher_target else 0)
         self.trunk = nn.Sequential(_orthogonal(nn.Linear(width, HIDDEN), math.sqrt(2)),
@@ -258,10 +264,11 @@ class ActorCritic(nn.Module):
     def spatial(self):
         return self.memory_width > 0
 
-    def actor_inputs(self, cls, tokens, goal, proprio, privileged, memory=None, command=None):
-        return self.actor_inputs_and_features(cls, tokens, goal, proprio, privileged, memory, command)[0]
+    def actor_inputs(self, cls, tokens, goal, proprio, privileged, memory=None, command=None, obstacles=None):
+        return self.actor_inputs_and_features(cls, tokens, goal, proprio, privileged, memory, command, obstacles)[0]
 
-    def actor_inputs_and_features(self, cls, tokens, goal, proprio, privileged, memory=None, command=None):
+    def actor_inputs_and_features(self, cls, tokens, goal, proprio, privileged, memory=None, command=None,
+                                  obstacles=None):
         """Returns (actor inputs, saliency logits or None) so training reuses one saliency pass.
         ``memory`` is (ego crop, memory vector) from memory.observe when the policy has spatial
         memory; ``command`` [n] long (COMMANDS index) when the policy takes more than one command."""
@@ -276,12 +283,19 @@ class ActorCritic(nn.Module):
         else:
             inputs, logits = proprio, None
         inputs = self.with_command(inputs, command)
-        if self.depth_view:
+        if self.mode == "waypoint":
+            inputs = torch.cat((inputs, obstacles), dim=-1)
+        elif self.depth_view:
             inputs = torch.cat((inputs, memory[1][:, CANDIDATE_WIDTH:]), dim=-1)
         if self.teacher_target:
             # Privileged teacher: the true target offset in the body frame and its box distance.
             inputs = torch.cat((inputs, privileged[:, :TEACHER_TARGET_WIDTH]), dim=-1)
         return inputs, logits
+
+    @torch.no_grad()
+    def waypoint_obstacles(self, tokens, proprio, rays, grid):
+        depth, _ = self.perception.predict(tokens, ground_prior(proprio, rays))
+        return depth_view(depth, grid)
 
     def with_command(self, inputs, command):
         if self.commands == 1:

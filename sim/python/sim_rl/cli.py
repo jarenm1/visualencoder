@@ -34,6 +34,7 @@ ACTOR_INPUTS = {
     "visual": "target-saliency(frozen CLS + patch tokens, goal-crop embedding: global or patch) + proprio(19)",
     "state": "privileged(29) + proprio(19)",
     "hint": "proprio(19)",
+    "waypoint": "onboard sensors and commanded body-relative offset + frozen patch-depth obstacle view",
 }
 CRITIC_INPUTS = "privileged(29) + proprio(19)"
 # Recorded and compared on load; the library hash is provenance only (rebuilds keep the contract).
@@ -64,6 +65,8 @@ def sha256(path):
 
 
 def mode_of(features):
+    if features.goal == "waypoint":
+        return "waypoint"
     return "visual" if features.visual else features.spec
 
 
@@ -78,9 +81,12 @@ def build_policy(env, features, saved=None, memory_heads=None, commands=1, depth
     memory = memory_heads is not None or bool(recorded)
     commands = saved["metadata"].get("commands", 1) if saved is not None else commands
     depth_view = bool(recorded.get("depth_view")) if recorded else depth_view
+    if saved is not None and features.goal == "waypoint":
+        depth_view = bool(saved["metadata"].get("waypoint"))
     teacher_target = bool(saved["metadata"].get("teacher_target")) if saved is not None else teacher_target
     policy = ActorCritic(mode_of(features), features.dim, features.goal_dim, env.height // 16, env.width // 16,
-                         env.action_dim, features.goal, memory, commands, depth_view, teacher_target).to(env.device)
+                         env.action_dim, features.goal, memory and features.goal != "waypoint",
+                         commands, depth_view, teacher_target).to(env.device)
     if memory_heads is not None:
         policy.perception.load_state_dict(load_heads(memory_heads, features, env.device).state_dict())
     if saved is not None:
@@ -114,12 +120,18 @@ def training_settings(args):
         "grid": GRID, "cell_m": CELL, "ego": EGO, "ego_radius_m": EGO_RADIUS,
         "pose": "dead reckoning from noisy gyro and body velocity", "depth": "frozen monocular patch heads",
         "depth_view": args.depth_view}
+    waypoint = None
+    if args.goal == "waypoint":
+        waypoint = {"source": "simulator-supplied precise location hint (1–5 m uncertainty)",
+                    "heads": memory["heads"], "heads_sha256": memory["heads_sha256"]}
+        memory = None
     return {"curriculum": args.curriculum, "no_gps_fraction": args.no_gps_fraction,
             "coarse_hint_fraction": args.coarse_hint_fraction, "wrong_hint_fraction": args.wrong_hint_fraction,
             "aux_coefficient": args.aux_coefficient, "appearance": args.appearance,
             "goal_refresh_steps": args.goal_refresh_steps,
             "goal_box_source": "simulator" if args.goal_refresh_steps else None,
             "start_distance": args.start_distance, "memory": memory,
+            "waypoint": waypoint,
             "train_cities": None if not args.train_cities else {
                 "paths": [str(path) for path in (args.city, *args.train_cities)],
                 "catalog_size_per_city": args.city_catalog_size},
@@ -329,6 +341,13 @@ def solvable_labels(args, env):
 
 
 def train_command(args, started):
+    if args.goal == "waypoint":
+        if args.memory_heads is None or not args.depth_view or args.encoder in ("hint", "state"):
+            raise SystemExit("waypoint needs a visual encoder, --memory-heads and --depth-view")
+        if (args.control != "velocity" or args.no_gps_fraction or args.coarse_hint_fraction
+                or args.wrong_hint_fraction or args.goal_refresh_steps or args.explore_fraction
+                or args.mask_confusion or args.category_goal_fraction or args.teacher_target or args.init_from):
+            raise SystemExit("waypoint trains from scratch in velocity mode with a supplied precise hint and no image goal")
     seed_all(args.seed)
     config = make_config(args)
     run = args.out
@@ -429,6 +448,7 @@ def train_command(args, started):
         "steps": trainer.steps, "no_gps_fraction": args.no_gps_fraction, "aux_coefficient": args.aux_coefficient,
         "goal_refresh_steps": config.goal_refresh_steps,
         "goal_box_source": metadata["goal_box_source"],
+        "waypoint": metadata.get("waypoint"),
         "fixed_goal_test_success": ({label: fixed_goal_test[label]["policy"]["success"]
                                      for label in ("gps", "no_gps")} if fixed_goal_test else None),
         "best_validation_selection_success": best_success,
@@ -717,11 +737,10 @@ def add_precision(parser):
 def add_learner(parser):
     parser.add_argument("--encoder", default="mean", help=f"arm: {', '.join(ARMS)} or run:<dir>")
     parser.add_argument("--goal", choices=GOALS, default="patch",
-                        help="goal representation: patch (goal-crop patches matched against frame patches) "
-                             "or global (one CLS + mean-patch vector; earlier checkpoints)")
+                        help="patch/global: goal crop embedding; waypoint: onboard hint offset plus obstacle depth (no crop)")
     add_precision(parser)
     parser.add_argument("--memory-heads", type=Path,
-                        help="perception heads (train.py perception) for this encoder: enables the spatial memory")
+                        help="encoder-matched perception heads; spatial memory for image goals, depth only for waypoints")
     parser.add_argument("--depth-view", action="store_true",
                         help="with --memory-heads: the actor also reads the heads' nearest predicted depth "
                              "over a 3x5 image grid (obstacle view)")

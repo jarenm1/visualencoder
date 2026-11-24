@@ -263,6 +263,19 @@ Commander/pilot split: Gemma decides, the policy flies. v5 makes the pilot's tas
 - **Catalog override** (native field 19 `next_catalog`): writing an index makes that environment's next episode start from that catalog entry. Used by the verifier and prioritized replay.
 - v4 checkpoints cannot run on v5: one more sensor lane. The `--init-from` load also rejects other tasks.
 
+### Waypoint-conditioned pilot experiment
+
+`train --goal waypoint --encoder run:<dir> --memory-heads <heads.pt> --depth-view` runs a separate
+velocity policy. The simulator supplies a precise location hint (1–5 m uncertainty) as a body-frame
+command. The actor reads onboard sensors and a frozen 3×5 obstacle-depth view. It does not read
+object embeddings, target boxes, privileged state, or a spatial goal map. The critic and the
+reach-and-hold reward are unchanged. No-command evaluation issues a zero-velocity command.
+
+Use `eval` or `final-test.json` to compare `gps.policy` with `gps.heuristics.gps` on the same
+held-out starts and location hints. The latter is a proportional pursuit baseline without vision;
+this is not a comparison against an image-goal policy given less information. The GPS-denied
+branch tests missing-command behavior, not autonomous search.
+
 ### Solvability verifier (`train.py verify`, `sim_rl/verifier.py`)
 
 Hard-case post-training samples what the pilot fails, so impossible episodes must be excluded first. A privileged-state policy would not work as the verifier: it sees the target but not the obstacles.

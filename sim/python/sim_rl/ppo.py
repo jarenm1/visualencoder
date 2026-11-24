@@ -19,9 +19,10 @@ from .category import category_references
 from .curriculum import MODES as CURRICULUM_MODES, Curriculum
 from .features import RefreshedGoals
 from .levels import HardEpisodes
-from .memory import CHANNELS, EGO, SpatialMemory, observe as observe_memory
+from .memory import CHANNELS, EGO, VIEW_WIDTH, SpatialMemory, observe as observe_memory
 from .model import EXPLORE_COMMAND, GOAL_COMMAND, saliency_loss, squashed_entropy, squashed_log_prob
 from .native import HOVER_ACTIONS, PRIVILEGED_WIDTH, PROPRIO_WIDTH
+from .perception import patch_rays
 
 # finish_rollout layout: rollout totals, PPO losses, bucket totals, used/next weights, EMAs.
 ROLLOUT_WIDTH, LOSS_WIDTH, BUCKET_WIDTH = 9, 9, 12
@@ -123,10 +124,8 @@ class Trainer:
         config.validate()
         if policy.action_dim != env.action_dim:
             raise ValueError("policy action dimension differs from native city-drone task")
-        if policy.mode == "visual" and not features.visual:
-            raise ValueError("visual policy requires a visual encoder")
-        if policy.mode != "visual" and features.visual:
-            raise ValueError("non-visual policy must not own a visual encoder")
+        if (policy.mode in ("visual", "waypoint")) != features.visual:
+            raise ValueError("policy mode differs from the frozen feature arm")
         if (config.explore_fraction > 0) != (policy.commands > 1):
             raise ValueError("explore episodes need a command-conditioned policy, and only they")
         self.env, self.features, self.policy, self.config = env, features, policy, config
@@ -157,7 +156,13 @@ class Trainer:
         self.memory = torch.zeros((n, h), device=env.device)
         self.next_start = torch.ones(n, device=env.device)
         self.episode_return = torch.zeros(n, device=env.device)
-        if features.visual:
+        self.waypoint = policy.mode == "waypoint"
+        self.obstacles = None
+        if self.waypoint:
+            self.grid = (env.height // 16, env.width // 16)
+            self.rays = patch_rays(*self.grid, env.metadata["camera"], env.device)
+            self.obstacles = allocate(t, n, VIEW_WIDTH)
+        if features.image_goal:
             patches = env.height // 16 * (env.width // 16)
             self.goals = features.catalog_goals(env, config.appearance)
             category = category_references(env) if config.category_goal_fraction > 0 else None
@@ -173,7 +178,7 @@ class Trainer:
         self.confused = torch.zeros((t, n), device=env.device)
         self.claimed = torch.zeros((t, n), device=env.device)
         self.confusion_by_catalog = torch.zeros(env.catalog_size, device=env.device)
-        if features.visual:
+        if features.image_goal:
             layout = json.loads((env.city_path / "layout.json").read_text())["objects"]
             self.object_class = torch.tensor([env.layout_classes.index(o["class"]) for o in layout],
                                              device=env.device, dtype=torch.long)
@@ -210,9 +215,15 @@ class Trainer:
         self.loss_weights[t].copy_(1.0 - confused.float() if self.config.mask_confusion else torch.ones_like(self.confused[t]))
         self.confusion_by_catalog.index_add_(0, self.env.catalog_index.long(), confused.float())
 
-    def _inputs(self, cls, tokens, goal, proprio, privileged, memory=None, command=None):
-        """Use the exact goal and memory seen at collection, including any in-episode refresh."""
-        return self.policy.actor_inputs_and_features(cls, tokens, goal, proprio, privileged, memory, command)
+    def _inputs(self, cls, tokens, goal, proprio, privileged, memory=None, command=None, obstacles=None):
+        """Use the exact goal and perception features seen at collection."""
+        return self.policy.actor_inputs_and_features(cls, tokens, goal, proprio, privileged, memory, command,
+                                                     obstacles=obstacles)
+
+    def _obstacles(self):
+        if self.waypoint:
+            return self.policy.waypoint_obstacles(self.current_tokens, self.env.proprio, self.rays, self.grid)
+        return None
 
     def _memory(self, goal):
         """Spatial-memory tick for the current observation (None without spatial memory). Explore
@@ -246,16 +257,17 @@ class Trainer:
         """Initialize kernels/allocator, then discard warmup physics episodes."""
         hover = self.hover.expand(self.env.n, -1).contiguous()
         for _ in range(iterations):
-            goal = self.goal_source.step(self.next_start) if self.features.visual else None
+            goal = self.goal_source.step(self.next_start) if self.features.image_goal else None
             inputs, _ = self._inputs(self.current_cls, self.current_tokens, goal,
-                                     self.env.proprio, self.env.privileged, self._memory(goal), self.command)
+                                     self.env.proprio, self.env.privileged, self._memory(goal), self.command,
+                                     obstacles=self._obstacles())
             self.policy.step(inputs, self.memory, self.next_start)
             self.env.step(hover)
             self._observe()
         self.env.reset(seed)
         if self.levels is not None:
             self.levels.episode.copy_(self.env.catalog_index.long())
-        if self.features.visual:
+        if self.features.image_goal:
             self.goal_source.ticks = 0
             self.goal_source.updates.zero_()
         self._observe()
@@ -285,20 +297,23 @@ class Trainer:
                 self.privileged[t].copy_(self.env.privileged)
                 self.starts[t].copy_(self.next_start)
                 self.hidden[t].copy_(self.memory)
-                if self.features.visual:
+                if self.features.image_goal:
                     # Explore episodes carry no goal: the goal input is zero.
                     goal = self.goal_source.step(self.next_start) * (~explore).unsqueeze(-1)
                     self.rollout_goals[t].copy_(goal)
                     self.cls[t].copy_(self.current_cls)
                     self.tokens[t].copy_(self.current_tokens)
-                memory = self._memory(self.rollout_goals[t].float() if self.features.visual else None)
+                goal = self.rollout_goals[t].float() if self.features.image_goal else None
+                memory = self._memory(goal)
                 if memory is not None:
                     self.memory_ego[t].copy_(memory[0])
                     self.memory_vector[t].copy_(memory[1])
-                inputs, logits = self._inputs(self.cls[t] if self.features.visual else None,
-                                              self.tokens[t] if self.features.visual else None,
-                                              self.rollout_goals[t].float() if self.features.visual else None,
-                                              self.proprio[t], self.privileged[t], memory, self.command)
+                obstacles = self._obstacles()
+                if self.obstacles is not None:
+                    self.obstacles[t].copy_(obstacles)
+                inputs, logits = self._inputs(self.current_cls, self.current_tokens, goal,
+                                              self.proprio[t], self.privileged[t], memory, self.command,
+                                              obstacles=obstacles)
                 if logits is not None:
                     self._confusion(t, logits, explore)
                 mean, hidden = self.policy.step(inputs, self.memory, self.next_start)
@@ -364,7 +379,7 @@ class Trainer:
                     length_b, batch = times.shape
                     command = self.commands[times, env_ids]
                     goal_rows = command.flatten(0, 1) == GOAL_COMMAND
-                    if self.features.visual:
+                    if self.features.image_goal:
                         memory = ((self.memory_ego[times, env_ids].flatten(0, 1),
                                    self.memory_vector[times, env_ids].flatten(0, 1))
                                   if self.spatial is not None else None)
@@ -374,8 +389,11 @@ class Trainer:
                                                         proprio.flatten(0, 1), privileged.flatten(0, 1), memory,
                                                         command.flatten(0, 1))
                     else:
+                        obstacles = (self.obstacles[times, env_ids].flatten(0, 1)
+                                     if self.obstacles is not None else None)
                         inputs, attended = self._inputs(None, None, None, proprio.flatten(0, 1),
-                                                        privileged.flatten(0, 1), None, command.flatten(0, 1))
+                                                        privileged.flatten(0, 1), None, command.flatten(0, 1),
+                                                        obstacles=obstacles)
                     means = self.policy.sequence(inputs.view(length_b, batch, -1),
                                                  self.hidden[first, env_ids], self.starts[times, env_ids])
                     logprobs = squashed_log_prob(means, self.policy.log_std, self.actions[times, env_ids])

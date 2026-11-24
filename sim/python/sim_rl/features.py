@@ -20,7 +20,7 @@ PREPROCESSING = {
 PRECISIONS = tuple(PREPROCESSING)
 # Goal representation the policy compares against the frame: "global" = concat(CLS, mean patch)
 # [2D]; "patch" = CLS + the goal crop's patch grid pooled to GOAL_POOL, flattened [(1+K)*D].
-GOALS = ("global", "patch")
+GOALS = ("global", "patch", "waypoint")
 
 
 def precision_of(preprocessing):
@@ -97,6 +97,10 @@ class FrozenFeatures:
     def visual(self):
         return self.encoder is not None
 
+    @property
+    def image_goal(self):
+        return self.visual and self.goal != "waypoint"
+
     @torch.no_grad()
     def encode(self, images):
         """images: float32 [m,3,H,W] in [0,1]. Returns layer-normalized (cls f32 [m,D], patches bf16 [m,P,D])."""
@@ -121,13 +125,15 @@ class FrozenFeatures:
 
     @property
     def goal_dim(self):
+        if not self.image_goal:
+            return 0
         return (2 if self.goal == "global" else 1 + GOAL_POOL[0] * GOAL_POOL[1]) * self.dim
 
     @torch.no_grad()
     def goal_embedding(self, images):
         """Goal embedding [m, goal_dim] of goal images [m,3,H,W] (see GOALS)."""
-        if self.encoder is None:
-            raise ValueError("goal embeddings require a visual arm")
+        if not self.image_goal:
+            raise ValueError("this arm does not use goal images")
         cls, patches = self.encode(images)
         if self.goal == "global":
             return torch.cat((cls, patches.float().mean(1)), dim=-1)
@@ -142,6 +148,8 @@ class FrozenFeatures:
         entry's randomized appearance at ``appearance`` strength), which is cropped to its goal box
         and encoded. Episodes look up their row by ``env.catalog_index``.
         """
+        if not self.image_goal:
+            raise ValueError("this arm does not use catalog goal images")
         if hasattr(env, "joined"):   # CityPool: per-city tables, catalog indices already offset
             return env.joined(lambda city: self.catalog_goals(city, appearance))
         cache = env.__dict__.setdefault("goal_tables", {})
