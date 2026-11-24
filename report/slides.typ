@@ -30,17 +30,17 @@
 ]
 
 #let refinement-plot() = {
-  let checks = json("../reports/gate/refine-anchors-mv-vs-mean/verdict.json").checks
+  let checks = json("../reports/gate/presentation-retrain-seed2.json").checks
   let rows = (
     ([Simulation], [Shifted-look retrieval\@1], checks.at("sim/retrieval_at_1")),
     ([Real imagery · UAVid], [Car-patch average precision], checks.at("real/sim_to_real_vehicle_ap")),
     ([Task · held-out flight frames], [Goal-matching score], checks.at("failures/patch_head_score")),
   )
-  let x(v) = 280pt + (v + 0.025) * 1650pt
+  let x(v) = 280pt + (v + 0.05) * 1350pt
   let score(v) = str(calc.round(v, digits: 3))
   block(width: slide-width, height: 226pt, breakable: false, {
     place(top + left, dx: 691pt, kicker[BEFORE → AFTER])
-    for (tick, label) in ((0.0, [0]), (0.05, [+0.05]), (0.10, [+0.10]), (0.15, [+0.15]), (0.20, [+0.20])) {
+    for (tick, label) in ((-0.05, [−0.05]), (0.0, [0]), (0.05, [+0.05]), (0.10, [+0.10]), (0.15, [+0.15]), (0.20, [+0.20])) {
       let stroke = if tick == 0 { 1.5pt + muted } else { 0.75pt + rule }
       place(top + left, dx: x(tick), dy: 24pt, line(end: (0pt, 151pt), stroke: stroke))
       place(top + left, dx: x(tick) - 23pt, dy: 182pt, box(width: 46pt, align(center, secondary(label, size: 13pt))))
@@ -55,7 +55,7 @@
       place(top + left, dx: x(row.difference) - 4.5pt, dy: y - 4.5pt, circle(radius: 4.5pt, fill: color))
       place(top + left, dx: 691pt, dy: y - 8pt, text(16pt, weight: "medium")[#score(row.baseline) → #score(row.candidate)])
     }
-    place(top + left, dx: 280pt, dy: 206pt, box(width: x(0.20) - 280pt, align(center, secondary([Score change (refined − original)], size: 15pt))))
+    place(top + left, dx: 280pt, dy: 206pt, box(width: x(0.225) - 280pt, align(center, secondary([Score change (refined − original)], size: 15pt))))
   })
 }
 
@@ -169,11 +169,11 @@ on a real drone’s camera?]
 
 #pagebreak()
 #title([03 · IMPLEMENTATION · EVALUATION], [Refinement helped most on real images])
-#secondary[Same encoder backbone, before and after adding unlabeled real images.]
+#secondary[Fresh training seed (2), same held-out data. Before and after adding unlabeled real images.]
 #v(16pt)
 #refinement-plot()
 #v(12pt)
-#secondary(size: 15pt)[Bars: paired 95% bootstrap intervals. One refinement seed. Goal matching is a probe, not flight success.]
+#secondary(size: 15pt)[Bars: paired 95% bootstrap intervals within this seed. Goal matching is a probe, not flight success.]
 
 #pagebreak()
 #title([04 · IMPLICATIONS], [Flight gives us harder camera views])
