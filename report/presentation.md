@@ -4,7 +4,7 @@
 
 ## Before you start
 
-- Open the [slides](../runs/presentation/slides.pdf) full-screen and cue the silent [flight reel](../runs/presentation/pilot-demo.mp4). Record the whole display or splice the MP4 into the recording at slide 11; a capture limited to the PDF window won’t show the video player. Make a short test recording to check slide legibility, mic level, and the video cut.
+- Open the [slides](../runs/presentation/slides.pdf) full-screen and cue the silent [textured flight reel](../runs/presentation/pilot-demo-textured.mp4). Record the whole display or splice the MP4 into the recording at slide 11; a capture limited to the PDF window won’t show the player. Make a short test recording to check slide legibility, mic level, and the video cut.
 - For a three-minute cut, use slides 1, 3, 5–6, 8, 10 and 12. Skip the reel or splice in a short excerpt. No live server or model needs to run.
 - Keep the [report](report.pdf) and [supplement](supplement.pdf) available for questions. To rebuild the deck from the repo root: `nix develop --command typst compile report/slides.typ runs/presentation/slides.pdf` (create the output directory first if needed).
 
@@ -54,9 +54,11 @@ Trace the arrows left to right.
 
 ### 11 · Flight reel (3:50–4:36, including 27 seconds of video)
 
-> A learned policy flies in simulation and supplies camera viewpoints for testing the encoder. These are selected successes with location hints: onboard view on the left, an external replay camera on the right.
+> A learned policy flies in simulation and supplies camera viewpoints for testing the encoder. These are selected successes with location hints. The left panel re-renders the recorded camera poses with Poly Haven textures; the right panel is the original external camera recording.
 
-**Cut to `pilot-demo.mp4`.** The first clip is held out; the memory-enabled second clip is from a training district. Then return to the deck.
+**Cut to `pilot-demo-textured.mp4`.** The first clip is held out; the memory-enabled second clip is from a training district. Then return to the deck. The [original reel](../runs/presentation/pilot-demo.mp4) shows the policy's actual camera input.
+
+To regenerate the presentation visuals from the saved flights, run `nix develop --command .venv/bin/python scripts/render_presentation.py --figure report/figures/textured-flight.png --video --ffmpeg /path/to/ffmpeg` from the repo root with FFmpeg (including `drawtext` and `libx264`). This path doesn't change training or benchmark renders.
 
 ### 12 · Takeaway (4:36–5:00)
 

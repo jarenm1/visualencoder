@@ -44,18 +44,35 @@ uniform sampler2D detailC; uniform sampler2D normalC;
 uniform sampler2D shadowMap;
 uniform int classMode; uniform float detailStrength; uniform vec3 photoColour;
 uniform vec3 tileSize; uniform vec3 meanA; uniform vec3 meanB; uniform vec3 meanC;
+#ifdef PRESENTATION_LIGHT
+uniform vec3 tileHeight;
+#endif
 uniform mat4 lightVP; uniform float shadowTexel; uniform float shadowBias;
 uniform vec3 viewPos; uniform vec3 sunDir; uniform vec3 sunColor;
 uniform vec3 skyAmbient; uniform vec3 groundAmbient; uniform vec3 tint;
 uniform vec3 fogColor; uniform float fogDensity; uniform float exposure;
 out vec4 finalColor;
 
+vec3 linear_rgb(vec3 c) {
+    return mix(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, lessThanEqual(c, vec3(0.04045)));
+}
+vec3 display_rgb(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, 12.92 * c, lessThanEqual(c, vec3(0.0031308)));
+}
+
 vec3 triWeights(vec3 n) { vec3 w = pow(abs(n), vec3(4.0)); return w / (w.x + w.y + w.z); }
-vec3 triSample(sampler2D t, vec3 p, vec3 w, float s) {
+vec3 triSample(sampler2D t, vec3 p, vec3 w, vec2 s) {
+#ifdef PRESENTATION_LIGHT
+    return linear_rgb(texture(t, p.zy / s).rgb) * w.x
+         + linear_rgb(texture(t, p.xz / s).rgb) * w.y
+         + linear_rgb(texture(t, p.xy / s).rgb) * w.z;
+#else
     return texture(t, p.zy / s).rgb * w.x + texture(t, p.xz / s).rgb * w.y + texture(t, p.xy / s).rgb * w.z;
+#endif
 }
 // Whiteout-blended triplanar normal mapping (tangent spaces aligned with the projection axes).
-vec3 triNormal(sampler2D t, vec3 p, vec3 n, vec3 w, float s) {
+vec3 triNormal(sampler2D t, vec3 p, vec3 n, vec3 w, vec2 s) {
     vec3 tx = texture(t, p.zy / s).xyz * 2.0 - 1.0;
     vec3 ty = texture(t, p.xz / s).xyz * 2.0 - 1.0;
     vec3 tz = texture(t, p.xy / s).xyz * 2.0 - 1.0;
@@ -72,6 +89,9 @@ float vnoise(vec2 p) {
 
 void main() {
     vec3 palette = (texture(texture0, fragTexCoord) * colDiffuse).rgb;
+#ifdef PRESENTATION_LIGHT
+    palette = linear_rgb(texture(texture0, fragTexCoord).rgb) * colDiffuse.rgb;
+#endif
     vec3 n = normalize(fragNormal);
     if (!gl_FrontFacing) n = -n;
     vec3 geomN = n;
@@ -79,8 +99,12 @@ void main() {
     if (classMode != 0) {
         vec3 p = fragPosition, w = triWeights(n);
         float variant = fragColor.r, kind = floor(fragColor.g * 4.0 + 0.5);
-        vec3 dA = triSample(detailA, p, w, tileSize.x), dB = triSample(detailB, p, w, tileSize.y), dC = triSample(detailC, p, w, tileSize.z);
-        vec3 nA = triNormal(normalA, p, n, w, tileSize.x), nB = triNormal(normalB, p, n, w, tileSize.y), nC = triNormal(normalC, p, n, w, tileSize.z);
+        vec2 sA = vec2(tileSize.x), sB = vec2(tileSize.y), sC = vec2(tileSize.z);
+#ifdef PRESENTATION_LIGHT
+        sA.y = tileHeight.x; sB.y = tileHeight.y; sC.y = tileHeight.z;
+#endif
+        vec3 dA = triSample(detailA, p, w, sA), dB = triSample(detailB, p, w, sB), dC = triSample(detailC, p, w, sC);
+        vec3 nA = triNormal(normalA, p, n, w, sA), nB = triNormal(normalB, p, n, w, sB), nC = triNormal(normalC, p, n, w, sC);
         vec3 sel;
         if (classMode == 1) {          // ground: two grasses blended at large scale, dirt patches
             float m = vnoise(p.xz / 35.0), d = smoothstep(0.62, 0.75, vnoise(p.xz / 18.0 + 7.3));
@@ -100,6 +124,9 @@ void main() {
         vec3 base = palette;
         if (classMode == 1) base = mix(vec3(0.22, 0.36, 0.13), vec3(0.34, 0.44, 0.17), vnoise(p.xz / 60.0));
         if (classMode == 4) base = mix(vec3(0.17, 0.30, 0.10), vec3(0.33, 0.42, 0.14), variant);
+#ifdef PRESENTATION_LIGHT
+        if (classMode == 1 || classMode == 4) base = linear_rgb(base);
+#endif
         vec3 cA = mix(base * mix(vec3(1.0), dA / max(meanA, vec3(0.02)), detailStrength), dA, photoColour.x);
         vec3 cB = mix(base * mix(vec3(1.0), dB / max(meanB, vec3(0.02)), detailStrength), dB, photoColour.y);
         vec3 cC = mix(base * mix(vec3(1.0), dC / max(meanC, vec3(0.02)), detailStrength), dC, photoColour.z);
@@ -108,6 +135,10 @@ void main() {
         albedo = cA * sel.x + cB * sel.y + cC * sel.z;
         n = normalize(nA * sel.x + nB * sel.y + nC * sel.z);
     }
+#ifdef PRESENTATION_LIGHT
+        // Preserve the faceted mesh silhouette and keep normal detail from dominating the light.
+        n = normalize(mix(geomN, n, 0.55));
+#endif
     float ndl = max(dot(n, sunDir), 0.0);
     float lit = 1.0;
     vec4 ls = lightVP * vec4(fragPosition, 1.0);
@@ -123,9 +154,21 @@ void main() {
     vec3 ambient = mix(groundAmbient, skyAmbient, 0.5 + 0.5 * n.y);
     vec3 h = normalize(normalize(viewPos - fragPosition) + sunDir);
     float spec = pow(max(dot(n, h), 0.0), 48.0) * 0.12 * step(0.0, dot(geomN, sunDir));
+#ifdef PRESENTATION_LIGHT
+    float facing = max(dot(geomN, sunDir), 0.0);
+    // Normal maps should not light the back of a surface. Matte surfaces get a small, broad highlight.
+    ndl *= smoothstep(0.0, 0.16, facing);
+    spec = pow(max(dot(n, h), 0.0), 32.0) * 0.035 * ndl;
+    vec3 c = (albedo * tint * (ambient + sunColor * ndl * lit) + sunColor * spec * lit) * exposure;
+    float luminance = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    c /= 1.0 + 0.28 * luminance;
+    c = mix(linear_rgb(fogColor), c, exp(-fogDensity * length(fragPosition - viewPos)));
+    finalColor = vec4(display_rgb(c), 1.0);
+#else
     vec3 c = (albedo * tint * (ambient + sunColor * ndl * lit) + sunColor * spec * lit) * exposure;
     c = mix(fogColor, c, exp(-fogDensity * length(fragPosition - viewPos)));
     finalColor = vec4(clamp(c, 0.0, 1.0), 1.0);
+#endif
 }
 """
 
@@ -314,11 +357,18 @@ class SurfaceTexture:
     albedo: object
     normal: object
     size_m: float
+    height_m: float
     mean: tuple[float, float, float]
 
 
 class CityRenderer:
-    def __init__(self, scene_dir: Path, width: int, height: int, textures_dir: Path = Path("assets/polyhaven")):
+    def __init__(
+        self, scene_dir: Path, width: int, height: int, textures_dir: Path = Path("assets/polyhaven"),
+        *, presentation: bool = False,
+    ):
+        # Preserve the benchmark image distribution; the grade is for qualitative renders only.
+        self.presentation = presentation
+        self.shadow_far = 640.0 if presentation else FAR
         self.layout = CityLayout(scene_dir)
         self.width, self.height = width, height
         rl.set_trace_log_level(rl.LOG_WARNING)
@@ -327,7 +377,10 @@ class CityRenderer:
         self.rgb_target = rl.load_render_texture(width * SUPERSAMPLE, height * SUPERSAMPLE)
         self.target = rl.load_render_texture(width, height)
         self.shadow = self._load_shadow_target()
-        self.lit = rl.load_shader_from_memory(VERTEX, LIT)
+        fragment = LIT.replace("#version 330", "#version 330\n#define PRESENTATION_LIGHT") if presentation else LIT
+        self.lit = rl.load_shader_from_memory(VERTEX, fragment)
+        if self.lit.id == rl.rl_get_shader_id_default():
+            raise RuntimeError("city lighting shader did not compile")
         self.semantic = rl.load_shader_from_memory(VERTEX, SEMANTIC)
         self.depth = rl.load_shader_from_memory(VERTEX, DEPTH)
         for shader in (self.lit, self.semantic, self.depth):
@@ -344,7 +397,7 @@ class CityRenderer:
             model = rl.load_model(str(path))
             for i in range(model.materialCount):
                 m = model.materials[i].maps[rl.MATERIAL_MAP_ALBEDO]
-                if m.texture.id == default_texture:
+                if not presentation and m.texture.id == default_texture:
                     # Untextured glTF materials carry a linear base colour; the shader works in sRGB values.
                     m.color = rl.Color(_srgb_u8(m.color.r), _srgb_u8(m.color.g), _srgb_u8(m.color.b), m.color.a)
             self.models[class_id] = model
@@ -381,8 +434,14 @@ class CityRenderer:
                         rl.rl_texture_parameters(tex.id, rl.RL_TEXTURE_FILTER_ANISOTROPIC, 8)
                         rl.set_texture_wrap(tex, rl.TEXTURE_WRAP_REPEAT)
                         textures.append(tex)
-                    mean = np.asarray(Image.open(root / tid / "diff.jpg").convert("RGB").reduce(16), dtype=np.float64).mean((0, 1)) / 255
-                    loaded[tid] = SurfaceTexture(textures[0], textures[1], float(spec["textures"][tid]["size_m"][0]), tuple(mean))
+                    with Image.open(root / tid / "diff.jpg") as image:
+                        if self.presentation:
+                            rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)[::8, ::8] / 255.0
+                            mean = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4).mean((0, 1))
+                        else:
+                            mean = np.asarray(image.convert("RGB").reduce(16), dtype=np.float64).mean((0, 1)) / 255
+                    size_x, size_y = map(float, spec["textures"][tid]["size_m"])
+                    loaded[tid] = SurfaceTexture(textures[0], textures[1], size_x, size_y, tuple(mean))
                 pools["heldout" if tid in held else "train"][role].append(loaded[tid])
         self._all_textures = list(loaded.values())
         return pools
@@ -469,10 +528,11 @@ class CityRenderer:
         ahead = flat / norm * (SHADOW_EXTENT_M * 0.3) if norm > 1e-6 else np.zeros(3)
         centre = np.array([pose.position[0], 0.0, pose.position[2]]) + ahead
         up = (0.0, 0.0, 1.0) if abs(sun[1]) > 0.99 else (0.0, 1.0, 0.0)
-        camera = rl.Camera3D(tuple(centre + sun * (FAR / 2)), tuple(centre), up, SHADOW_EXTENT_M, rl.CAMERA_ORTHOGRAPHIC)
+        camera = rl.Camera3D(tuple(centre + sun * (self.shadow_far / 2)), tuple(centre), up,
+                             SHADOW_EXTENT_M, rl.CAMERA_ORTHOGRAPHIC)
         rl.begin_texture_mode(self.shadow)
         rl.clear_background(rl.WHITE)
-        rl.rl_set_clip_planes(NEAR, FAR)
+        rl.rl_set_clip_planes(NEAR, self.shadow_far)
         rl.begin_mode_3d(camera)
         light_vp = rl.matrix_multiply(rl.rl_get_matrix_modelview(), rl.rl_get_matrix_projection())
         self._render_models(self.semantic)
@@ -502,7 +562,7 @@ class CityRenderer:
         light_vp = self._render_shadow_map(pose, sun)
         rl.set_shader_value_matrix(s, rl.get_shader_location(s, "lightVP"), light_vp)
         self._set(s, "shadowTexel", [1.0 / SHADOW_SIZE])
-        self._set(s, "shadowBias", [SHADOW_BIAS_M / (FAR - NEAR)])
+        self._set(s, "shadowBias", [SHADOW_BIAS_M / (self.shadow_far - NEAR)])
         self._set(s, "viewPos", pose.position)
         self._set(s, "sunDir", sun)
         for name, value in [
@@ -522,6 +582,8 @@ class CityRenderer:
                 self._set(s, "detailStrength", [DETAIL_STRENGTH[cls]])
                 self._set(s, "photoColour", PHOTO_COLOUR[cls])
                 self._set(s, "tileSize", [t.size_m for t in picked])
+                if self.presentation:
+                    self._set(s, "tileHeight", [t.height_m for t in picked])
                 for t, name in zip(picked, ("meanA", "meanB", "meanC")):
                     self._set(s, name, t.mean)
             for i in range(model.materialCount):

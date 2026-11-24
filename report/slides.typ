@@ -139,11 +139,11 @@
 
 #pagebreak()
 #title([10 · LEARNED FLIGHT], [The pilot supplies harder camera views])
-#strip("figures/city-cameras.png", 176pt, 1280 / 528)
+#image("figures/textured-flight.png", width: 550pt)
 #v(18pt)
-#text(22pt, weight: "bold")[Play the 27-second replay: `pilot-demo.mp4`]
+#text(22pt, weight: "bold")[Play the 27-second replay: `pilot-demo-textured.mp4`]
 #v(11pt)
-#secondary[Two selected approaches with location hints. The external view is for the audience only.]
+#secondary[Two selected approaches with location hints. Textured re-render and recorded external camera.]
 #v(19pt)
 #text(20pt, weight: "medium")[Frozen camera features + image goal + motion inputs → recurrent PPO pilot]
 #v(8pt)
