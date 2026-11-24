@@ -29,18 +29,19 @@
   #body
 ]
 
-#kicker[VISUAL ENCODER RESEARCH]
+#kicker[01 · PROBLEM]
 #v(45pt)
 #text(64pt, weight: "bold")[Appearance-robust \ vision for drones]
 #v(23pt)
-#secondary(size: 25pt)[Can a small encoder recognize the same scene \ through changes in lighting, textures, and fog?]
+#secondary(size: 25pt)[Same scene, different lighting and textures. \
+Can a small encoder keep the features that matter?]
 #v(34pt)
 #text(22pt, weight: "bold", fill: accent)[300M-parameter teacher → 22M-parameter student]
 #v(28pt)
 #secondary[Jaren McHugh]
 
 #pagebreak()
-#title([01 · DATA], [One pose, different appearances])
+#title([01 · PROBLEM], [Same street, different pixels])
 #strip("figures/looks.png", 128pt, 1600 / 960)
 #v(5pt)
 #grid(columns: (1fr, 2fr, 2fr),
@@ -51,26 +52,26 @@
 #v(25pt)
 #text(24pt, weight: "bold")[Change lighting, materials, and fog. Keep the geometry fixed.]
 #v(15pt)
-#secondary[Train on paired renders. Test on unseen poses and appearances.]
+#secondary[The test: do features still match when the camera pose stays the same?]
 
 #pagebreak()
-#title([02 · ARCHITECTURE], [What runs on each frame])
+#title([02 · SOLUTION], [Keep only the small encoder at runtime])
 #image("figures/encoder-architecture.svg", width: slide-width)
 #v(18pt)
 #secondary[22M parameters. No teacher or distillation heads at inference.]
 
 #pagebreak()
-#title([03 · OUTPUTS], [A scene summary and a spatial grid])
+#title([02 · SOLUTION], [Keep a scene summary and a spatial grid])
 #v(28pt)
 #grid(columns: (1fr, 1fr), gutter: 16pt,
-  card([ONE GLOBAL TOKEN], [A summary of the frame. Useful for scene retrieval and pose probes.], highlighted: true),
-  card([300 PATCH TOKENS], [One feature vector per patch location. Useful for depth, segmentation, and goal matching.]),
+  card([1 CLS TOKEN], [A whole-frame feature for pose and retrieval.], highlighted: true),
+  card([300 PATCH TOKENS], [A grid of local features for depth and segmentation.]),
 )
 #v(25pt)
 #secondary[Self-attention lets each token use context from the rest of the image.]
 
 #pagebreak()
-#title([04 · DISTILLATION], [Teach the student to match features])
+#title([03 · IMPLEMENTATION], [Learn features from a frozen teacher])
 #v(22pt)
 #grid(columns: (1fr, 1fr), gutter: 16pt,
   card([FROZEN TEACHER], [LingBot ViT-L/16 produces 1024-dimensional target features.]),
@@ -80,24 +81,35 @@
 #text(23pt, weight: "bold")[Cosine loss on the global token and corresponding patches.]
 
 #pagebreak()
-#title([05 · PAIRED TARGETS], [Same images. Different teacher target.])
-#v(28pt)
+#title([03 · IMPLEMENTATION], [What changes: the teacher target])
+#v(18pt)
 #grid(columns: (1fr, 1fr), gutter: 16pt,
-  card([STANDARD], [Look A matches teacher A. \ Look B matches teacher B.]),
-  card([PAIRED], [Both looks match the mean of teacher A and teacher B.], highlighted: true),
+  card([STANDARD DISTILLATION], [
+    #grid(columns: (1fr, auto, 1fr), column-gutter: 9pt, row-gutter: 14pt,
+      [Look A], [→], [Teacher A],
+      [Look B], [→], [Teacher B],
+    )
+  ]),
+  card([PAIRED-VIEW DISTILLATION], [
+    #grid(columns: (1fr, auto, 1fr), column-gutter: 9pt, row-gutter: 14pt,
+      [Look A], [↘], grid.cell(rowspan: 2, align: horizon)[Mean of \
+        teacher A and B],
+      [Look B], [↗],
+    )
+  ], highlighted: true),
 )
-#v(25pt)
-#secondary[Same pose and shared crop, so patch locations line up across the pair.]
+#v(23pt)
+#secondary[Same pose and shared crop, so patch locations line up.]
 
 #pagebreak()
-#title([06 · EVALUATION], [What do the frozen features retain?])
+#title([03 · IMPLEMENTATION], [What do the frozen features retain?])
 #v(28pt)
 #card([LINEAR PROBES], [Fit on canonical renders. Read out pose, depth, and segmentation under shifted looks.])
 #v(18pt)
 #card([RETRIEVAL], [Given one view, find the same pose under a different look. No fitted probe.], highlighted: true)
 
 #pagebreak()
-#title([07 · SIMULATOR RESULTS], [Paired targets improve robustness])
+#title([03 · IMPLEMENTATION · SIMULATOR RESULTS], [Paired targets improve robustness])
 #set text(size: 18pt)
 #table(
   columns: (2.1fr, 1fr, 1fr, 1.1fr, 1.2fr),
@@ -116,17 +128,17 @@
 #secondary[Held-out lighting and textures. Same probe protocol for all encoders; retrieval needs no fitted probe.]
 
 #pagebreak()
-#title([08 · REAL-DATA REFINEMENT], [Add real RGB without dropping simulator pairs])
+#title([03 · IMPLEMENTATION], [Add unlabeled real training images])
 #v(26pt)
 #grid(columns: (1fr, 1fr), gutter: 16pt,
   card([SIMULATOR], [Keep the paired teacher target.]),
   card([UAVID TRAINING RGB], [Match the teacher on each unlabeled real frame.], highlighted: true),
 )
 #v(25pt)
-#secondary[Update only the last four student blocks. Evaluate on separate UAVid videos.]
+#secondary[Update the last four blocks and final LayerNorm. Test on separate videos.]
 
 #pagebreak()
-#title([09 · REAL-IMAGE RESULTS], [Unlabeled real images improved transfer])
+#title([03 · IMPLEMENTATION · REAL-IMAGE RESULTS], [Unlabeled real images improved transfer])
 #secondary(size: 22pt)[Paired student → refined student, matched run]
 #v(36pt)
 #text(76pt, weight: "bold", fill: accent)[0.604 → 0.749]
@@ -138,22 +150,20 @@
 #secondary[Simulator readouts stayed within prespecified margins. This is patch ranking, not box detection.]
 
 #pagebreak()
-#title([10 · LEARNED FLIGHT], [The pilot supplies harder camera views])
+#title([04 · IMPLICATIONS], [Flight gives us harder camera views])
 #image("figures/textured-flight.png", width: 550pt)
 #v(18pt)
-#text(22pt, weight: "bold")[Play the 27-second replay: `pilot-demo-textured.mp4`]
+#text(22pt, weight: "bold")[Learned flight in simulation]
 #v(11pt)
-#secondary[Two selected approaches with location hints. Textured re-render and recorded external camera.]
+#secondary[Selected successes with hints. Re-rendered onboard view and original external view.]
 #v(19pt)
-#text(20pt, weight: "medium")[Frozen camera features + image goal + motion inputs → recurrent PPO pilot]
-#v(8pt)
-#secondary[Recorded flights supply test frames for a fresh goal-matching probe.]
+#text(20pt, weight: "medium")[Recorded flight frames → fresh probe on frozen features]
 
 #pagebreak()
-#title([11 · TAKEAWAY], [What improved, and what didn’t])
+#title([04 · IMPLICATIONS], [Better features, not proven autonomy])
 #v(16pt)
-#card([WHAT WORKED], [Paired targets improved simulator robustness. Real RGB improved transfer.], highlighted: true)
+#card([WHAT THIS ENABLES], [A 22M-parameter backbone for vision tasks. No teacher at runtime.], highlighted: true)
 #v(18pt)
-#card([WHAT’S OPEN], [Small targets and look-alikes still fail. Held-out navigation did not reliably improve.])
+#card([WHAT WE DIDN’T SHOW], [Reliable navigation, small-object matching, or onboard latency.])
 #v(22pt)
 #secondary[No-hint city hard set: 28/256 vs. 24/256 successful flights (original vs. refined pilot).]

@@ -1,68 +1,48 @@
 # Presentation guide — Appearance-robust vision for drones
 
-**Five-minute recording, 12 slides.** Walk through one frame from RGB to features, then show how those features were trained and tested. Keep the narration on the encoder; the flight reel is an example, not the headline result.
+**Five-minute recording, 12 slides.** Tell the story in four parts. Use the cues below to practice; don’t read them into the mic.
+
+| Rubric question | Slides | One answer to land |
+|---|---|---|
+| What was the problem? | 1–2 | Lighting, materials, and fog can change the pixels without changing the scene. We wanted a small encoder whose features stay useful under that shift. |
+| What’s the solution? | 3–4 | Use a 22M-parameter ViT that keeps a scene summary and a grid of local features. Train it with a large teacher; deploy only the student. |
+| How did you solve it? | 5–10 | Average teacher features across aligned simulator looks, test against standard distillation, then add unlabeled real images and measure transfer separately. |
+| What are the implications? | 11–12 | Better features for vision tasks at the same student size; simulated flight exposes failure cases, but doesn’t establish real-world navigation or onboard latency. |
 
 ## Before you start
 
-- Open the [slides](../runs/presentation/slides.pdf) full-screen and cue the silent [textured flight reel](../runs/presentation/pilot-demo-textured.mp4). Record the whole display or splice the MP4 into the recording at slide 11; a capture limited to the PDF window won’t show the player. Make a short test recording to check slide legibility, mic level, and the video cut.
+- Open the [slides](../runs/presentation/slides.pdf) full-screen. Cue the silent [flight reel](../runs/presentation/pilot-demo-textured.mp4) for slide 11. Capture the whole display or splice in the MP4; a capture limited to the PDF window won’t show the player.
+- Make a 15-second audio test in the same recorder. Play it back with headphones: listen for clipping, fan noise, and dropped words. Then do one timed take and trim the reel before speeding up the method or the results.
 - For a three-minute cut, use slides 1, 3, 5–6, 8, 10 and 12. Skip the reel or splice in a short excerpt. No live server or model needs to run.
 - Keep the [report](report.pdf) and [supplement](supplement.pdf) available for questions. To rebuild the deck from the repo root: `nix develop --command typst compile report/slides.typ runs/presentation/slides.pdf` (create the output directory first if needed).
 
-## What to say
+## On-camera cues
 
-### 1 · Question (0:00–0:18)
+### Problem · 0:00–0:38
 
-> A building is still the same building at noon and at dusk, but it looks different to the camera. We wanted a small encoder that keeps useful scene information when appearance changes, then tested whether that helped on real drone imagery.
+- **1 · 0:00.** Open with the technical question: “Can a small encoder tell this is the same scene when the pixels look different?”
+- **2 · 0:18.** Point to the same roof or road marking across the renders. Same pose and geometry; different lighting, materials, and fog. Transition: “That gives us a controlled way to train and test invariance.”
 
-### 2 · Data (0:18–0:38)
+### Solution · 0:38–1:27
 
-> These five images share one camera pose in our Blender city. We change lighting, materials and fog, not the geometry. The middle two columns show the kinds of looks we pair in training; the last two are held-out looks for evaluation.
+- **3 · 0:38.** Follow the architecture arrows: 320×240 RGB → 16×16 patches → twelve transformer blocks → normalized features. Say that the backbone already exists; the contribution is the training recipe.
+- **4 · 1:08.** Contrast one 384-dimensional CLS token for the whole frame with 300 local tokens for spatial readouts. The encoder does not output boxes or flight controls. Transition: “We want the student to keep that information when appearance changes.”
 
-### 3 · Architecture (0:38–1:08)
+### Implementation · 1:27–3:50
 
-Trace the arrows left to right.
+- **5 · 1:27.** Point to the frozen teacher and the trainable student. The two linear heads match the student’s 384-dimensional CLS and patch features to the teacher’s 1024-dimensional space for cosine loss. None of that runs at inference.
+- **6 · 1:52.** Trace separate arrows, then converging arrows. Same images, different targets: average the teacher’s normalized features from the two aligned looks. Shared cropping keeps patches aligned.
+- **7 · 2:18.** Freeze the encoders. Fit linear probes on canonical renders and test on shifted looks. Retrieval asks whether the same pose is the nearest match under a different look, with no trained probe.
+- **8 · 2:40.** Point to the last two rows: retrieval 0.747 → 0.951; depth error 0.242 → 0.201. Don’t read the table. DINOv3-L still leads on segmentation.
+- **9 · 3:04.** Transition: “But robustness in simulation didn’t guarantee transfer.” Keep the paired simulator target, add unlabeled UAVid RGB, and update the last four blocks and final LayerNorm.
+- **10 · 3:25.** A simulator-fit probe ranks car patches on separate UAVid videos: AP 0.604 → 0.749, with a paired interval over videos. Patch ranking, not object detection.
 
-> A 320 by 240 frame gives us a grid of 20 by 15 patches, each 16 pixels square. Patch embedding turns those patches into vectors. Twelve transformer blocks let tokens exchange context across the image. At the output we keep one global token and 300 patch tokens, all 384-dimensional. This is the existing 22-million-parameter LingBot ViT-S backbone; our contribution is how we train it, not a new transformer architecture.
+### Implications · 3:50–5:00
 
-### 4 · Outputs (1:08–1:27)
+- **11 · 3:50.** Explain what the reel shows, then play it (~27 seconds). These are selected successes with location hints. Left: Poly Haven re-render of the saved camera poses. Right: original external view. The first clip is held out; the second is from a training district. Flight frames also provide harder views for a fresh probe on frozen features.
+- **12 · 4:36.** End on the distinction: paired views improved simulator robustness; real RGB improved transfer. The 22M-parameter encoder needs no teacher at runtime, but onboard latency was not measured and the new pilot didn’t reliably improve. Stop by 5:00.
 
-> The CLS token is a summary of the frame. For global readouts we also pool the patch features. The full grid keeps the spatial layout, so a small probe can read depth or class at a particular location. The encoder itself doesn’t output boxes or flight controls.
-
-### 5 · Distillation (1:27–1:52)
-
-> The 300-million-parameter teacher stays frozen. Its features are 1024-dimensional, so two linear layers map the student’s outputs into the same space: one for the CLS token, one shared by all the patches. Cosine loss compares the direction of the projected features with the target. At inference we keep only the student backbone.
-
-### 6 · Paired targets (1:52–2:18)
-
-> Standard distillation matches each image to the teacher on that same image. Our variant averages the teacher’s normalized features across the two looks, then makes each student view match that shared target. The crop is shared so we average the same patch locations. Same data, same backbone, different supervision.
-
-### 7 · Evaluation (2:18–2:40)
-
-> We freeze the encoders. We fit small linear probes on canonical renders, then test what pose, depth and segmentation information survives under shifted looks. Retrieval asks a separate question: can a view find the same pose in another appearance, without fitting a readout?
-
-### 8 · Simulator baselines (2:40–3:04)
-
-> Follow the last two rows. Standard distillation already helps, but changing to paired targets raises retrieval from 0.747 to 0.951 and drops depth error from 0.242 to 0.201. DINOv3-L still leads on segmentation. The main improvement is robustness under new looks, not a sweep of every benchmark.
-
-### 9 · Real-data refinement (3:04–3:25)
-
-> The simulator gain didn’t automatically carry over to UAVid. We kept the paired simulator target and mixed in unlabeled real training images, matching each real frame to the teacher on that frame. We updated only the student’s last four blocks.
-
-### 10 · UAVid results (3:25–3:50)
-
-> A probe fit in simulation ranked car patches in separate UAVid validation videos. In the matched run, average precision rose from 0.604 to 0.749. The interval resamples videos, not patches, and the simulator checks stayed within the margins we set in advance. This is patch ranking, not bounding-box detection.
-
-### 11 · Flight reel (3:50–4:36, including 27 seconds of video)
-
-> A learned policy flies in simulation and supplies camera viewpoints for testing the encoder. These are selected successes with location hints. The left panel re-renders the recorded camera poses with Poly Haven textures; the right panel is the original external camera recording.
-
-**Cut to `pilot-demo-textured.mp4`.** The first clip is held out; the memory-enabled second clip is from a training district. Then return to the deck. The [original reel](../runs/presentation/pilot-demo.mp4) shows the policy's actual camera input.
-
-To regenerate the presentation visuals from the saved flights, run `nix develop --command .venv/bin/python scripts/render_presentation.py --figure report/figures/textured-flight.png --video --ffmpeg /path/to/ffmpeg` from the repo root with FFmpeg (including `drawtext` and `libx264`). This path doesn't change training or benchmark renders.
-
-### 12 · Takeaway (4:36–5:00)
-
-> Paired targets helped with unfamiliar simulator looks. Real RGB improved transfer. The flight frames exposed weaknesses in small-target and look-alike matching that the refinement didn’t fix. It didn’t establish a better pilot either. The result is a stronger visual representation, not reliable autonomous flight.
+The [original reel](../runs/presentation/pilot-demo.mp4) shows the policy’s actual input. To regenerate the textured visuals without changing benchmark renders: `nix develop --command .venv/bin/python scripts/render_presentation.py --figure report/figures/textured-flight.png --video --ffmpeg /path/to/ffmpeg` (requires `drawtext` and `libx264`).
 
 ## Likely questions
 
