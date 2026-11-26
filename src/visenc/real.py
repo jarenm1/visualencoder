@@ -298,7 +298,7 @@ def rescore(reports: list[Path], out: Path, resamples: int = 1000, seed: int = 0
     return results
 
 
-def run(args: argparse.Namespace) -> None:
+def run(args: argparse.Namespace, *, encoder_factory=None) -> None:
     # Keep the historical fit data, region selection, row ordering and probe settings unchanged.
     import torch
     from .data import Split
@@ -341,7 +341,7 @@ def run(args: argparse.Namespace) -> None:
         prediction_path = out / f"predictions-{index:03d}.npz"
         if prediction_path.exists():
             raise ValueError(f"refusing to overwrite saved predictions: {prediction_path}")
-        enc = Encoder(spec, batch_size=16)
+        enc = (encoder_factory or Encoder)(spec, batch_size=16)
         va = enc(va_rgb).patches.flatten(1, 2)
         flat = va.reshape(-1, va.shape[-1])
         sim_probe = DenseProbes(enc, sim, sim_fit, view=args.sim_view).semantic

@@ -204,3 +204,10 @@ The supplement contains secondary ablations, precision checks, global/real-trans
 ## Licences
 
 The Kenney kits are CC0, fetched from OpenGameArt mirrors. Poly Haven textures are CC0. LingBot-Vision code and weights are Apache-2.0. DINOv3 weights are under the DINOv3 licence.
+
+The UAVid-derived examples in `report/figures/real.png`, `report/figures/real-car-readout.png`, and
+`report/figures/uavid-training-view.png` use imagery from [UAVid](https://uavid.nl/) by Ye Lyu, George
+Vosselman, Gui-Song Xia, Alper Yilmaz, and Michael Ying Yang
+([paper](https://doi.org/10.1016/j.isprsjprs.2020.05.009)). The examples are cropped/resized and some
+include model predictions. They are distributed under
+[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/).

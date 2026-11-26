@@ -7,7 +7,7 @@ S="nix develop --command nix develop path:sim --command env PYTHONPATH=sim/pytho
 LOG=reports/drone15.log
 ENC=run:runs/refine-anchors-mv
 echo "$(date +%T) perception heads" >> $LOG
-[ -f runs/perception-v5/refine-anchors-mv.pt ] || $S sim/python/train.py perception --encoders $ENC --train-frames 16384 \
+[ -f runs/perception-v5/refine-anchors-mv.pt ] || $S sim/python/train.py perception --encoders $ENC --train-frames 8192 \
   --test-frames 3072 --epochs 16 --out runs/perception-v5 >> $LOG 2>&1 || exit 1
 R=runs/drone15-v5-refined-seed0; rm -rf $R; mkdir -p $R
 echo "$(date +%T) drone15" >> $LOG
