@@ -11,7 +11,7 @@
 
 ## Before you start
 
-- Open the [slides](../runs/presentation/slides.pdf) full-screen. Cue the silent [flight reel](../runs/presentation/pilot-demo-textured.mp4) for slide 21. Capture the whole display or splice in the MP4.
+- Open the [slides](../runs/presentation/slides.pdf) full-screen. Cue the silent [dual-textured flight clip](../runs/replay-drone11-textured-full/env-015.mp4) for slide 21. Capture the whole display or splice in the MP4.
 - Make a 15-second audio test in the same recorder. Play it back with headphones: listen for clipping, fan noise, and dropped words. Then do one timed take and trim the reel before speeding up the method or the results.
 - **Five-minute cut:** Show slides 1–5, 7, 9–10, 12–13, 15, 17–20, and 22. Aim to reach slide 12 by 2:25 and slide 18 by 4:00. Skip the reel or run 8 seconds over the closing narration. The full deck also works offline.
 - Keep the [report](report.pdf) and [supplement](supplement.pdf) available for questions. To rebuild from the repo root: `nix develop --command typst compile --root . report/slides.typ runs/presentation/slides.pdf` (create the output directory first if needed).
@@ -49,10 +49,10 @@
 ### Implications · 5:35–6:30
 
 - **20 · 5:35.** “Better real-image scores didn’t fix the pilot. With matched training budgets, the two policies reached the goal in only four and five of 256 no-hint episodes. Both collided in over half, and neither solved a hidden-and-far episode.” No hint removes the location hint, not the simulator-assisted crop refresh.
-- **21 · 5:51.** Play roughly 20 seconds of the reel. These are selected successes with location hints, not a random sample. Left is a re-render of saved camera poses; right is the original external view.
+- **21 · 5:51.** Play the 11.6-second clip. This is one selected success with a location hint, not a random sample. Both camera views were re-rendered from the same recorded flight. The textures and lighting are for presentation; they were not the policy’s input.
 - **22 · 6:14.** Trace the three uses. “One encoder gives geometry in simulation, useful car scores on real video, and a visual input to a simulated pilot. Transfer of a readout doesn’t imply transfer of a controller.” Close with better temporal association and hardware latency as next tests.
 
-The [original reel](../runs/presentation/pilot-demo.mp4) shows the policy’s actual input. To regenerate the textured visuals without changing benchmark renders: `nix develop --command .venv/bin/python scripts/render_presentation.py --figure report/figures/textured-flight.png --video --ffmpeg /path/to/ffmpeg` (requires `drawtext` and `libx264`).
+The [original recording](../runs/replay-drone11-train101/env-015.mp4) shows the policy’s actual camera input on the left. To regenerate the [dual-textured replay](../sim/python/README.md#replay-and-reports), use the recorded poses rather than rerunning the pilot. Slide 21 uses the still at 8 s from the textured clip.
 
 The patch PCA, saliency, memory and rollout stills come from `replay-drone11-train101`, episode 15, a selected v4 success in a training district. The saliency overlay is relative within the frame; the separate in-view estimate at 8 s was 0.824. The reward description is the newer v5 recipe, not a label on each v4 screenshot.
 

@@ -306,13 +306,11 @@ on a real drone’s camera?]
 
 #pagebreak()
 #title([04 · IMPLICATIONS], [Flight gives us harder camera views])
-#image("figures/textured-flight.png", width: 550pt)
-#v(18pt)
-#text(22pt, weight: "bold")[Learned flight in simulation]
-#v(11pt)
-#secondary[Selected successes with hints. Re-rendered onboard view and original external view.]
-#v(19pt)
-#text(20pt, weight: "medium")[Recorded flight frames → fresh probe on frozen features]
+#panels("figures/textured-replay-flight.png", ([Onboard camera], [Chase camera]), width: 790pt)
+#v(14pt)
+#secondary[Both views re-rendered with Poly Haven textures and updated lighting.]
+#v(9pt)
+#secondary[Selected simulator success with a location hint. The flight path is unchanged.]
 
 #pagebreak()
 #title([04 · IMPLICATIONS], [One encoder, three ways to use it])
