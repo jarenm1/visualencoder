@@ -86,7 +86,7 @@ impl Capture {
     }
 }
 
-fn chase_camera(scene: &CityScene, pose: &Pose) -> Result<Camera> {
+pub(crate) fn chase_camera(scene: &CityScene, pose: &Pose) -> Result<Camera> {
     let target = Vec3::from_array(pose.position);
     // Follow the recorded body heading, i.e. where the policy camera points.
     let forward = proxy::heading(pose.rotation);

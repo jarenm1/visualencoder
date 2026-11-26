@@ -263,6 +263,7 @@ function showEpisodeStatus(frame) {
       + `${flight.landed ? " · on ground" : ""}${flight.visible ? " · target in view" : ""}`
     : "";
   status.append(head, outcome, start + now);
+  if (manifest.presentation_render) status.append(`\n${manifest.presentation_render}`);
 }
 
 function fail(message) {

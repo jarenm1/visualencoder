@@ -564,6 +564,21 @@ Language goals by grounding (`sim/python/gemma_goal.py`): `frames` renders the f
 
 Typed goals in the replay site: start the server inside the root dev shell with `nix develop --command .venv/bin/python sim/replay/serve.py --data <recording> --live [--checkpoint runs/drone8-mean-hold-seed0/best.pt]`. Each instruction runs frames → ground → record on `--live-envs` (default 32) held-out environments with a fresh random seed and switches the page to the recording; episodes where Gemma boxed nothing are dropped. Recordings have their own `/replay/<recording>/` URLs.
 
+For a textured presentation replay without rerunning the pilot, build `sim-replay-render`,
+export the collision-checked chase camera positions, then render the two views:
+
+```sh
+nix develop path:sim --command cargo build --manifest-path sim/Cargo.toml \
+  --target-dir .sim-target --profile training -p sim-replay-render --locked
+.sim-target/training/sim-replay-render --recording "$recording/manifest.json" --chase-poses > chase.jsonl
+nix develop --command .venv/bin/python -m scripts.render_textured_replay \
+  "$recording" "$textured_recording" --chase-poses chase.jsonl --ffmpeg "$ffmpeg"
+.venv/bin/python sim/replay/serve.py --data "$textured_recording"
+```
+
+The textured video is presentation-only. The encoder, saliency, and memory overlays still come
+from the original policy observations, not from the new lighting or materials.
+
 ## Resource notes
 
 - Rollout token memory is about 944 MB at 64 environments, D=384, bf16.

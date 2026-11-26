@@ -12,6 +12,7 @@ come from the vertex colour written by build_city.py (R = variant, G = kind / 4)
 
 import json
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -502,7 +503,7 @@ class CityRenderer:
                 model.materials[i].shader = shader
             rl.draw_model(model, (0.0, 0.0, 0.0), 1.0, rl.WHITE)
 
-    def _draw(self, target, pose: Pose, clear, shader, per_class=None) -> np.ndarray:
+    def _draw(self, target, pose: Pose, clear, shader, per_class=None, extra: Callable[[], None] | None = None) -> np.ndarray:
         forward, up = pose.basis()
         camera = rl.Camera3D(
             tuple(pose.position), tuple(pose.position + forward), tuple(up), math.degrees(pose.vfov), rl.CAMERA_PERSPECTIVE
@@ -512,6 +513,8 @@ class CityRenderer:
         rl.rl_set_clip_planes(NEAR, FAR)
         rl.begin_mode_3d(camera)
         self._render_models(shader, per_class)
+        if extra is not None:
+            extra()
         rl.end_mode_3d()
         rl.end_texture_mode()
         image = rl.load_image_from_texture(target.texture)
@@ -554,7 +557,7 @@ class CityRenderer:
         )[..., 0]  # fmt: skip
         return semantic, depth
 
-    def render_rgb(self, pose: Pose, look: Appearance) -> np.ndarray:
+    def render_rgb(self, pose: Pose, look: Appearance, *, extra: Callable[[], None] | None = None) -> np.ndarray:
         """uint8 [H,W,3], box-downsampled from a SUPERSAMPLE x render."""
         s = self.lit
         sun = np.asarray(look.sun_dir, dtype=np.float64)
@@ -595,7 +598,7 @@ class CityRenderer:
                 maps[SHADOW_SLOT[0]].texture = self.shadow.depth
 
         sky = tuple(int(round(255 * v)) for v in look.sky) + (255,)
-        big = self._draw(self.rgb_target, pose, sky, s, bind)[..., :3].astype(np.float32)
+        big = self._draw(self.rgb_target, pose, sky, s, bind, extra)[..., :3].astype(np.float32)
         h, w = self.height, self.width
         small = big.reshape(h, SUPERSAMPLE, w, SUPERSAMPLE, 3).mean((1, 3))
         return np.round(small).astype(np.uint8)

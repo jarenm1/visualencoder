@@ -81,20 +81,20 @@ impl StateColumns {
 }
 
 impl Recording {
-    pub fn load(path: &Path) -> Result<(Self, PathBuf, StateColumns)> {
+    pub fn load(path: &Path, require_raw_video: bool) -> Result<(Self, PathBuf, StateColumns)> {
         let path = path.canonicalize().context("locating recording manifest")?;
         let directory = path.parent().context("manifest has no parent directory")?.to_path_buf();
         let mut recording: Self = serde_json::from_slice(
             &fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
         ).context("decoding replay manifest")?;
-        let columns = recording.validate(&directory)?;
+        let columns = recording.validate(&directory, require_raw_video)?;
         if recording.city_path.is_relative() {
             recording.city_path = directory.join(&recording.city_path);
         }
         Ok((recording, directory, columns))
     }
 
-    fn validate(&self, directory: &Path) -> Result<StateColumns> {
+    fn validate(&self, directory: &Path, require_raw_video: bool) -> Result<StateColumns> {
         ensure!(self.format == FORMAT, "unsupported replay format {} (expected {FORMAT})", self.format);
         ensure!(self.control_hz.is_finite() && self.control_hz > 0.0, "control_hz must be positive and finite");
         ensure!(self.frame_width > 0 && self.frame_height > 0 && self.frame_height % 2 == 0,
@@ -120,6 +120,9 @@ impl Recording {
             ensure!(videos.insert(&environment.video), "duplicate video filename {}", environment.video.display());
             environment.validate(self, &columns)
                 .with_context(|| format!("invalid environment {}", environment.id))?;
+            if !require_raw_video {
+                continue;
+            }
             let frame_bytes = u64::from(self.frame_width).checked_mul(u64::from(self.frame_height))
                 .and_then(|pixels| pixels.checked_mul(3)).context("raw RGB frame size overflows u64")?;
             let expected = frame_bytes.checked_mul(u64::try_from(environment.frame_count)?)
